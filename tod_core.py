@@ -1,0 +1,505 @@
+"""
+Core numerical routines for sample-based TOD generation.
+
+All functions are stateless and take only arrays as arguments.
+
+Numba JIT kernels
+-----------------
+_rodrigues_jit          — fused double Rodrigues rotation (recenter + pol. roll).
+                          Writes directly into a pre-allocated (B, S, 3) buffer,
+                          eliminating the 4-5 large intermediate arrays that the
+                          numpy version creates.
+
+_gather_accum_jit       — fused HEALPix bilinear gather + beam-weighted accumulation.
+                          Replaces the (C, 4, B*Sc) mp_gathered intermediate and the
+                          separate einsum + matmul calls.  Kept for backward compatibility.
+
+_gather_accum_fused_jit — fully fused vec2ang + HEALPix bilinear interpolation +
+                          beam accumulation; prange over B, sequential over S.
+                          Replaces the hp.vec2ang + hp.get_interp_weights +
+                          _gather_accum_jit triplet in beam_tod_batch, eliminating
+                          all four intermediate arrays (theta_flat, phi_flat, pixels,
+                          weights) from the hot tile loop.
+
+HEALPix RING helpers (in numba_healpy.py)
+-----------------------------------------
+_ring_above_jit, _ring_info_jit, _ring_z_jit,
+_get_interp_weights_jit, get_interp_weights_numba
+"""
+import math
+import numpy as np
+import healpy as hp
+import numba
+
+from numba_healpy import (
+    _TWO_PI,
+    _TWO_THIRDS,
+    _ring_above_jit,
+    _ring_info_jit,
+    _ring_z_jit,
+    _get_interp_weights_jit,
+    get_interp_weights_numba,
+)
+
+# Target working-set size for the (B × Sc × 3 × float32) vec_rot intermediate.
+# Sized to stay within a typical L2 cache (2 MB).
+_S_TILE_TARGET_BYTES = 2 * 1024 * 1024
+
+# Maximum number of S-tiles per beam entry.  Each tile makes one call into the
+# HEALPix interpolation logic.  Capping at _MAX_TILES ensures Sc is always at
+# least S/_MAX_TILES, keeping per-tile overhead bounded while still preventing
+# out-of-memory.
+_MAX_TILES = 8
+
+_INV_TWO_PI  = 1.0 / _TWO_PI
+
+
+# ── Numba JIT kernels ─────────────────────────────────────────────────────────
+
+@numba.jit(nopython=True, cache=True)
+def _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out):
+    """
+    Fused double-Rodrigues rotation (recenter + polarisation roll).
+
+    All input/output arrays are float32.  Computes each output element in a
+    single (b, s) pass with no temporaries beyond a handful of scalars.
+
+    Parameters
+    ----------
+    vec_orig : (S, 3)
+    axes     : (B, 3)  normalised rotation axes (zero where angle ≈ 0)
+    cos_a    : (B,)
+    sin_a    : (B,)
+    ax_pts   : (B, 3)  pointing unit vectors
+    cos_p    : (B,)
+    sin_p    : (B,)
+    out      : (B, S, 3)  written in place
+    """
+    B = axes.shape[0]
+    S = vec_orig.shape[0]
+    for b in range(B):
+        kx  = axes[b, 0];  ky  = axes[b, 1];  kz  = axes[b, 2]
+        ca  = cos_a[b];    sa  = sin_a[b];    oma = 1.0 - ca
+        px  = ax_pts[b, 0]; py = ax_pts[b, 1]; pz = ax_pts[b, 2]
+        cp_ = cos_p[b];    sp_ = sin_p[b];    omp = 1.0 - cp_
+        for s in range(S):
+            vx = vec_orig[s, 0]; vy = vec_orig[s, 1]; vz = vec_orig[s, 2]
+            # Rodrigues 1 – recenter beam
+            dkv = kx*vx + ky*vy + kz*vz
+            rx = vx*ca + (ky*vz - kz*vy)*sa + kx*dkv*oma
+            ry = vy*ca + (kz*vx - kx*vz)*sa + ky*dkv*oma
+            rz = vz*ca + (kx*vy - ky*vx)*sa + kz*dkv*oma
+            # Rodrigues 2 – polarisation roll
+            dpr = px*rx + py*ry + pz*rz
+            out[b, s, 0] = rx*cp_ + (py*rz - pz*ry)*sp_ + px*dpr*omp
+            out[b, s, 1] = ry*cp_ + (pz*rx - px*rz)*sp_ + py*dpr*omp
+            out[b, s, 2] = rz*cp_ + (px*ry - py*rx)*sp_ + pz*dpr*omp
+
+
+@numba.jit(nopython=True, cache=True)
+def _gather_accum_jit(pixels, weights, beam_vals, mp_stacked, B, Sc, tod):
+    """
+    Fused HEALPix gather, bilinear interpolation, and beam accumulation.
+
+    Replaces:  np.stack gather → einsum → reshape → matmul
+    with a single scalar loop over (b, s) that reads map values once and
+    accumulates directly, avoiding the (C, 4, B*Sc) mp_gathered intermediate.
+
+    Parameters
+    ----------
+    pixels     : (4, B*Sc)  int64   HEALPix pixel indices
+    weights    : (4, B*Sc)  float64 bilinear weights
+    beam_vals  : (Sc,)      float32 beam weights
+    mp_stacked : (C, N)     float32 stacked sky-map components
+    B, Sc      : int
+    tod        : (C, B)     float64 — accumulated in place
+    """
+    C = mp_stacked.shape[0]
+    for b in range(B):
+        for s in range(Sc):
+            n  = b * Sc + s
+            bv = float(beam_vals[s])
+            p0 = pixels[0, n]; p1 = pixels[1, n]
+            p2 = pixels[2, n]; p3 = pixels[3, n]
+            w0 = weights[0, n]; w1 = weights[1, n]
+            w2 = weights[2, n]; w3 = weights[3, n]
+            for c in range(C):
+                tod[c, b] += (mp_stacked[c, p0]*w0 + mp_stacked[c, p1]*w1 +
+                              mp_stacked[c, p2]*w2 + mp_stacked[c, p3]*w3) * bv
+
+
+# ── Fully fused kernel ────────────────────────────────────────────────────────
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
+    """
+    Fully fused vec2ang + HEALPix bilinear interpolation + beam accumulation.
+
+    Eliminates the (N,) theta/phi and (4, N) pixels/weights intermediate arrays
+    that the split-call version allocates per S-tile.  Parallelised over the B
+    (sample) dimension; each ``b`` owns ``tod[:, b]`` exclusively so there are
+    no write races.
+
+    Inlines the HEALPix RING get_interpol algorithm so that Numba can see the
+    complete computation and apply cross-step optimisations.
+
+    Parameters
+    ----------
+    vec_rot    : (B, Sc, 3)   float32   rotated beam unit vectors
+    nside      : int
+    mp_stacked : (C, N_hp)    float32   stacked sky-map components
+    beam_vals  : (Sc,)        float32   beam weights for this tile
+    B, Sc      : int
+    tod        : (C, B)       float64   accumulated in place
+    """
+    C          = mp_stacked.shape[0]
+    npix_total = 12 * nside * nside
+
+    for b in numba.prange(B):               # ← parallel; no race on tod[:, b]
+        for s in range(Sc):
+
+            # ── step 1: vec2ang (inline) ──────────────────────────────────────
+            # atan2(r_xy, z) is better conditioned near the poles than acos(z).
+            vx = float(vec_rot[b, s, 0])
+            vy = float(vec_rot[b, s, 1])
+            vz = float(vec_rot[b, s, 2])
+            theta = math.atan2(math.sqrt(vx*vx + vy*vy), vz)
+            phi   = math.atan2(vy, vx)
+            if phi < 0.0:
+                phi += _TWO_PI
+
+            # ── step 2: HEALPix RING bilinear interpolation (inline) ──────────
+            z        = math.cos(theta)
+            az       = abs(z)
+            if az > _TWO_THIRDS:                 # polar cap
+                tp       = nside * math.sqrt(3.0 * (1.0 - az))
+                ir_above = int(tp)
+                if z < 0.0:
+                    ir_above = 4 * nside - ir_above - 1
+            else:                                # equatorial belt
+                ir_above = int(nside * (2.0 - 1.5 * z))
+            ir_below = ir_above + 1
+
+            if ir_above == 0:
+                # ── North-pole boundary ───────────────────────────────────────
+                # Ring 1 layout
+                na1  = 4
+                fpa1 = 0
+                sa1  = 1
+                dphia1 = _TWO_PI / na1
+                phi0a1 = sa1 * dphia1 * 0.5
+                tw   = ((phi - phi0a1) / dphia1) % float(na1)
+                ip   = int(tw)
+                frac = tw - ip
+                ip2  = (ip + 1) % na1
+                p2   = fpa1 + ip
+                p3   = fpa1 + ip2
+                p0   = (ip  + 2) % na1
+                p1   = (ip2 + 2) % na1
+                # theta weight (theta1 = 0 at north pole)
+                tmp_r1 = 1.0
+                za1    = 1.0 - tmp_r1 * tmp_r1 / (3.0 * nside * nside)
+                ta1    = math.acos(za1)
+                wt     = theta / ta1
+                nf     = (1.0 - wt) * 0.25
+                w0     = nf
+                w1     = nf
+                w2     = (1.0 - frac) * wt + nf
+                w3     = frac          * wt + nf
+
+            elif ir_below == 4 * nside:
+                # ── South-pole boundary ───────────────────────────────────────
+                ir_last = 4 * nside - 1
+                i2last  = 4 * nside - ir_last          # = 1
+                na_l    = 4 * i2last                   # = 4
+                fpa_l   = npix_total - 2 * i2last * (i2last + 1)
+                dphia_l = _TWO_PI / na_l
+                phi0a_l = dphia_l * 0.5                # shift=1 always for last ring
+                tw      = ((phi - phi0a_l) / dphia_l) % float(na_l)
+                ip      = int(tw)
+                frac    = tw - ip
+                ip2     = (ip + 1) % na_l
+                p0      = fpa_l + ip
+                p1      = fpa_l + ip2
+                p2      = (ip  + 2) % na_l + fpa_l
+                p3      = (ip2 + 2) % na_l + fpa_l
+                # theta weight toward south pole
+                tmp_rl  = float(i2last)
+                za_l    = -(1.0 - tmp_rl * tmp_rl / (3.0 * nside * nside))
+                ta_l    = math.acos(za_l)
+                wts     = (theta - ta_l) / (math.pi - ta_l)
+                sf      = wts * 0.25
+                w0      = (1.0 - frac) * (1.0 - wts) + sf
+                w1      = frac          * (1.0 - wts) + sf
+                w2      = sf
+                w3      = sf
+
+            else:
+                # ── Normal case ───────────────────────────────────────────────
+                # z of ring above
+                if ir_above < nside:
+                    tmp_a = float(ir_above)
+                    za = 1.0 - tmp_a * tmp_a / (3.0 * nside * nside)
+                elif ir_above <= 3 * nside:
+                    za = _TWO_THIRDS * (2.0 - float(ir_above) / nside)
+                else:
+                    tmp_a = float(4 * nside - ir_above)
+                    za = -(1.0 - tmp_a * tmp_a / (3.0 * nside * nside))
+                # z of ring below
+                if ir_below < nside:
+                    tmp_b = float(ir_below)
+                    zb = 1.0 - tmp_b * tmp_b / (3.0 * nside * nside)
+                elif ir_below <= 3 * nside:
+                    zb = _TWO_THIRDS * (2.0 - float(ir_below) / nside)
+                else:
+                    tmp_b = float(4 * nside - ir_below)
+                    zb = -(1.0 - tmp_b * tmp_b / (3.0 * nside * nside))
+                ta      = math.acos(za)
+                tb      = math.acos(zb)
+                w_below = (theta - ta) / (tb - ta)
+                w_above = 1.0 - w_below
+
+                # Ring above: pixel layout + phi interpolation
+                if ir_above < nside:
+                    na  = 4 * ir_above
+                    fpa = 2 * ir_above * (ir_above - 1)
+                    sa  = 1
+                elif ir_above <= 3 * nside:
+                    na  = 4 * nside
+                    fpa = 2 * nside * (nside - 1) + (ir_above - nside) * 4 * nside
+                    sa  = 1 if (ir_above - nside) % 2 == 0 else 0
+                else:
+                    i2a = 4 * nside - ir_above
+                    na  = 4 * i2a
+                    fpa = npix_total - 2 * i2a * (i2a + 1)
+                    sa  = 1
+                dphia = _TWO_PI / na
+                phi0a = sa * dphia * 0.5
+                tw    = ((phi - phi0a) / dphia) % float(na)
+                iphia = int(tw)
+                fphia = tw - iphia
+                p0    = fpa + iphia
+                p1    = fpa + (iphia + 1) % na
+                w0    = w_above * (1.0 - fphia)
+                w1    = w_above * fphia
+
+                # Ring below: pixel layout + phi interpolation
+                if ir_below < nside:
+                    nb  = 4 * ir_below
+                    fpb = 2 * ir_below * (ir_below - 1)
+                    sb  = 1
+                elif ir_below <= 3 * nside:
+                    nb  = 4 * nside
+                    fpb = 2 * nside * (nside - 1) + (ir_below - nside) * 4 * nside
+                    sb  = 1 if (ir_below - nside) % 2 == 0 else 0
+                else:
+                    i2b = 4 * nside - ir_below
+                    nb  = 4 * i2b
+                    fpb = npix_total - 2 * i2b * (i2b + 1)
+                    sb  = 1
+                dphib = _TWO_PI / nb
+                phi0b = sb * dphib * 0.5
+                tw    = ((phi - phi0b) / dphib) % float(nb)
+                iphib = int(tw)
+                fphib = tw - iphib
+                p2    = fpb + iphib
+                p3    = fpb + (iphib + 1) % nb
+                w2    = w_below * (1.0 - fphib)
+                w3    = w_below * fphib
+
+            # ── step 3: gather + beam-weighted accumulation ───────────────────
+            bv = float(beam_vals[s])
+            for c in range(C):
+                tod[c, b] += (  mp_stacked[c, p0] * w0
+                              + mp_stacked[c, p1] * w1
+                              + mp_stacked[c, p2] * w2
+                              + mp_stacked[c, p3] * w3) * bv
+
+
+# ── Public numpy functions ────────────────────────────────────────────────────
+
+def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=(100, 100)):
+    """
+    Compute Rodrigues rotation vectors and polarisation angle offsets (beta)
+    that bring the beam centre to each pointing direction in the batch.
+
+    Returns
+    -------
+    rot_vector : (B, 3)
+    beta       : (B,)
+    """
+    def sph2vec(phi, theta):
+        return np.stack([np.sin(theta)*np.cos(phi),
+                         np.sin(theta)*np.sin(phi),
+                         np.cos(theta)], axis=-1)
+
+    phi_orig   = ra
+    theta_orig = np.pi/2 - dec
+
+    vec_center = sph2vec(phi_orig[center_idx], theta_orig[center_idx])[np.newaxis, :]
+    vec_target = sph2vec(phi_batch, theta_batch)
+
+    N_center = np.array([ np.cos(phi_orig[center_idx]) * np.cos(theta_orig[center_idx]),
+                          np.sin(phi_orig[center_idx]) * np.cos(theta_orig[center_idx]),
+                         -np.sin(theta_orig[center_idx])])
+    N_target = np.array([ np.cos(phi_batch) * np.cos(theta_batch),
+                          np.sin(phi_batch) * np.cos(theta_batch),
+                         -np.sin(theta_batch)]).T
+    E_target = np.array([-np.sin(phi_batch),
+                          np.cos(phi_batch),
+                          np.zeros_like(phi_batch)]).T
+
+    axis      = np.cross(vec_center, vec_target)
+    axis_norm = np.linalg.norm(axis, axis=-1, keepdims=True)
+    axis      = np.where(axis_norm > 1e-10, axis / axis_norm, 0)
+
+    angle      = np.arccos(np.clip(np.sum(vec_center * vec_target, axis=-1), -1, 1))
+    rot_vector = axis * angle[..., np.newaxis]
+
+    ca     = np.cos(angle)
+    v      = N_center[np.newaxis, :]
+    dot_kv = np.sum(axis * v, axis=-1, keepdims=True)
+    w      = (v * ca[..., np.newaxis]
+              + np.cross(axis, v) * np.sin(angle)[..., np.newaxis]
+              + axis * dot_kv * (1 - ca)[..., np.newaxis])
+
+    beta = np.arctan2(np.sum(w * E_target, axis=-1), np.sum(w * N_target, axis=-1))
+    beta = np.where(beta < 0, beta + 2*np.pi, beta)
+
+    return rot_vector, beta
+
+
+def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
+    """
+    Pre-compute the per-sample scalars needed by _rodrigues_jit from the
+    Rodrigues vectors and pointing angles.  All outputs are float32.
+
+    Returns axes (B,3), cos_a (B,), sin_a (B,), ax_pts (B,3), cos_p (B,), sin_p (B,)
+    """
+    angles = np.linalg.norm(rot_vecs, axis=-1).astype(np.float32)      # (B,)
+    safe   = angles > np.float32(1e-10)
+    axes   = (rot_vecs / np.where(safe[:, None],
+                                   angles[:, None],
+                                   np.float32(1.))).astype(np.float32)
+    axes   = np.where(safe[:, None], axes, np.float32(0.))
+    cos_a  = np.cos(angles)
+    sin_a  = np.sin(angles)
+
+    phi_f   = np.asarray(phi_b,   dtype=np.float32)
+    theta_f = np.asarray(theta_b, dtype=np.float32)
+    psis_f  = np.asarray(psis_b,  dtype=np.float32)
+    st = np.sin(theta_f); ct = np.cos(theta_f)
+    sp = np.sin(phi_f);   cp = np.cos(phi_f)
+    ax_pts = np.stack([st*cp, st*sp, ct], axis=-1)
+    cos_p  = np.cos(psis_f)
+    sin_p  = np.sin(psis_f)
+
+    return axes, cos_a, sin_a, ax_pts, cos_p, sin_p
+
+
+def recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
+    """
+    Fused recenter + rotate via Rodrigues formula.
+
+    Parameters
+    ----------
+    vec_orig : (S, 3)  precomputed beam pixel unit vectors
+    rot_vecs : (B, 3)  rotation vectors (axis * angle)
+    phi_pix  : (B,)
+    theta_pix: (B,)
+    psis     : (B,)    combined rotation angle (-beta + psi)
+
+    Returns
+    -------
+    out : (B, S, 3)  float32
+    """
+    B = rot_vecs.shape[0]
+    S = vec_orig.shape[0]
+    axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
+        rot_vecs, phi_pix, theta_pix, psis)
+    out = np.empty((B, S, 3), dtype=np.float32)
+    _rodrigues_jit(np.asarray(vec_orig, dtype=np.float32),
+                   axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out)
+    return out
+
+
+def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
+    """
+    Accumulate the TOD contribution of one beam entry for a batch of B samples.
+
+    Tiles over the S beam pixels so that each (B × Sc × 3 × float32)
+    intermediate stays within _S_TILE_TARGET_BYTES.  Uses Numba JIT kernels
+    for both the rotation and the gather+accumulation steps.
+
+    When ``data`` contains ``'mp_stacked'`` (C, N) float32 the fully fused
+    ``_gather_accum_fused_jit`` kernel is used: it performs vec2ang, HEALPix
+    bilinear interpolation, and beam-weighted accumulation in a single parallel
+    pass, eliminating all four intermediate arrays (theta_flat, phi_flat,
+    pixels, weights) that the split-call version allocated per tile.
+
+    If ``'mp_stacked'`` is absent the function falls back to the numpy gather
+    path (used for validation / low-memory situations).
+
+    Parameters
+    ----------
+    nside    : int
+    mp       : list of arrays — sky map components (fallback only)
+    data     : dict — beam_data entry
+    rot_vecs : (B, 3)
+    phi_b    : (B,)
+    theta_b  : (B,)
+    psis_b   : (B,)
+
+    Returns
+    -------
+    tod : dict  comp_index -> (B,) float32 array
+    """
+    B            = phi_b.shape[0]
+    vec_orig     = data['vec_orig']    # (S, 3)
+    beam_vals    = data['beam_vals']   # (S,)
+    S            = vec_orig.shape[0]
+    comp_indices = data['comp_indices']
+    C            = len(comp_indices)
+    mp_stacked   = data.get('mp_stacked')   # (C, N) float32, or None
+
+    # Lower bound from L2 target; upper bound from _MAX_TILES cap.
+    # The max() ensures we never produce more than _MAX_TILES tiles even when
+    # the memory-based Sc is tiny (e.g. Sc=79 at B=2212 → 64 tiles → 64 C calls).
+    Sc = max(1, _S_TILE_TARGET_BYTES // (B * 3 * 4))   # memory target
+    Sc = max(Sc, -(-S // _MAX_TILES))                  # tile-count cap (ceiling div)
+    Sc = min(Sc, S)
+
+    # Pre-compute per-sample rotation scalars once for all S-tiles (O(B))
+    axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
+        rot_vecs, phi_b, theta_b, psis_b)
+
+    tod = {comp: np.zeros(B, dtype=np.float32) for comp in comp_indices}
+
+    for s0 in range(0, S, Sc):
+        s1        = min(s0 + Sc, S)
+        vec_chunk = np.asarray(vec_orig[s0:s1], dtype=np.float32)  # (Sc, 3)
+        bv_chunk  = beam_vals[s0:s1]                                # (Sc,)
+
+        # Fused double Rodrigues rotation — no intermediate (B, Sc, 3) temps
+        vec_rot = np.empty((B, s1 - s0, 3), dtype=np.float32)
+        _rodrigues_jit(vec_chunk, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot)
+
+        if mp_stacked is not None:
+            # Fully fused Numba path: vec2ang + HEALPix interp + accumulation
+            # in one parallel kernel — no theta_flat/phi_flat/pixels/weights allocs.
+            tod_arr = np.zeros((C, B), dtype=np.float64)
+            _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
+                                    B, s1 - s0, tod_arr)
+            for i, comp in enumerate(comp_indices):
+                tod[comp] += tod_arr[i].astype(np.float32)
+        else:
+            # numpy fallback (mp_stacked not precomputed)
+            theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
+            pixels, weights      = get_interp_weights_numba(nside, theta_flat, phi_flat)
+            mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
+            mp_flat     = np.einsum('ckn,kn->cn', mp_gathered, weights)
+            tod_chunk   = mp_flat.reshape(C, B, s1 - s0) @ bv_chunk
+            for i, comp in enumerate(comp_indices):
+                tod[comp] += tod_chunk[i]
+
+    return tod
