@@ -7,7 +7,7 @@ from functools import partial
 import numpy as np
 import healpy as hp
 
-import sample_based_tod_generation_config as config
+import tod_config as config
 from tod_io        import load_beam, load_scan_information, load_scan_data_batch, open_scan_day
 from tod_core      import precompute_rotation_vector_batch, beam_tod_batch
 from tod_calibrate import calibrate_batch_size

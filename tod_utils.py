@@ -6,7 +6,7 @@ or psutil are unavailable.
 """
 import os
 import multiprocessing
-import sample_based_tod_generation_config as config
+import tod_config as config
 
 
 def get_ncpus():

@@ -1,0 +1,24 @@
+import os
+import yaml
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+_local = os.path.join(_HERE, "config_local.yaml")
+_default = os.path.join(_HERE, "config.yaml")
+
+_cfg_file = _local if os.path.exists(_local) else _default
+
+with open(_cfg_file) as _f:
+    _cfg = yaml.safe_load(_f)
+
+FOLDER_BEAM           = _cfg["FOLDER_BEAM"]
+FOLDER_SCAN           = _cfg["FOLDER_SCAN"]
+FOLDER_TOD_OUTPUT     = _cfg["FOLDER_TOD_OUTPUT"]
+path_to_map           = _cfg["path_to_map"]
+beam_file_I           = _cfg["beam_file_I"]
+beam_file_Q           = _cfg["beam_file_Q"]
+beam_file_U           = _cfg["beam_file_U"]
+start_day             = _cfg["start_day"]
+end_day               = _cfg["end_day"]
+n_processes           = _cfg["n_processes"]
+max_memory_per_process = _cfg["max_memory_per_process"]

@@ -42,7 +42,7 @@ from tod_utils import (
     get_memory_per_process,
     get_ncpus,
 )
-import sample_based_tod_generation_config as config
+import tod_config as config
 
 
 # ===========================================================================
