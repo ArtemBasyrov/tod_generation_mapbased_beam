@@ -9,47 +9,61 @@ import multiprocessing
 import tod_config as config
 
 
-def get_ncpus():
+def _cpu_ceiling():
     """
-    Determine the number of worker processes to use.
+    Return the number of physical cores available to this process.
 
     Priority
     --------
-    1. psutil affinity-aware core count (local multi-core)
-    2. SLURM_CPUS_PER_TASK environment variable (HPC cluster)
-    3. config.n_processes (explicit fallback)
-
-    Returns
-    -------
-    ncpus : int
+    1. SLURM_CPUS_PER_TASK (scheduler knows exactly what was allocated)
+    2. psutil affinity-aware core count (respects taskset / cgroup limits)
+    3. os.cpu_count() (total logical CPUs — last resort)
     """
+    slurm = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm is not None:
+        try:
+            return int(slurm)
+        except ValueError:
+            pass
 
-    # 1. psutil (affinity-aware — respects taskset / cgroup limits)
     try:
         import psutil
         nthreads_per_core = (psutil.cpu_count(logical=True)
                              // psutil.cpu_count(logical=False))
-        ncores_available  = len(os.sched_getaffinity(0)) // nthreads_per_core
-        ncpus = min(ncores_available, config.n_processes)
-        print(f"[cpu] Using {ncpus}/{ncores_available} available cores (psutil)")
-        return ncpus
+        return len(os.sched_getaffinity(0)) // nthreads_per_core
     except Exception:
         pass
 
-    # 2. SLURM
-    slurm = os.environ.get("SLURM_CPUS_PER_TASK")
-    if slurm is not None:
-        try:
-            ncpus = int(slurm)
-            print(f"[cpu] Using {ncpus} CPUs from SLURM_CPUS_PER_TASK")
-            return ncpus
-        except ValueError:
-            pass
+    return os.cpu_count() or config.n_processes
 
-    # 3. Config fallback
-    ncpus = config.n_processes
-    print(f"[cpu] Using {ncpus} CPUs from config (fallback)")
-    return ncpus
+
+def get_ncpus():
+    """
+    Return the CPU ceiling for this job.
+
+    On a cluster (SLURM / PBS / LSF / SGE detected) this is the number of
+    cores allocated by the scheduler.  The actual number of worker processes
+    to launch is determined later by calibrate_n_processes(), which balances
+    CPU count against per-process memory to maximise total throughput.
+
+    Locally, the result is capped at config.n_processes so the workstation
+    stays usable.
+
+    Returns
+    -------
+    n_cpu : int
+    """
+    cluster = _is_cluster()
+    n_cpu   = _cpu_ceiling()
+
+    if cluster:
+        print(f"[cpu] Cluster — {n_cpu} CPUs available (scheduler/psutil); "
+              f"optimal worker count determined by calibration")
+    else:
+        n_cpu = min(n_cpu, config.n_processes)
+        print(f"[cpu] Local — {n_cpu} CPUs (capped at config.n_processes={config.n_processes})")
+
+    return n_cpu
 
 
 # Fraction of available RAM reserved for the OS and other user processes

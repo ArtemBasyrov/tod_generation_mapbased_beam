@@ -10,7 +10,7 @@ import healpy as hp
 import tod_config as config
 from tod_io        import load_beam, load_scan_information, load_scan_data_batch, open_scan_day
 from tod_core      import precompute_rotation_vector_batch, beam_tod_batch
-from tod_calibrate import calibrate_batch_size
+from tod_calibrate import calibrate_n_processes
 from tod_utils     import get_ncpus, _fmt_time, should_print_batch
 
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -192,14 +192,13 @@ def process_day(day_index, batch_size, Nb):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(ncpus):
+def main(n_cpu_ceiling):
     t0 = time.time()
     Nb, _ = load_scan_information(folder_scan)
 
     start = max(start_day or 0, 0)
     end   = min(end_day   or Nb, Nb)
     days  = range(start, end)
-    print(f"Processing days {start}–{end-1}  ({len(days)} days,  {ncpus} workers)")
 
     os.makedirs(folder_tod_output, exist_ok=True)
 
@@ -220,11 +219,12 @@ def main(ncpus):
             np.stack([MP[c] for c in data['comp_indices']])  # (C, N_hp)
         )
 
-    print("Calibrating batch size...")
-    batch_size, _ = calibrate_batch_size(
+    print("Calibrating optimal worker count and batch size...")
+    ncpus, batch_size = calibrate_n_processes(
         beam_data, folder_scan, probe_day=start,
-        mp=MP, n_processes=ncpus,
+        mp=MP, n_cpu_ceiling=n_cpu_ceiling,
     )
+    print(f"Processing days {start}–{end-1}  ({len(days)} days,  {ncpus} workers)")
 
     if ncpus > 1:
         # ── Allocate shared memory ─────────────────────────────────────────

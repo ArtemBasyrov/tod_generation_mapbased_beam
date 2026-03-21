@@ -115,3 +115,84 @@ def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
     best_bs, best_tp = max(results, key=lambda x: x[1])
     print(prefix + f"[calibrate] -> optimal batch_size={best_bs}  ({best_tp:,.0f} samp/s)  [mem_cap={mem_cap}]")
     return best_bs, results
+
+
+def calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
+                           n_repeats=3, prefix=""):
+    """
+    Find the optimal number of worker processes by maximising estimated total
+    throughput = throughput_per_process(n) × n.
+
+    Runs batch-size calibration once with the full available memory budget
+    (as if only one process is running), which produces a throughput curve
+    over all candidate batch sizes.  Then, for each candidate n in
+    [1 … n_cpu_ceiling], it determines the largest batch size that fits in
+    memory/n and reads off the corresponding per-process throughput from the
+    curve.  The n that maximises n × per-process-throughput is returned.
+
+    This correctly captures the NERSC / HPC pattern where using all available
+    cores gives each process too little RAM (→ tiny batches → high overhead),
+    so fewer processes with larger per-process memory actually runs faster end-
+    to-end.
+
+    Parameters
+    ----------
+    beam_data      : dict — loaded beam data (from prepare_beam_data)
+    folder_scan    : str  — path to scan data folder
+    probe_day      : int  — any valid day index for the timing probe
+    mp             : list — sky maps [I, Q, U]
+    n_cpu_ceiling  : int  — maximum number of processes allowed (from scheduler
+                            or config)
+    n_repeats      : int  — timing repeats for the calibration run (default 3)
+    prefix         : str  — log prefix
+
+    Returns
+    -------
+    n_optimal  : int  — optimal number of worker processes
+    batch_size : int  — optimal batch size for that process count
+    """
+    max_beam_sel = max(d['n_sel'] for d in beam_data.values())
+
+    # Total usable memory: get_memory_per_process(1) = available × fraction / 1
+    total_memory_gb = get_memory_per_process(1)
+
+    # Run calibration with full memory to get throughput at all batch sizes.
+    print(prefix + f"[n_proc] Calibrating throughput curve "
+          f"(total_memory={total_memory_gb:.1f} GB, cpu_ceiling={n_cpu_ceiling})...")
+    _, results = calibrate_batch_size(
+        beam_data, folder_scan, probe_day, mp,
+        n_processes=1,
+        n_repeats=n_repeats,
+        prefix=prefix,
+    )
+    # results: list of (batch_size, throughput_samp_per_s), ordered by batch_size
+    results_dict = dict(results)
+    sorted_bs    = sorted(results_dict)
+
+    # For each candidate n compute estimated total throughput.
+    print(prefix + f"[n_proc] Scanning n_processes 1 … {n_cpu_ceiling}:")
+    best_n, best_total_tp, best_bs = 1, 0.0, sorted_bs[-1]
+
+    for n in range(1, n_cpu_ceiling + 1):
+        mem_per_proc = total_memory_gb / n
+        cap          = _memory_cap(mem_per_proc, max_beam_sel)
+        affordable   = [bs for bs in sorted_bs if bs <= cap]
+        if not affordable:
+            print(prefix + f"[n_proc]   n={n:3d}: mem/proc={mem_per_proc:.2f} GB  "
+                  f"→ no affordable batch size, skipping")
+            continue
+        bs_n       = max(affordable, key=lambda bs: results_dict[bs])
+        tp_per_proc = results_dict[bs_n]
+        total_tp   = tp_per_proc * n
+        marker     = "  ←" if total_tp > best_total_tp else ""
+        print(prefix + f"[n_proc]   n={n:3d}: mem/proc={mem_per_proc:.2f} GB  "
+              f"cap={cap}  batch_size={bs_n}  "
+              f"tp/proc={tp_per_proc:,.0f}  total={total_tp:,.0f}{marker}")
+        if total_tp > best_total_tp:
+            best_total_tp = total_tp
+            best_n        = n
+            best_bs       = bs_n
+
+    print(prefix + f"[n_proc] → n_optimal={best_n}  batch_size={best_bs}  "
+          f"(est. total throughput={best_total_tp:,.0f} samp/s)")
+    return best_n, best_bs
