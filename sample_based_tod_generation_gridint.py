@@ -190,6 +190,23 @@ def process_day(day_index, batch_size, Nb):
         return day_index, False, str(e)
 
 
+# ── Calibration cache ─────────────────────────────────────────────────────────
+
+def _save_calibration(n_processes, batch_size):
+    """Write calibration results back to the active config file."""
+    import yaml
+    with open(config.CONFIG_FILE) as f:
+        raw = yaml.safe_load(f)
+    raw['calibration_n_processes'] = int(n_processes)
+    raw['calibration_batch_size']  = int(batch_size)
+    raw['calibration_skip']        = True
+    with open(config.CONFIG_FILE, 'w') as f:
+        yaml.dump(raw, f, default_flow_style=False, allow_unicode=True,
+                  explicit_start=True, sort_keys=False)
+    print(f"Calibration saved to {config.CONFIG_FILE} "
+          f"(n_processes={n_processes}, batch_size={batch_size})")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(n_cpu_ceiling):
@@ -219,11 +236,22 @@ def main(n_cpu_ceiling):
             np.stack([MP[c] for c in data['comp_indices']])  # (C, N_hp)
         )
 
-    print("Calibrating optimal worker count and batch size...")
-    ncpus, batch_size = calibrate_n_processes(
-        beam_data, folder_scan, probe_day=start,
-        mp=MP, n_cpu_ceiling=n_cpu_ceiling,
+    use_cached = (
+        config.calibration_skip
+        or (config.calibration_n_processes is not None
+            and config.calibration_batch_size is not None)
     )
+    if use_cached:
+        ncpus      = config.calibration_n_processes
+        batch_size = config.calibration_batch_size
+        print(f"Using cached calibration: n_processes={ncpus}, batch_size={batch_size}")
+    else:
+        print("Calibrating optimal worker count and batch size...")
+        ncpus, batch_size = calibrate_n_processes(
+            beam_data, folder_scan, probe_day=start,
+            mp=MP, n_cpu_ceiling=n_cpu_ceiling,
+        )
+        _save_calibration(ncpus, batch_size)
     print(f"Processing days {start}–{end-1}  ({len(days)} days,  {ncpus} workers)")
 
     if ncpus > 1:

@@ -11,3 +11,8 @@
   # multipricessing parameters
   n_processes: 6
   max_memory_per_process: 1.5 # GB
+  # calibration cache — set by the calibration run, skip it on subsequent runs
+  # set calibration_skip: true to force using the cached values below
+  calibration_skip: false
+  calibration_n_processes: null
+  calibration_batch_size: null

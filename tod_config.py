@@ -7,6 +7,7 @@ _local = os.path.join(_HERE, "config_local.yaml")
 _default = os.path.join(_HERE, "config.yaml")
 
 _cfg_file = _local if os.path.exists(_local) else _default
+CONFIG_FILE = _cfg_file
 
 with open(_cfg_file) as _f:
     _cfg = yaml.safe_load(_f)
@@ -22,3 +23,8 @@ start_day             = _cfg["start_day"]
 end_day               = _cfg["end_day"]
 n_processes           = _cfg["n_processes"]
 max_memory_per_process = _cfg["max_memory_per_process"]
+
+# Optional calibration cache
+calibration_skip        = _cfg.get("calibration_skip", False)
+calibration_n_processes = _cfg.get("calibration_n_processes", None)
+calibration_batch_size  = _cfg.get("calibration_batch_size", None)
