@@ -5,21 +5,32 @@ All functions are stateless and take only arrays as arguments.
 
 Numba JIT kernels
 -----------------
-_rodrigues_jit          — fused double Rodrigues rotation (recenter + pol. roll).
-                          Writes directly into a pre-allocated (B, S, 3) buffer,
-                          eliminating the 4-5 large intermediate arrays that the
-                          numpy version creates.
+_rodrigues_jit                — fused double Rodrigues rotation (recenter + pol. roll).
+                                Writes directly into a pre-allocated (B, S, 3) buffer,
+                                eliminating the 4-5 large intermediate arrays that the
+                                numpy version creates.
+
+_rodrigues1_from_rolled_jit   — single Rodrigues rotation (recenter only) applied to
+                                per-sample pre-rolled (B, Sc, 3) beam vectors loaded
+                                from the beam cache.  Replaces the double rotation when
+                                vec_rolled / psi_grid are present in beam_data.
 
 _gather_accum_jit       — fused HEALPix bilinear gather + beam-weighted accumulation.
                           Replaces the (C, 4, B*Sc) mp_gathered intermediate and the
                           separate einsum + matmul calls.  Kept for backward compatibility.
 
-_gather_accum_fused_jit — fully fused vec2ang + HEALPix bilinear interpolation +
-                          beam accumulation; prange over B, sequential over S.
-                          Replaces the hp.vec2ang + hp.get_interp_weights +
-                          _gather_accum_jit triplet in beam_tod_batch, eliminating
-                          all four intermediate arrays (theta_flat, phi_flat, pixels,
-                          weights) from the hot tile loop.
+_gather_accum_fused_jit   — fully fused vec2ang + HEALPix bilinear interpolation +
+                            beam accumulation; prange over B, sequential over S.
+                            Replaces the hp.vec2ang + hp.get_interp_weights +
+                            _gather_accum_jit triplet in beam_tod_batch, eliminating
+                            all four intermediate arrays (theta_flat, phi_flat, pixels,
+                            weights) from the hot tile loop.
+
+_gather_accum_flatsky_jit — fully fused flat-sky HEALPix interpolation + accumulation.
+                            Skips vec2ang and both Rodrigues rotations; computes sky
+                            positions directly from precomputed (dtheta, dphi) offsets
+                            and pointing angles (theta_b, phi_b).  Used when the beam
+                            cache provides dtheta/dphi alongside vec_rolled/psi_grid.
 
 HEALPix RING helpers (in numba_healpy.py)
 -----------------------------------------
@@ -94,6 +105,38 @@ def _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out):
             out[b, s, 0] = rx*cp_ + (py*rz - pz*ry)*sp_ + px*dpr*omp
             out[b, s, 1] = ry*cp_ + (pz*rx - px*rz)*sp_ + py*dpr*omp
             out[b, s, 2] = rz*cp_ + (px*ry - py*rx)*sp_ + pz*dpr*omp
+
+
+@numba.jit(nopython=True, cache=True)
+def _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out):
+    """
+    Apply only Rodrigues 1 (recentering) to pre-rolled beam pixel vectors.
+
+    Used when vec_rolled is loaded from the beam cache — the psi-roll
+    (Rodrigues 2) is already baked in, so only the recentering rotation
+    to the current pointing direction is needed.
+
+    Parameters
+    ----------
+    vec_rolled_b : (B, Sc, 3)  float32  — per-sample pre-rolled vectors
+    axes         : (B, 3)      float32  — Rodrigues rotation axes
+    cos_a        : (B,)        float32
+    sin_a        : (B,)        float32
+    out          : (B, Sc, 3)  float32  — written in place
+    """
+    B  = axes.shape[0]
+    Sc = vec_rolled_b.shape[1]
+    for b in range(B):
+        kx  = axes[b, 0]; ky = axes[b, 1]; kz = axes[b, 2]
+        ca  = cos_a[b];   sa = sin_a[b];   oma = 1.0 - ca
+        for s in range(Sc):
+            vx = vec_rolled_b[b, s, 0]
+            vy = vec_rolled_b[b, s, 1]
+            vz = vec_rolled_b[b, s, 2]
+            dkv = kx*vx + ky*vy + kz*vz
+            out[b, s, 0] = vx*ca + (ky*vz - kz*vy)*sa + kx*dkv*oma
+            out[b, s, 1] = vy*ca + (kz*vx - kx*vz)*sa + ky*dkv*oma
+            out[b, s, 2] = vz*ca + (kx*vy - ky*vx)*sa + kz*dkv*oma
 
 
 @numba.jit(nopython=True, cache=True)
@@ -316,6 +359,204 @@ def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
                               + mp_stacked[c, p3] * w3) * bv
 
 
+# ── Flat-sky fused kernel ─────────────────────────────────────────────────────
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _gather_accum_flatsky_jit(dtheta_tile, dphi_tile, k_b, theta_b, phi_b,
+                               nside, mp_stacked, beam_vals, B, Sc, tod):
+    """
+    Fully fused flat-sky HEALPix interpolation + beam accumulation.
+
+    Skips both Rodrigues rotations and vec2ang entirely.  Uses precomputed
+    angular offsets (dtheta, dphi) from the beam cache to compute sky positions
+    directly from the pointing angles (theta_b, phi_b):
+
+        theta_s(b, s) = theta_b[b] + dtheta_tile[k_b[b], s]
+        phi_s  (b, s) = phi_b  [b] + dphi_tile  [k_b[b], s] / sin(theta_b[b])
+
+    Then runs the standard HEALPix RING bilinear interpolation and accumulates
+    beam-weighted sky-map values into tod.  Parallelised over B (samples).
+
+    Parameters
+    ----------
+    dtheta_tile : (N_psi, Sc)  float32  — colatitude offsets for this S-tile
+    dphi_tile   : (N_psi, Sc)  float32  — raw phi offsets (divide by sin(theta_b))
+    k_b         : (B,)         int64    — psi bin index per sample
+    theta_b     : (B,)         float32  — pointing colatitude [rad]
+    phi_b       : (B,)         float32  — pointing longitude  [rad]
+    nside       : int
+    mp_stacked  : (C, N_hp)    float32  — stacked sky-map components
+    beam_vals   : (Sc,)        float32  — beam weights for this tile
+    B, Sc       : int
+    tod         : (C, B)       float64  — accumulated in place
+    """
+    C          = mp_stacked.shape[0]
+    npix_total = 12 * nside * nside
+
+    for b in numba.prange(B):
+        th_point = float(theta_b[b])
+        ph_point = float(phi_b[b])
+        kb       = k_b[b]
+        sin_th   = math.sin(th_point)
+        inv_sin  = 1.0 / sin_th if sin_th > 1e-10 else 0.0
+
+        for s in range(Sc):
+            theta = th_point + float(dtheta_tile[kb, s])
+            phi   = ph_point + float(dphi_tile[kb, s]) * inv_sin
+
+            # Clamp theta to [0, π] — flat-sky approximation can push edge
+            # beam pixels slightly outside the valid range near the poles.
+            if theta < 0.0:
+                theta = -theta
+                phi  += math.pi
+            elif theta > math.pi:
+                theta = _TWO_PI - theta
+                phi  += math.pi
+
+            # Wrap phi to [0, 2π)
+            if phi < 0.0:
+                phi += _TWO_PI
+            elif phi >= _TWO_PI:
+                phi -= _TWO_PI
+
+            # ── HEALPix RING bilinear interpolation (inline) ──────────────────
+            z        = math.cos(theta)
+            az       = abs(z)
+            if az > _TWO_THIRDS:
+                tp       = nside * math.sqrt(3.0 * (1.0 - az))
+                ir_above = int(tp)
+                if z < 0.0:
+                    ir_above = 4 * nside - ir_above - 1
+            else:
+                ir_above = int(nside * (2.0 - 1.5 * z))
+            ir_below = ir_above + 1
+
+            if ir_above == 0:
+                na1    = 4
+                fpa1   = 0
+                sa1    = 1
+                dphia1 = _TWO_PI / na1
+                phi0a1 = sa1 * dphia1 * 0.5
+                tw     = ((phi - phi0a1) / dphia1) % float(na1)
+                ip     = int(tw)
+                frac   = tw - ip
+                ip2    = (ip + 1) % na1
+                p2     = fpa1 + ip
+                p3     = fpa1 + ip2
+                p0     = (ip  + 2) % na1
+                p1     = (ip2 + 2) % na1
+                tmp_r1 = 1.0
+                za1    = 1.0 - tmp_r1 * tmp_r1 / (3.0 * nside * nside)
+                ta1    = math.acos(za1)
+                wt     = theta / ta1
+                nf     = (1.0 - wt) * 0.25
+                w0     = nf
+                w1     = nf
+                w2     = (1.0 - frac) * wt + nf
+                w3     = frac          * wt + nf
+
+            elif ir_below == 4 * nside:
+                ir_last = 4 * nside - 1
+                i2last  = 4 * nside - ir_last
+                na_l    = 4 * i2last
+                fpa_l   = npix_total - 2 * i2last * (i2last + 1)
+                dphia_l = _TWO_PI / na_l
+                phi0a_l = dphia_l * 0.5
+                tw      = ((phi - phi0a_l) / dphia_l) % float(na_l)
+                ip      = int(tw)
+                frac    = tw - ip
+                ip2     = (ip + 1) % na_l
+                p0      = fpa_l + ip
+                p1      = fpa_l + ip2
+                p2      = (ip  + 2) % na_l + fpa_l
+                p3      = (ip2 + 2) % na_l + fpa_l
+                tmp_rl  = float(i2last)
+                za_l    = -(1.0 - tmp_rl * tmp_rl / (3.0 * nside * nside))
+                ta_l    = math.acos(za_l)
+                wts     = (theta - ta_l) / (math.pi - ta_l)
+                sf      = wts * 0.25
+                w0      = (1.0 - frac) * (1.0 - wts) + sf
+                w1      = frac          * (1.0 - wts) + sf
+                w2      = sf
+                w3      = sf
+
+            else:
+                if ir_above < nside:
+                    tmp_a = float(ir_above)
+                    za = 1.0 - tmp_a * tmp_a / (3.0 * nside * nside)
+                elif ir_above <= 3 * nside:
+                    za = _TWO_THIRDS * (2.0 - float(ir_above) / nside)
+                else:
+                    tmp_a = float(4 * nside - ir_above)
+                    za = -(1.0 - tmp_a * tmp_a / (3.0 * nside * nside))
+                if ir_below < nside:
+                    tmp_b = float(ir_below)
+                    zb = 1.0 - tmp_b * tmp_b / (3.0 * nside * nside)
+                elif ir_below <= 3 * nside:
+                    zb = _TWO_THIRDS * (2.0 - float(ir_below) / nside)
+                else:
+                    tmp_b = float(4 * nside - ir_below)
+                    zb = -(1.0 - tmp_b * tmp_b / (3.0 * nside * nside))
+                ta      = math.acos(za)
+                tb      = math.acos(zb)
+                w_below = (theta - ta) / (tb - ta)
+                w_above = 1.0 - w_below
+
+                if ir_above < nside:
+                    na  = 4 * ir_above
+                    fpa = 2 * ir_above * (ir_above - 1)
+                    sa  = 1
+                elif ir_above <= 3 * nside:
+                    na  = 4 * nside
+                    fpa = 2 * nside * (nside - 1) + (ir_above - nside) * 4 * nside
+                    sa  = 1 if (ir_above - nside) % 2 == 0 else 0
+                else:
+                    i2a = 4 * nside - ir_above
+                    na  = 4 * i2a
+                    fpa = npix_total - 2 * i2a * (i2a + 1)
+                    sa  = 1
+                dphia = _TWO_PI / na
+                phi0a = sa * dphia * 0.5
+                tw    = ((phi - phi0a) / dphia) % float(na)
+                iphia = int(tw)
+                fphia = tw - iphia
+                p0    = fpa + iphia
+                p1    = fpa + (iphia + 1) % na
+                w0    = w_above * (1.0 - fphia)
+                w1    = w_above * fphia
+
+                if ir_below < nside:
+                    nb  = 4 * ir_below
+                    fpb = 2 * ir_below * (ir_below - 1)
+                    sb  = 1
+                elif ir_below <= 3 * nside:
+                    nb  = 4 * nside
+                    fpb = 2 * nside * (nside - 1) + (ir_below - nside) * 4 * nside
+                    sb  = 1 if (ir_below - nside) % 2 == 0 else 0
+                else:
+                    i2b = 4 * nside - ir_below
+                    nb  = 4 * i2b
+                    fpb = npix_total - 2 * i2b * (i2b + 1)
+                    sb  = 1
+                dphib = _TWO_PI / nb
+                phi0b = sb * dphib * 0.5
+                tw    = ((phi - phi0b) / dphib) % float(nb)
+                iphib = int(tw)
+                fphib = tw - iphib
+                p2    = fpb + iphib
+                p3    = fpb + (iphib + 1) % nb
+                w2    = w_below * (1.0 - fphib)
+                w3    = w_below * fphib
+
+            # ── gather + beam-weighted accumulation ───────────────────────────
+            bv = float(beam_vals[s])
+            for c in range(C):
+                tod[c, b] += (  mp_stacked[c, p0] * w0
+                              + mp_stacked[c, p1] * w1
+                              + mp_stacked[c, p2] * w2
+                              + mp_stacked[c, p3] * w3) * bv
+
+
 # ── Public numpy functions ────────────────────────────────────────────────────
 
 def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=(100, 100)):
@@ -431,14 +672,20 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
     intermediate stays within _S_TILE_TARGET_BYTES.  Uses Numba JIT kernels
     for both the rotation and the gather+accumulation steps.
 
-    When ``data`` contains ``'mp_stacked'`` (C, N) float32 the fully fused
-    ``_gather_accum_fused_jit`` kernel is used: it performs vec2ang, HEALPix
-    bilinear interpolation, and beam-weighted accumulation in a single parallel
-    pass, eliminating all four intermediate arrays (theta_flat, phi_flat,
-    pixels, weights) that the split-call version allocated per tile.
+    Three execution paths, selected by what ``data`` contains:
 
-    If ``'mp_stacked'`` is absent the function falls back to the numpy gather
-    path (used for validation / low-memory situations).
+    **Flat-sky** (fastest) — requires ``vec_rolled``, ``psi_grid``, ``dtheta``,
+    ``dphi``, and ``mp_stacked``.  Skips both Rodrigues rotations and vec2ang;
+    computes sky positions via precomputed angular offsets and feeds directly
+    into the HEALPix interpolation + accumulation kernel.
+
+    **Single-Rodrigues** — requires ``vec_rolled``, ``psi_grid``, and
+    ``mp_stacked``.  The psi-roll is baked into the precomputed vectors; only
+    the recentering rotation (Rodrigues 1) is applied at runtime.
+
+    **Original** (fallback) — full double Rodrigues rotation at runtime.  Used
+    when no cache arrays are present.  If ``mp_stacked`` is also absent the
+    function further falls back to the numpy gather path (validation only).
 
     Parameters
     ----------
@@ -461,6 +708,16 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
     comp_indices = data['comp_indices']
     C            = len(comp_indices)
     mp_stacked   = data.get('mp_stacked')   # (C, N) float32, or None
+    vec_rolled   = data.get('vec_rolled')   # (N_psi, S, 3) float32, or None
+    psi_grid     = data.get('psi_grid')     # (N_psi,) float32, or None
+    dtheta       = data.get('dtheta')       # (N_psi, S) float32, or None
+    dphi         = data.get('dphi')         # (N_psi, S) float32, or None
+
+    use_cache    = vec_rolled is not None and psi_grid is not None
+    # Flat-sky path: skips both Rodrigues rotations and vec2ang entirely.
+    # Requires mp_stacked since it feeds directly into _gather_accum_flatsky_jit.
+    use_flatsky  = use_cache and dtheta is not None and dphi is not None \
+                   and mp_stacked is not None
 
     # Lower bound from L2 target; upper bound from _MAX_TILES cap.
     # The max() ensures we never produce more than _MAX_TILES tiles even when
@@ -469,37 +726,84 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
     Sc = max(Sc, -(-S // _MAX_TILES))                  # tile-count cap (ceiling div)
     Sc = min(Sc, S)
 
-    # Pre-compute per-sample rotation scalars once for all S-tiles (O(B))
-    axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
-        rot_vecs, phi_b, theta_b, psis_b)
+    if use_cache:
+        # Map each sample's psi angle to the nearest precomputed bin index.
+        # Used by both the flat-sky and single-Rodrigues cached paths.
+        n_psi = len(psi_grid)
+        dpsi  = _TWO_PI / n_psi
+        k_b   = np.mod(
+            np.round(np.mod(psis_b, _TWO_PI) / dpsi).astype(np.int64),
+            n_psi,
+        )   # (B,)
+
+    # Rotation scalars are not needed on the flat-sky path — both rotations
+    # are bypassed. Compute them only for the other two paths.
+    if not use_flatsky:
+        axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
+            rot_vecs, phi_b, theta_b, psis_b)
 
     tod = {comp: np.zeros(B, dtype=np.float32) for comp in comp_indices}
 
     for s0 in range(0, S, Sc):
-        s1        = min(s0 + Sc, S)
-        vec_chunk = np.asarray(vec_orig[s0:s1], dtype=np.float32)  # (Sc, 3)
-        bv_chunk  = beam_vals[s0:s1]                                # (Sc,)
+        s1       = min(s0 + Sc, S)
+        bv_chunk = beam_vals[s0:s1]   # (Sc,)
 
-        # Fused double Rodrigues rotation — no intermediate (B, Sc, 3) temps
-        vec_rot = np.empty((B, s1 - s0, 3), dtype=np.float32)
-        _rodrigues_jit(vec_chunk, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot)
-
-        if mp_stacked is not None:
-            # Fully fused Numba path: vec2ang + HEALPix interp + accumulation
-            # in one parallel kernel — no theta_flat/phi_flat/pixels/weights allocs.
+        if use_flatsky:
+            # Flat-sky path: compute sky positions from precomputed angular
+            # offsets directly; skip all rotation and vec2ang arithmetic.
             tod_arr = np.zeros((C, B), dtype=np.float64)
-            _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
-                                    B, s1 - s0, tod_arr)
+            _gather_accum_flatsky_jit(
+                np.ascontiguousarray(dtheta[:, s0:s1]),
+                np.ascontiguousarray(dphi[:, s0:s1]),
+                k_b,
+                np.asarray(theta_b, dtype=np.float32),
+                np.asarray(phi_b,   dtype=np.float32),
+                nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr,
+            )
             for i, comp in enumerate(comp_indices):
                 tod[comp] += tod_arr[i].astype(np.float32)
+
+        elif use_cache:
+            # Single-Rodrigues path: psi-roll baked in, only recentering needed.
+            vec_chunk = vec_rolled[k_b[:, None], np.arange(s0, s1)[None, :], :]
+            vec_chunk = np.ascontiguousarray(vec_chunk.astype(np.float32))  # (B, Sc, 3)
+            vec_rot   = np.empty((B, s1 - s0, 3), dtype=np.float32)
+            _rodrigues1_from_rolled_jit(vec_chunk, axes, cos_a, sin_a, vec_rot)
+
+            if mp_stacked is not None:
+                tod_arr = np.zeros((C, B), dtype=np.float64)
+                _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
+                                        B, s1 - s0, tod_arr)
+                for i, comp in enumerate(comp_indices):
+                    tod[comp] += tod_arr[i].astype(np.float32)
+            else:
+                theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
+                pixels, weights      = get_interp_weights_numba(nside, theta_flat, phi_flat)
+                mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
+                mp_flat     = np.einsum('ckn,kn->cn', mp_gathered, weights)
+                tod_chunk   = mp_flat.reshape(C, B, s1 - s0) @ bv_chunk
+                for i, comp in enumerate(comp_indices):
+                    tod[comp] += tod_chunk[i]
+
         else:
-            # numpy fallback (mp_stacked not precomputed)
-            theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
-            pixels, weights      = get_interp_weights_numba(nside, theta_flat, phi_flat)
-            mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
-            mp_flat     = np.einsum('ckn,kn->cn', mp_gathered, weights)
-            tod_chunk   = mp_flat.reshape(C, B, s1 - s0) @ bv_chunk
-            for i, comp in enumerate(comp_indices):
-                tod[comp] += tod_chunk[i]
+            # Original path: double Rodrigues (recenter + psi roll).
+            vec_chunk = np.asarray(vec_orig[s0:s1], dtype=np.float32)  # (Sc, 3)
+            vec_rot   = np.empty((B, s1 - s0, 3), dtype=np.float32)
+            _rodrigues_jit(vec_chunk, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot)
+
+            if mp_stacked is not None:
+                tod_arr = np.zeros((C, B), dtype=np.float64)
+                _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
+                                        B, s1 - s0, tod_arr)
+                for i, comp in enumerate(comp_indices):
+                    tod[comp] += tod_arr[i].astype(np.float32)
+            else:
+                theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
+                pixels, weights      = get_interp_weights_numba(nside, theta_flat, phi_flat)
+                mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
+                mp_flat     = np.einsum('ckn,kn->cn', mp_gathered, weights)
+                tod_chunk   = mp_flat.reshape(C, B, s1 - s0) @ bv_chunk
+                for i, comp in enumerate(comp_indices):
+                    tod[comp] += tod_chunk[i]
 
     return tod

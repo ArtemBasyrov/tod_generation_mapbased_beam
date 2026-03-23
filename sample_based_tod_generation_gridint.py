@@ -8,10 +8,11 @@ import numpy as np
 import healpy as hp
 
 import tod_config as config
-from tod_io        import load_beam, load_scan_information, load_scan_data_batch, open_scan_day
-from tod_core      import precompute_rotation_vector_batch, beam_tod_batch
-from tod_calibrate import calibrate_n_processes
-from tod_utils     import get_ncpus, _fmt_time, should_print_batch
+from tod_io              import load_beam, load_scan_information, load_scan_data_batch, open_scan_day
+from tod_core            import precompute_rotation_vector_batch, beam_tod_batch
+from tod_calibrate       import calibrate_n_processes
+from tod_utils           import get_ncpus, _fmt_time, should_print_batch
+from precompute_beam_cache import cache_filename, load_cache
 
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -72,8 +73,16 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
 
 # ── Beam preparation ──────────────────────────────────────────────────────────
 
-def prepare_beam_data(beam_filenames):
-    """Load and preprocess all unique beam files. Returns beam_data dict."""
+def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
+    """
+    Load and preprocess all unique beam files. Returns beam_data dict.
+
+    If cache_dir is given, attempts to load precomputed vec_rolled / psi_grid
+    from the .npz files produced by precompute_beam_cache.py.  When found,
+    beam_tod_batch will apply only Rodrigues 1 (recentering) at runtime,
+    skipping the psi-roll rotation entirely.  Falls back silently to the
+    full double-Rodrigues path when no cache file is found.
+    """
     beam_groups = {}
     for i, bf in enumerate(beam_filenames):
         beam_groups.setdefault(bf, []).append(i)
@@ -102,6 +111,23 @@ def prepare_beam_data(beam_filenames):
             'vec_orig': vec_orig,
         }
         print(f"  Beam {bf}: {sel.sum()} selected pixels")
+
+        if cache_dir is not None:
+            cache_path = cache_filename(bf, cache_dir, cache_n_psi)
+            if os.path.exists(cache_path):
+                cache = load_cache(cache_path)
+                beam_data[bf]['vec_rolled'] = cache['vec_rolled']  # (N_psi, S, 3)
+                beam_data[bf]['psi_grid']   = cache['psi_grid']    # (N_psi,)
+                mode = "single-Rodrigues"
+                if 'dtheta' in cache and 'dphi' in cache:
+                    beam_data[bf]['dtheta'] = cache['dtheta']      # (N_psi, S)
+                    beam_data[bf]['dphi']   = cache['dphi']        # (N_psi, S)
+                    mode = "flat-sky (both rotations skipped)"
+                print(f"    Beam cache loaded: {cache_path}  "
+                      f"(N_psi={len(cache['psi_grid'])}, S={cache['vec_rolled'].shape[1]}, "
+                      f"mode={mode})")
+            else:
+                print(f"    [warn] Beam cache not found: {cache_path} — using exact double Rodrigues")
 
     return beam_data
 
@@ -227,7 +253,11 @@ def main(n_cpu_ceiling):
 
     # Load beams and calibrate once — result is shared by all days and workers.
     print("Loading beam data...")
-    beam_data = prepare_beam_data(beam_files)
+    beam_data = prepare_beam_data(
+        beam_files,
+        cache_dir  = config.beam_cache_dir,
+        cache_n_psi = config.beam_cache_n_psi,
+    )
 
     # Stack sky-map components per beam entry into a contiguous (C, N) float32
     # array.  The Numba gather kernel requires this layout.
