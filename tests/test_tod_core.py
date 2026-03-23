@@ -39,8 +39,10 @@ import pytest
 from tod_core import (
     _rotation_params,
     _rodrigues_jit,
+    _rodrigues1_from_rolled_jit,
     _gather_accum_jit,
     _gather_accum_fused_jit,
+    _gather_accum_flatsky_jit,
     get_interp_weights_numba,
     recenter_and_rotate,
     precompute_rotation_vector_batch,
@@ -871,6 +873,244 @@ class TestGatherAccumFusedJit:
 
             npt.assert_allclose(tod_fused, tod_ref, atol=1e-10,
                                 err_msg=f"Disagreement in {label} region at nside={nside}")
+
+
+# ===========================================================================
+# TestRodrigues1FromRolledJit
+# ===========================================================================
+
+class TestRodrigues1FromRolledJit:
+    """Tests for tod_core._rodrigues1_from_rolled_jit Numba kernel."""
+
+    def test_identity_rotation(self):
+        """Identity rotation (cos_a=1, sin_a=0) leaves vectors unchanged."""
+        rng = np.random.default_rng(60)
+        B, Sc = 3, 5
+        vec_rolled_b = rng.standard_normal((B, Sc, 3)).astype(np.float32)
+        vec_rolled_b /= np.linalg.norm(vec_rolled_b, axis=-1, keepdims=True)
+        axes  = np.zeros((B, 3), dtype=np.float32)
+        cos_a = np.ones(B, dtype=np.float32)
+        sin_a = np.zeros(B, dtype=np.float32)
+        out   = np.empty((B, Sc, 3), dtype=np.float32)
+        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
+        npt.assert_allclose(out, vec_rolled_b, atol=1e-5)
+
+    def test_output_shape(self):
+        """Output buffer has shape (B, Sc, 3) after the kernel call."""
+        B, Sc = 4, 7
+        vec_rolled_b = np.zeros((B, Sc, 3), dtype=np.float32)
+        axes  = np.zeros((B, 3), dtype=np.float32)
+        cos_a = np.ones(B, dtype=np.float32)
+        sin_a = np.zeros(B, dtype=np.float32)
+        out   = np.empty((B, Sc, 3), dtype=np.float32)
+        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
+        assert out.shape == (B, Sc, 3)
+
+    def test_unit_vector_norms_preserved(self):
+        """Rodrigues rotation preserves unit vector norms."""
+        rng = np.random.default_rng(61)
+        B, Sc = 4, 6
+        vec_rolled_b = rng.standard_normal((B, Sc, 3)).astype(np.float32)
+        vec_rolled_b /= np.linalg.norm(vec_rolled_b, axis=-1, keepdims=True)
+        rot_vecs = rng.standard_normal((B, 3)) * 0.5
+        angles   = np.linalg.norm(rot_vecs, axis=-1)
+        axes     = (rot_vecs / np.where(angles > 1e-10, angles, 1.0)[:, None]).astype(np.float32)
+        cos_a    = np.cos(angles).astype(np.float32)
+        sin_a    = np.sin(angles).astype(np.float32)
+        out      = np.empty((B, Sc, 3), dtype=np.float32)
+        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
+        norms = np.linalg.norm(out.astype(np.float64), axis=-1)
+        npt.assert_allclose(norms, np.ones((B, Sc)), atol=1e-4)
+
+    def test_matches_numpy_reference(self):
+        """Matches a pure-numpy single Rodrigues rotation to tolerance 1e-5."""
+        rng = np.random.default_rng(62)
+        B, Sc = 5, 8
+        vec_rolled_b = rng.standard_normal((B, Sc, 3)).astype(np.float32)
+        vec_rolled_b /= np.linalg.norm(vec_rolled_b, axis=-1, keepdims=True)
+        rot_vecs  = rng.standard_normal((B, 3)) * 0.4
+        angles    = np.linalg.norm(rot_vecs, axis=-1)
+        axes_f64  = rot_vecs / np.where(angles > 1e-10, angles, 1.0)[:, None]
+        cos_a     = np.cos(angles).astype(np.float32)
+        sin_a     = np.sin(angles).astype(np.float32)
+        axes      = axes_f64.astype(np.float32)
+
+        out = np.empty((B, Sc, 3), dtype=np.float32)
+        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
+
+        # Pure-numpy reference: single Rodrigues rotation per (b, s)
+        ref = np.empty_like(out, dtype=np.float64)
+        for b in range(B):
+            k = axes_f64[b]
+            ca, sa, oma = float(cos_a[b]), float(sin_a[b]), 1.0 - float(cos_a[b])
+            for s in range(Sc):
+                v   = vec_rolled_b[b, s].astype(np.float64)
+                dkv = np.dot(k, v)
+                ref[b, s] = v * ca + np.cross(k, v) * sa + k * dkv * oma
+
+        npt.assert_allclose(out.astype(np.float64), ref, atol=1e-5)
+
+    def test_90deg_rotation_around_z(self):
+        """90-degree rotation around z maps [1,0,0] to [0,1,0] for all B samples."""
+        B, Sc = 3, 1
+        vec_rolled_b = np.tile([[1.0, 0.0, 0.0]], (B, Sc, 1)).astype(np.float32)
+        axes  = np.tile([0.0, 0.0, 1.0], (B, 1)).astype(np.float32)
+        angle = np.float32(np.pi / 2)
+        cos_a = np.full(B, np.cos(angle), dtype=np.float32)
+        sin_a = np.full(B, np.sin(angle), dtype=np.float32)
+        out   = np.empty((B, Sc, 3), dtype=np.float32)
+        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
+        for b in range(B):
+            npt.assert_allclose(out[b, 0], [0.0, 1.0, 0.0], atol=1e-5)
+
+    def test_output_dtype_float32(self):
+        """Output buffer dtype is float32 (written in-place by the kernel)."""
+        B, Sc = 2, 4
+        vec_rolled_b = _random_unit_vectors(B * Sc).reshape(B, Sc, 3).astype(np.float32)
+        axes  = np.zeros((B, 3), dtype=np.float32)
+        cos_a = np.ones(B, dtype=np.float32)
+        sin_a = np.zeros(B, dtype=np.float32)
+        out   = np.empty((B, Sc, 3), dtype=np.float32)
+        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
+        assert out.dtype == np.float32
+
+
+# ===========================================================================
+# TestGatherAccumFlatsky
+# ===========================================================================
+
+class TestGatherAccumFlatsky:
+    """
+    Tests for tod_core._gather_accum_flatsky_jit.
+
+    Validates the flat-sky fused kernel against a reference pipeline and
+    checks output contracts (shape, accumulation, constant-map behaviour).
+    """
+
+    @staticmethod
+    def _make_pointing(B, seed=70):
+        rng = np.random.default_rng(seed)
+        theta_b = rng.uniform(0.2, np.pi - 0.2, B).astype(np.float32)
+        phi_b   = rng.uniform(0, 2 * np.pi, B).astype(np.float32)
+        return theta_b, phi_b
+
+    @staticmethod
+    def _zero_offsets(N_psi, Sc):
+        dtheta = np.zeros((N_psi, Sc), dtype=np.float32)
+        dphi   = np.zeros((N_psi, Sc), dtype=np.float32)
+        return dtheta, dphi
+
+    # ── output contract ──────────────────────────────────────────────────────
+
+    def test_output_shape(self):
+        """tod buffer has shape (C, B) after the kernel call."""
+        C, B, Sc, N_psi, nside = 3, 5, 4, 8, 16
+        theta_b, phi_b = self._make_pointing(B)
+        dtheta, dphi   = self._zero_offsets(N_psi, Sc)
+        k_b        = np.zeros(B, dtype=np.int64)
+        mp_stacked = np.ones((C, hp.nside2npix(nside)), dtype=np.float32)
+        beam_vals  = np.ones(Sc, dtype=np.float32) / Sc
+        tod        = np.zeros((C, B), dtype=np.float64)
+        _gather_accum_flatsky_jit(dtheta, dphi, k_b, theta_b, phi_b,
+                                  nside, mp_stacked, beam_vals, B, Sc, tod)
+        assert tod.shape == (C, B)
+
+    def test_zero_beam_vals_no_contribution(self):
+        """Zero beam_vals leave the tod buffer unchanged."""
+        C, B, Sc, N_psi, nside = 2, 4, 3, 4, 16
+        theta_b, phi_b = self._make_pointing(B)
+        dtheta, dphi   = self._zero_offsets(N_psi, Sc)
+        k_b        = np.zeros(B, dtype=np.int64)
+        mp_stacked = np.ones((C, hp.nside2npix(nside)), dtype=np.float32)
+        beam_vals  = np.zeros(Sc, dtype=np.float32)
+        tod        = np.zeros((C, B), dtype=np.float64)
+        _gather_accum_flatsky_jit(dtheta, dphi, k_b, theta_b, phi_b,
+                                  nside, mp_stacked, beam_vals, B, Sc, tod)
+        npt.assert_array_equal(tod, np.zeros((C, B)))
+
+    def test_constant_map_normalised_beam(self):
+        """Constant map + normalised beam gives tod ≈ map_value for all (c, b)."""
+        C, B, Sc, N_psi, nside = 2, 6, 5, 4, 32
+        map_val        = 3.0
+        theta_b, phi_b = self._make_pointing(B)
+        dtheta, dphi   = self._zero_offsets(N_psi, Sc)
+        k_b        = np.zeros(B, dtype=np.int64)
+        mp_stacked = np.full((C, hp.nside2npix(nside)), map_val, dtype=np.float32)
+        beam_vals  = np.full(Sc, 1.0 / Sc, dtype=np.float32)
+        tod        = np.zeros((C, B), dtype=np.float64)
+        _gather_accum_flatsky_jit(dtheta, dphi, k_b, theta_b, phi_b,
+                                  nside, mp_stacked, beam_vals, B, Sc, tod)
+        npt.assert_allclose(tod, np.full((C, B), map_val), atol=1e-4)
+
+    def test_inplace_accumulation(self):
+        """Calling the kernel twice on the same tod buffer doubles the result."""
+        C, B, Sc, N_psi, nside = 2, 4, 3, 4, 16
+        theta_b, phi_b = self._make_pointing(B)
+        dtheta, dphi   = self._zero_offsets(N_psi, Sc)
+        k_b        = np.zeros(B, dtype=np.int64)
+        mp_stacked = np.ones((C, hp.nside2npix(nside)), dtype=np.float32)
+        beam_vals  = np.full(Sc, 1.0 / Sc, dtype=np.float32)
+        tod        = np.zeros((C, B), dtype=np.float64)
+        _gather_accum_flatsky_jit(dtheta, dphi, k_b, theta_b, phi_b,
+                                  nside, mp_stacked, beam_vals, B, Sc, tod)
+        first = tod.copy()
+        _gather_accum_flatsky_jit(dtheta, dphi, k_b, theta_b, phi_b,
+                                  nside, mp_stacked, beam_vals, B, Sc, tod)
+        npt.assert_allclose(tod, 2.0 * first, atol=1e-14)
+
+    # ── agreement with _gather_accum_fused_jit ───────────────────────────────
+
+    def test_zero_offsets_agrees_with_fused_kernel(self):
+        """
+        With dtheta=dphi=0 all beam pixels collapse to the pointing direction.
+
+        Builds an equivalent vec_rot for _gather_accum_fused_jit where all Sc
+        pixels for sample b point along (theta_b[b], phi_b[b]) and verifies
+        that both kernels produce the same TOD (atol=1e-4, limited by float32
+        roundtrip of the angle → Cartesian → angle conversion).
+        """
+        C, B, Sc, N_psi, nside = 2, 5, 3, 4, 16
+        rng        = np.random.default_rng(76)
+        theta_b    = rng.uniform(0.2, np.pi - 0.2, B).astype(np.float32)
+        phi_b      = rng.uniform(0, 2 * np.pi, B).astype(np.float32)
+        dtheta, dphi = self._zero_offsets(N_psi, Sc)
+        k_b        = np.zeros(B, dtype=np.int64)
+        mp_stacked = rng.uniform(0.5, 1.5, (C, hp.nside2npix(nside))).astype(np.float32)
+        beam_vals  = rng.uniform(0.1, 1.0, Sc).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        # Flat-sky kernel
+        tod_flat = np.zeros((C, B), dtype=np.float64)
+        _gather_accum_flatsky_jit(dtheta, dphi, k_b, theta_b, phi_b,
+                                  nside, mp_stacked, beam_vals, B, Sc, tod_flat)
+
+        # Reference: all Sc pixels point to (theta_b[b], phi_b[b])
+        vec_rot = np.empty((B, Sc, 3), dtype=np.float32)
+        for b in range(B):
+            vec_rot[b, :, 0] = np.sin(theta_b[b]) * np.cos(phi_b[b])
+            vec_rot[b, :, 1] = np.sin(theta_b[b]) * np.sin(phi_b[b])
+            vec_rot[b, :, 2] = np.cos(theta_b[b])
+
+        tod_fused = np.zeros((C, B), dtype=np.float64)
+        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod_fused)
+
+        npt.assert_allclose(tod_flat, tod_fused, atol=1e-4,
+                            err_msg="flat-sky kernel disagrees with fused kernel on zero offsets")
+
+    @pytest.mark.parametrize("nside", [4, 16, 32])
+    def test_various_nsides(self, nside):
+        """Constant map gives tod ≈ map_value for several nside values."""
+        C, B, Sc, N_psi = 1, 4, 2, 4
+        theta_b, phi_b = self._make_pointing(B, seed=80)
+        dtheta, dphi   = self._zero_offsets(N_psi, Sc)
+        k_b        = np.zeros(B, dtype=np.int64)
+        mp_stacked = np.full((C, hp.nside2npix(nside)), 1.0, dtype=np.float32)
+        beam_vals  = np.full(Sc, 1.0 / Sc, dtype=np.float32)
+        tod        = np.zeros((C, B), dtype=np.float64)
+        _gather_accum_flatsky_jit(dtheta, dphi, k_b, theta_b, phi_b,
+                                  nside, mp_stacked, beam_vals, B, Sc, tod)
+        npt.assert_allclose(tod, np.ones((C, B)), atol=1e-4,
+                            err_msg=f"constant-map test failed at nside={nside}")
 
 
 # ---------------------------------------------------------------------------

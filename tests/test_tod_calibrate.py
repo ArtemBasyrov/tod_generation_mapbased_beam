@@ -1,7 +1,7 @@
 """
 Tests for the tod_calibrate module.
 
-Covers: _memory_cap, _candidate_batch_sizes.
+Covers: _memory_cap, _candidate_batch_sizes, calibrate_n_processes.
 
 Can be run independently:
     pytest tests/test_tod_calibrate.py -v
@@ -10,7 +10,7 @@ Can be run independently:
 
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -31,7 +31,7 @@ if "tod_io" not in sys.modules:
 # ---------------------------------------------------------------------------
 # Imports under test
 # ---------------------------------------------------------------------------
-from tod_calibrate import _memory_cap, _candidate_batch_sizes
+from tod_calibrate import _memory_cap, _candidate_batch_sizes, calibrate_n_processes
 
 
 # ===========================================================================
@@ -109,6 +109,107 @@ class TestCandidateBatchSizes:
         """Works correctly for mem_cap=1, returning a single-element list [1]."""
         result = _candidate_batch_sizes(1)
         assert result == [1]
+
+
+# ===========================================================================
+# TestCalibrateNProcesses
+# ===========================================================================
+
+class TestCalibrateNProcesses:
+    """
+    Tests for tod_calibrate.calibrate_n_processes.
+
+    calibrate_batch_size and get_memory_per_process are mocked so that the
+    logic under test is the n-process selection algorithm only.
+    """
+
+    # Minimal beam_data: n_sel drives max_beam_sel = 1_000_000.
+    _BEAM_DATA = {"beam_A": {"n_sel": 1_000_000}}
+
+    def test_returns_n_within_ceiling(self):
+        """n_optimal is always in [1, n_cpu_ceiling]."""
+        results = [(1, 100), (2, 300), (3, 350), (4, 400), (6, 380)]
+        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
+            n_opt, _ = calibrate_n_processes(
+                self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=4,
+            )
+        assert 1 <= n_opt <= 4
+
+    def test_returns_at_least_one(self):
+        """n_optimal is always >= 1."""
+        results = [(1, 50), (2, 100)]
+        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
+            n_opt, _ = calibrate_n_processes(
+                self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=1,
+            )
+        assert n_opt >= 1
+
+    def test_ceiling_one_returns_one(self):
+        """With n_cpu_ceiling=1, n_optimal is always 1."""
+        results = [(1, 1000), (2, 2000), (4, 3000)]
+        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate.get_memory_per_process", return_value=8.0):
+            n_opt, _ = calibrate_n_processes(
+                self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=1,
+            )
+        assert n_opt == 1
+
+    def test_maximizes_total_throughput(self):
+        """
+        The selected n maximizes n × per-process throughput.
+
+        Setup (total_memory_gb=1.0, max_beam_sel=1_000_000):
+          _memory_cap(1.0 / n, 1e6)  →  affordable batch sizes:
+            n=1 → cap=6,  bs=4  (tp=400), total=  400
+            n=2 → cap=3,  bs=3  (tp=350), total=  700
+            n=3 → cap=2,  bs=2  (tp=300), total=  900  ← winner
+            n=4 → cap=1,  bs=1  (tp=100), total=  400
+        """
+        results = [(1, 100), (2, 300), (3, 350), (4, 400), (6, 380)]
+        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
+            n_opt, bs_opt = calibrate_n_processes(
+                self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=4,
+            )
+        assert n_opt  == 3
+        assert bs_opt == 2
+
+    def test_batch_size_is_affordable_for_optimal_n(self):
+        """
+        The returned batch_size never exceeds the memory cap for the optimal n.
+        """
+        results = [(1, 100), (2, 300), (3, 350), (4, 400), (6, 380)]
+        total_gb = 1.0
+        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate.get_memory_per_process", return_value=total_gb):
+            n_opt, bs_opt = calibrate_n_processes(
+                self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=4,
+            )
+        max_beam_sel = 1_000_000
+        cap = _memory_cap(total_gb / n_opt, max_beam_sel)
+        assert bs_opt <= cap
+
+    def test_all_affordable_skipped_when_memory_too_small(self):
+        """
+        If memory per process is so small that no batch size is affordable for
+        some n values, those n are skipped and the result is still valid.
+        """
+        # Use a very large max_beam_sel so only n=1 has an affordable batch size.
+        beam_data = {"beam_A": {"n_sel": 100_000_000}}
+        # _memory_cap(1.0, 1e8) = max(1, int(1e9/1.5/1e10)) = max(1, 0) = 1
+        # _memory_cap(0.5, 1e8) = max(1, int(0.5e9/1.5/1e10)) = max(1, 0) = 1
+        # So cap=1 for all n; results must contain bs=1 to avoid "no affordable" skips.
+        results = [(1, 500)]
+        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
+            n_opt, bs_opt = calibrate_n_processes(
+                beam_data, ".", 0, [None], n_cpu_ceiling=4,
+            )
+        # Any n in [1,4] is valid; what matters is the result is sane.
+        assert 1 <= n_opt <= 4
+        assert bs_opt == 1
 
 
 # ---------------------------------------------------------------------------
