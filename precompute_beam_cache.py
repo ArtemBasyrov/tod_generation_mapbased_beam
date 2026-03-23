@@ -52,7 +52,7 @@ from tod_io import load_beam
 
 DEFAULT_N_PSI   = 720          # 0.5-degree bins; increase for wider beams
 BEAM_CENTER_IDX = (100, 100)   # must match precompute_rotation_vector_batch()
-DB_THRESHOLD_DB = -25          # pixel selection threshold (same as prepare_beam_data)
+DB_THRESHOLD_DB = -35          # pixel selection threshold (same as prepare_beam_data)
 
 
 # ── Rodrigues rotation (beam-frame, around beam_ctr) ──────────────────────────
