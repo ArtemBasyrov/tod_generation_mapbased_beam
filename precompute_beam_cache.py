@@ -46,13 +46,13 @@ import numba
 
 import tod_config as config
 from tod_io import load_beam
+from tod_utils import compute_dB_threshold_from_power
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 DEFAULT_N_PSI   = 720          # 0.5-degree bins; increase for wider beams
 BEAM_CENTER_IDX = (100, 100)   # must match precompute_rotation_vector_batch()
-DB_THRESHOLD_DB = -35          # pixel selection threshold (same as prepare_beam_data)
 
 
 # ── Rodrigues rotation (beam-frame, around beam_ctr) ──────────────────────────
@@ -136,7 +136,7 @@ def _compute_angular_offsets(vec_rolled, beam_ctr):
 
 # ── Per-beam precomputation ───────────────────────────────────────────────────
 
-def precompute_beam(bf, folder_beam, n_psi, compute_offsets=True):
+def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=True):
     """
     Load one beam file, apply pixel selection, and precompute vec_rolled.
 
@@ -145,6 +145,7 @@ def precompute_beam(bf, folder_beam, n_psi, compute_offsets=True):
     bf              : str   – beam filename (relative to folder_beam)
     folder_beam     : str   – beam folder path
     n_psi           : int   – number of psi bins
+    power_threshold : float – fraction of total power for pixel selection (e.g. 0.99)
     compute_offsets : bool  – also compute flat-sky angular offsets (Phase 2)
 
     Returns
@@ -157,7 +158,8 @@ def precompute_beam(bf, folder_beam, n_psi, compute_offsets=True):
     ra, dec, pixel_map = load_beam(folder_beam, bf)
 
     # ── pixel selection (mirrors prepare_beam_data) ────────────────────────
-    sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > DB_THRESHOLD_DB)
+    dB_cut = compute_dB_threshold_from_power(pixel_map, power_threshold)
+    sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > dB_cut)
     beam_vals = pixel_map[sel].astype(np.float32)
     norm      = beam_vals.sum()
     if norm != 0:
@@ -282,6 +284,11 @@ def main():
     output_dir = args.output_dir or config.FOLDER_BEAM
     os.makedirs(output_dir, exist_ok=True)
 
+    beam_threshold_map = {
+        config.beam_file_I: config.power_threshold_I,
+        config.beam_file_Q: config.power_threshold_Q,
+        config.beam_file_U: config.power_threshold_U,
+    }
     beam_files = list({config.beam_file_I, config.beam_file_Q, config.beam_file_U})
 
     print(f"Precomputing beam cache")
@@ -300,8 +307,9 @@ def main():
         cache = precompute_beam(
             bf,
             config.FOLDER_BEAM,
-            n_psi         = args.n_psi,
-            compute_offsets = not args.no_offsets,
+            n_psi             = args.n_psi,
+            power_threshold   = beam_threshold_map[bf],
+            compute_offsets   = not args.no_offsets,
         )
         save_cache(cache, out_path)
         print()

@@ -7,6 +7,7 @@ or psutil are unavailable.
 import os
 import multiprocessing
 import tod_config as config
+import numpy as np
 
 
 def _cpu_ceiling():
@@ -136,3 +137,44 @@ def should_print_batch(batch_idx, n_batches, max_prints=100):
         return True
     step = n_batches // max_prints
     return batch_idx % step == 0
+
+
+def compute_dB_threshold_from_power(beam_vals, power_cut):
+    """
+    Compute dB threshold from power percentage.
+    
+    Find threshold value where the sum of power for pixels above threshold 
+    equals the target power (total_power * power_cut).
+    
+    Parameters
+    ----------
+    beam_vals : ndarray — beam pixel values (linear)
+    power_cut : float   — fraction of total power for hard cut (e.g., 0.99)
+    
+    Returns
+    -------
+    dB_threshold : float — threshold in dB where sum of power above threshold ≈ target
+    """
+    # Flatten and ensure array
+    prof = np.asarray(beam_vals).flatten()
+    
+    # Calculate target power
+    target_power = np.sum(prof) * power_cut
+    
+    # Convert to dB
+    prof_dB = 10 * np.log10(prof)
+    
+    # Sort by dB values and get corresponding linear values
+    sort_idx = np.argsort(prof_dB)
+    sorted_dB = prof_dB[sort_idx]
+    sorted_prof = prof[sort_idx]
+    
+    # Calculate cumulative sum from highest to lowest (reverse order)
+    # This gives the sum of all pixels with dB >= threshold
+    cumulative_sums = np.cumsum(sorted_prof[::-1])[::-1]
+    
+    # Find index where cumulative sum is closest to target
+    idx = np.argmin(np.abs(cumulative_sums - target_power))
+    
+    # Return the threshold value
+    return sorted_dB[idx]

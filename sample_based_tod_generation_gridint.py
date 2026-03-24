@@ -11,7 +11,7 @@ import tod_config as config
 from tod_io              import load_beam, load_scan_information, load_scan_data_batch, open_scan_day
 from tod_core            import precompute_rotation_vector_batch, beam_tod_batch
 from tod_calibrate       import calibrate_n_processes
-from tod_utils           import get_ncpus, _fmt_time, should_print_batch
+from tod_utils           import get_ncpus, _fmt_time, should_print_batch, compute_dB_threshold_from_power
 from precompute_beam_cache import cache_filename, load_cache
 
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -35,7 +35,7 @@ _g_shm_handles = []     # SharedMemory handles kept alive for worker lifetime
 
 # ── Pool initialiser ─────────────────────────────────────────────────────────
 
-def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
+def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
     """
     Called once in each spawned worker process.
 
@@ -46,10 +46,15 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
 
     Parameters
     ----------
-    beam_data_static : dict  — beam_data without 'mp_stacked' (small arrays,
-                               safe to pickle)
+    beam_data_static : dict  — beam_data without large arrays (small scalars /
+                               tiny arrays safe to pickle: beam_vals, vec_orig,
+                               psi_grid, sel, ra, dec, …)
     mp_desc          : dict  — {'name', 'shape', 'dtype'} for the stacked MP block
     beam_shm_descs   : dict  — {beam_filename: {'name', 'shape', 'dtype'}}
+                               for mp_stacked
+    cache_shm_descs  : dict  — {beam_filename: {array_key: {'name','shape','dtype'}}}
+                               for vec_rolled, dtheta, dphi (present only when
+                               beam cache was loaded)
     """
     global _g_mp, _g_beam_data, _g_shm_handles
 
@@ -59,7 +64,8 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
     mp_full = np.ndarray(mp_desc['shape'], dtype=mp_desc['dtype'], buffer=shm_mp.buf)
     _g_mp = [mp_full[i] for i in range(mp_desc['shape'][0])]   # list of 3 views
 
-    # Attach to each beam entry's mp_stacked block
+    # Attach to each beam entry's mp_stacked block, then attach any
+    # beam-cache arrays (vec_rolled, dtheta, dphi) from their own blocks.
     _g_beam_data = {}
     for bf, static in beam_data_static.items():
         desc = beam_shm_descs[bf]
@@ -68,6 +74,12 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
         ms = np.ndarray(desc['shape'], dtype=desc['dtype'], buffer=shm.buf)
         entry = dict(static)
         entry['mp_stacked'] = ms
+
+        for key, cdesc in cache_shm_descs.get(bf, {}).items():
+            cshm = SharedMemory(name=cdesc['name'])
+            _g_shm_handles.append(cshm)
+            entry[key] = np.ndarray(cdesc['shape'], dtype=cdesc['dtype'], buffer=cshm.buf)
+
         _g_beam_data[bf] = entry
 
 
@@ -87,11 +99,18 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
     for i, bf in enumerate(beam_filenames):
         beam_groups.setdefault(bf, []).append(i)
 
+    beam_threshold_map = {
+        config.beam_file_I: config.power_threshold_I,
+        config.beam_file_Q: config.power_threshold_Q,
+        config.beam_file_U: config.power_threshold_U,
+    }
+
     beam_data = {}
     for bf, comp_indices in beam_groups.items():
         ra, dec, pixel_map = load_beam(folder_beam, bf)
 
-        sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > -25)
+        db_cut = compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
+        sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut)
         beam_vals = pixel_map[sel].astype(np.float32)
         norm      = beam_vals.sum()
         if norm != 0:
@@ -242,6 +261,7 @@ def main(n_cpu_ceiling):
     start = max(start_day or 0, 0)
     end   = min(end_day   or Nb, Nb)
     days  = range(start, end)
+    days = [148, 149, 150, 366]
 
     os.makedirs(folder_tod_output, exist_ok=True)
 
@@ -293,19 +313,38 @@ def main(n_cpu_ceiling):
         np.ndarray(mp_arr.shape, dtype=mp_arr.dtype, buffer=shm_mp.buf)[:] = mp_arr
         mp_desc = {'name': shm_mp.name, 'shape': mp_arr.shape, 'dtype': mp_arr.dtype}
 
-        # One block per unique beam file (in practice often just one entry).
-        beam_shms     = {}
+        # One block per unique beam file for mp_stacked (C, npix) float32.
+        beam_shms      = {}
         beam_shm_descs = {}
         for bf, data in beam_data.items():
-            ms  = data['mp_stacked']                           # (C, npix) float32
+            ms  = data['mp_stacked']
             shm = SharedMemory(create=True, size=ms.nbytes)
             np.ndarray(ms.shape, dtype=ms.dtype, buffer=shm.buf)[:] = ms
             beam_shms[bf]      = shm
             beam_shm_descs[bf] = {'name': shm.name, 'shape': ms.shape, 'dtype': ms.dtype}
 
-        # Small arrays (beam_vals, vec_orig, …) — safe to pickle per worker.
+        # Beam-cache arrays (vec_rolled, dtheta, dphi) — potentially large
+        # (N_psi × S × 3) and previously pickled to every worker. Move them
+        # into shared memory so workers attach zero-copy views instead.
+        _CACHE_KEYS = ('vec_rolled', 'dtheta', 'dphi')
+        cache_shms      = {bf: {} for bf in beam_data}
+        cache_shm_descs = {bf: {} for bf in beam_data}
+        for bf, data in beam_data.items():
+            for key in _CACHE_KEYS:
+                if key not in data:
+                    continue
+                arr = np.ascontiguousarray(data[key])
+                shm = SharedMemory(create=True, size=arr.nbytes)
+                np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)[:] = arr
+                cache_shms[bf][key]      = shm
+                cache_shm_descs[bf][key] = {'name': shm.name, 'shape': arr.shape,
+                                             'dtype': arr.dtype}
+
+        # Only small arrays remain in the pickle payload: beam_vals, vec_orig,
+        # psi_grid, sel, ra, dec, comp_indices, n_sel.
+        _SHARED_KEYS = {'mp_stacked'} | set(_CACHE_KEYS)
         beam_data_static = {
-            bf: {k: v for k, v in data.items() if k != 'mp_stacked'}
+            bf: {k: v for k, v in data.items() if k not in _SHARED_KEYS}
             for bf, data in beam_data.items()
         }
 
@@ -314,13 +353,17 @@ def main(n_cpu_ceiling):
             with multiprocessing.Pool(
                     processes=ncpus,
                     initializer=_worker_init,
-                    initargs=(beam_data_static, mp_desc, beam_shm_descs)) as pool:
+                    initargs=(beam_data_static, mp_desc,
+                              beam_shm_descs, cache_shm_descs)) as pool:
                 results = pool.map(worker, days)
         finally:
             # Release shared memory only after all workers have finished.
             shm_mp.close(); shm_mp.unlink()
             for shm in beam_shms.values():
                 shm.close(); shm.unlink()
+            for per_beam in cache_shms.values():
+                for shm in per_beam.values():
+                    shm.close(); shm.unlink()
 
         failed = [r for r in results if not r[1]]
         print(f"\nDone — {len(results)-len(failed)}/{len(results)} days OK")
