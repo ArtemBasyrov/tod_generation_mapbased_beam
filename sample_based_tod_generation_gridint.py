@@ -261,7 +261,6 @@ def main(n_cpu_ceiling):
     start = max(start_day or 0, 0)
     end   = min(end_day   or Nb, Nb)
     days  = range(start, end)
-    days = [148, 149, 150, 366]
 
     os.makedirs(folder_tod_output, exist_ok=True)
 
