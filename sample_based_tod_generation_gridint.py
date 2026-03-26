@@ -25,6 +25,10 @@ beam_files           = [config.beam_file_I, config.beam_file_Q, config.beam_file
 start_day = config.start_day
 end_day   = config.end_day
 
+interp_mode          = 'gaussian' if config.beam_interp_gaussian else 'bilinear'
+interp_sigma_deg     = config.beam_interp_sigma_deg
+interp_radius_deg    = config.beam_interp_radius_deg
+
 # ── Worker-global state (populated by _worker_init in each spawned process) ───
 # MP is loaded in the parent, placed in shared memory, and attached here
 # read-only by each worker — no copies, no re-loading the FITS file.
@@ -203,7 +207,10 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
 
         tod_batch = np.zeros((3, be - bs))
         for data in beam_data.values():
-            contrib = beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b)
+            contrib = beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
+                                     interp_mode=interp_mode,
+                                     sigma_deg=interp_sigma_deg,
+                                     radius_deg=interp_radius_deg)
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
 

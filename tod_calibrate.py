@@ -78,7 +78,7 @@ def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
     # The largest candidate (mem_cap) is the binding constraint.
     probe_n = mem_cap * _MIN_BATCHES_PER_PROBE
     theta_p, phi_p, psi_p = load_scan_data_batch(folder_scan, probe_day, 0, probe_n)
-    #probe_n = min(probe_n, len(phi_p))
+    probe_n = min(probe_n, len(phi_p))
 
     print(prefix + f"[calibrate] probe_n={probe_n}, mem_cap={mem_cap}, candidates={candidates}")
 

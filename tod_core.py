@@ -50,6 +50,9 @@ from numba_healpy import (
     _ring_z_jit,
     _get_interp_weights_jit,
     get_interp_weights_numba,
+    _query_disc_jit,
+    _pix2ang_ring_jit,
+    _ang2pix_ring_jit,
 )
 
 # Target working-set size for the (B × Sc × 3 × float32) vec_rot intermediate.
@@ -557,6 +560,107 @@ def _gather_accum_flatsky_jit(dtheta_tile, dphi_tile, k_b, theta_b, phi_b,
                               + mp_stacked[c, p3] * w3) * bv
 
 
+# ── Gaussian kernel interpolation helpers ────────────────────────────────────
+
+def _angular_distance(th1, ph1, th2, ph2):
+    """Great-circle angular distance between (th1,ph1) and arrays (th2,ph2) [rad]."""
+    cos_d = (np.sin(th1) * np.sin(th2) * np.cos(ph1 - ph2)
+             + np.cos(th1) * np.cos(th2))
+    return np.arccos(np.clip(cos_d, -1.0, 1.0))
+
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
+                                nside, mp_stacked, beam_vals, tod_arr,
+                                sigma_rad, radius_rad):
+    """
+    Numba JIT isotropic Gaussian kernel interpolation + beam-weighted
+    accumulation.  Parallelised over B (prange); sequential over Sc.
+
+    Uses _query_disc_jit (numba, no healpy), _pix2ang_ring_jit for neighbour
+    angles, and _ang2pix_ring_jit for the nearest-pixel fallback.
+
+    Parameters
+    ----------
+    theta_flat : (B*Sc,)  float64  co-latitude [rad]
+    phi_flat   : (B*Sc,)  float64  longitude   [rad]
+    B, Sc      : int
+    nside      : int
+    mp_stacked : (C, N_hp)  float32
+    beam_vals  : (Sc,)      float32
+    tod_arr    : (C, B)     float64  accumulated in place
+    sigma_rad  : float  Gaussian width [rad]
+    radius_rad : float  search radius  [rad]
+    """
+    two_sigma2 = 2.0 * sigma_rad * sigma_rad
+    C = mp_stacked.shape[0]
+
+    for b in numba.prange(B):
+        for s in range(Sc):
+            n  = b * Sc + s
+            th = theta_flat[n]
+            ph = phi_flat[n]
+            bv = float(beam_vals[s])
+
+            pix_idx = _query_disc_jit(nside, th, ph, radius_rad, True)
+            M = pix_idx.shape[0]
+
+            if M == 0:
+                nearest = _ang2pix_ring_jit(nside, th, ph)
+                for c in range(C):
+                    tod_arr[c, b] += mp_stacked[c, nearest] * bv
+                continue
+
+            # Compute Gaussian weights for each neighbour pixel.
+            sin_th = math.sin(th)
+            cos_th = math.cos(th)
+            w_arr  = np.empty(M, dtype=np.float64)
+            w_sum  = 0.0
+            for k in range(M):
+                theta_n, phi_n = _pix2ang_ring_jit(nside, pix_idx[k])
+                cos_d = (sin_th * math.sin(theta_n) * math.cos(ph - phi_n)
+                         + cos_th * math.cos(theta_n))
+                if cos_d > 1.0:
+                    cos_d = 1.0
+                elif cos_d < -1.0:
+                    cos_d = -1.0
+                dist    = math.acos(cos_d)
+                w       = math.exp(-dist * dist / two_sigma2)
+                w_arr[k] = w
+                w_sum   += w
+
+            if w_sum < 1e-300:
+                # All weights are negligible: fall back to the pixel with
+                # maximum weight (i.e. closest to the query point).
+                best_k = 0
+                for k in range(1, M):
+                    if w_arr[k] > w_arr[best_k]:
+                        best_k = k
+                for c in range(C):
+                    tod_arr[c, b] += mp_stacked[c, pix_idx[best_k]] * bv
+            else:
+                inv_w = 1.0 / w_sum
+                for c in range(C):
+                    acc = 0.0
+                    for k in range(M):
+                        acc += w_arr[k] * mp_stacked[c, pix_idx[k]]
+                    tod_arr[c, b] += acc * inv_w * bv
+
+
+def _gaussian_interp_accum(theta_flat, phi_flat, B, Sc,
+                            nside, mp_stacked, beam_vals, tod_arr,
+                            sigma_deg, radius_deg):
+    """
+    Thin wrapper: converts degrees → radians and delegates to the JIT kernel
+    ``_gaussian_interp_accum_jit``.
+    """
+    sigma_rad  = math.radians(sigma_deg)
+    radius_rad = math.radians(radius_deg)
+    _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
+                                nside, mp_stacked, beam_vals, tod_arr,
+                                sigma_rad, radius_rad)
+
+
 # ── Public numpy functions ────────────────────────────────────────────────────
 
 def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=(100, 100)):
@@ -664,7 +768,8 @@ def recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
     return out
 
 
-def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
+def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
+                   interp_mode='bilinear', sigma_deg=None, radius_deg=None):
     """
     Accumulate the TOD contribution of one beam entry for a batch of B samples.
 
@@ -689,13 +794,24 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
 
     Parameters
     ----------
-    nside    : int
-    mp       : list of arrays — sky map components (fallback only)
-    data     : dict — beam_data entry
-    rot_vecs : (B, 3)
-    phi_b    : (B,)
-    theta_b  : (B,)
-    psis_b   : (B,)
+    nside       : int
+    mp          : list of arrays — sky map components (fallback only)
+    data        : dict — beam_data entry
+    rot_vecs    : (B, 3)
+    phi_b       : (B,)
+    theta_b     : (B,)
+    psis_b      : (B,)
+    interp_mode : str, optional
+        ``'bilinear'`` (default) — fast 4-pixel bilinear HEALPix interpolation
+        via the Numba fused kernel.
+        ``'gaussian'`` — isotropic Gaussian kernel interpolation using
+        hp.query_disc; slower but avoids grid-aligned artefacts.
+    sigma_deg   : float or None
+        Gaussian width [degrees].  Defaults to one HEALPix pixel resolution.
+        Ignored when interp_mode='bilinear'.
+    radius_deg  : float or None
+        Neighbour search radius [degrees].  Defaults to 3 × sigma_deg.
+        Ignored when interp_mode='bilinear'.
 
     Returns
     -------
@@ -718,6 +834,13 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
     # Requires mp_stacked since it feeds directly into _gather_accum_flatsky_jit.
     use_flatsky  = use_cache and dtheta is not None and dphi is not None \
                    and mp_stacked is not None
+    use_gaussian = interp_mode == 'gaussian'
+
+    # Resolve Gaussian defaults once (avoids repeating hp.nside2resol per tile).
+    if use_gaussian:
+        pix_res_deg   = np.degrees(hp.nside2resol(nside))
+        _sigma_deg    = sigma_deg  if sigma_deg  is not None else pix_res_deg
+        _radius_deg   = radius_deg if radius_deg is not None else 3.0 * _sigma_deg
 
     # Lower bound from L2 target; upper bound from _MAX_TILES cap.
     # The max() ensures we never produce more than _MAX_TILES tiles even when
@@ -749,19 +872,48 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
         bv_chunk = beam_vals[s0:s1]   # (Sc,)
 
         if use_flatsky:
-            # Flat-sky path: compute sky positions from precomputed angular
-            # offsets directly; skip all rotation and vec2ang arithmetic.
-            tod_arr = np.zeros((C, B), dtype=np.float64)
-            _gather_accum_flatsky_jit(
-                np.ascontiguousarray(dtheta[:, s0:s1]),
-                np.ascontiguousarray(dphi[:, s0:s1]),
-                k_b,
-                np.asarray(theta_b, dtype=np.float32),
-                np.asarray(phi_b,   dtype=np.float32),
-                nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr,
-            )
-            for i, comp in enumerate(comp_indices):
-                tod[comp] += tod_arr[i].astype(np.float32)
+            if use_gaussian:
+                # Flat-sky + Gaussian: compute absolute sky angles from the
+                # precomputed offsets, then apply Gaussian kernel interpolation.
+                dth_tile = dtheta[:, s0:s1]   # (N_psi, Sc)
+                dph_tile = dphi[:, s0:s1]
+                theta_b_f = np.asarray(theta_b, dtype=np.float64)
+                phi_b_f   = np.asarray(phi_b,   dtype=np.float64)
+                theta_flat = np.empty(B * (s1 - s0), dtype=np.float64)
+                phi_flat   = np.empty(B * (s1 - s0), dtype=np.float64)
+                for b in range(B):
+                    kb       = k_b[b]
+                    sin_th   = math.sin(theta_b_f[b])
+                    inv_sin  = 1.0 / sin_th if sin_th > 1e-10 else 0.0
+                    th_arr   = theta_b_f[b] + dth_tile[kb].astype(np.float64)
+                    ph_arr   = phi_b_f[b]   + dph_tile[kb].astype(np.float64) * inv_sin
+                    # Clamp/wrap same as _gather_accum_flatsky_jit
+                    neg      = th_arr < 0.0
+                    th_arr[neg] = -th_arr[neg];  ph_arr[neg] += math.pi
+                    over     = th_arr > math.pi
+                    th_arr[over] = 2.0 * math.pi - th_arr[over]; ph_arr[over] += math.pi
+                    ph_arr   = ph_arr % (2.0 * math.pi)
+                    theta_flat[b*(s1-s0):(b+1)*(s1-s0)] = th_arr
+                    phi_flat  [b*(s1-s0):(b+1)*(s1-s0)] = ph_arr
+                tod_arr = np.zeros((C, B), dtype=np.float64)
+                _gaussian_interp_accum(theta_flat, phi_flat, B, s1 - s0,
+                                       nside, mp_stacked, bv_chunk, tod_arr,
+                                       _sigma_deg, _radius_deg)
+                for i, comp in enumerate(comp_indices):
+                    tod[comp] += tod_arr[i].astype(np.float32)
+            else:
+                # Flat-sky bilinear path (original).
+                tod_arr = np.zeros((C, B), dtype=np.float64)
+                _gather_accum_flatsky_jit(
+                    np.ascontiguousarray(dtheta[:, s0:s1]),
+                    np.ascontiguousarray(dphi[:, s0:s1]),
+                    k_b,
+                    np.asarray(theta_b, dtype=np.float32),
+                    np.asarray(phi_b,   dtype=np.float32),
+                    nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr,
+                )
+                for i, comp in enumerate(comp_indices):
+                    tod[comp] += tod_arr[i].astype(np.float32)
 
         elif use_cache:
             # Single-Rodrigues path: psi-roll baked in, only recentering needed.
@@ -772,8 +924,15 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
 
             if mp_stacked is not None:
                 tod_arr = np.zeros((C, B), dtype=np.float64)
-                _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
-                                        B, s1 - s0, tod_arr)
+                if use_gaussian:
+                    theta_flat, phi_flat = hp.vec2ang(
+                        vec_rot.reshape(-1, 3).astype(np.float64))
+                    _gaussian_interp_accum(theta_flat, phi_flat, B, s1 - s0,
+                                           nside, mp_stacked, bv_chunk, tod_arr,
+                                           _sigma_deg, _radius_deg)
+                else:
+                    _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
+                                            B, s1 - s0, tod_arr)
                 for i, comp in enumerate(comp_indices):
                     tod[comp] += tod_arr[i].astype(np.float32)
             else:
@@ -793,8 +952,15 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b):
 
             if mp_stacked is not None:
                 tod_arr = np.zeros((C, B), dtype=np.float64)
-                _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
-                                        B, s1 - s0, tod_arr)
+                if use_gaussian:
+                    theta_flat, phi_flat = hp.vec2ang(
+                        vec_rot.reshape(-1, 3).astype(np.float64))
+                    _gaussian_interp_accum(theta_flat, phi_flat, B, s1 - s0,
+                                           nside, mp_stacked, bv_chunk, tod_arr,
+                                           _sigma_deg, _radius_deg)
+                else:
+                    _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
+                                            B, s1 - s0, tod_arr)
                 for i, comp in enumerate(comp_indices):
                     tod[comp] += tod_arr[i].astype(np.float32)
             else:
