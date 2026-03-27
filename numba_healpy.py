@@ -476,6 +476,89 @@ def _query_disc_jit(nside, theta_q, phi_q, radius_rad, inclusive):
     return result[:count]
 
 
+@numba.jit(nopython=True, cache=True)
+def _query_disc_into_jit(nside, theta_q, phi_q, radius_rad, inclusive, out_buf):
+    """
+    Like _query_disc_jit but writes pixel indices into a pre-allocated buffer
+    instead of allocating a new array.  Returns the count M of pixels found.
+
+    Parameters
+    ----------
+    nside      : int
+    theta_q    : float  disc-centre colatitude [rad]
+    phi_q      : float  disc-centre longitude  [rad]
+    radius_rad : float  disc radius [rad]
+    inclusive  : bool   if True enlarge radius by ~max pixel radius
+    out_buf    : (max_M,) int64  caller-allocated scratch buffer
+
+    Returns
+    -------
+    M : int  number of pixels written into out_buf[:M]
+    """
+    npix_total = 12 * nside * nside
+    z_q        = math.cos(theta_q)
+    sin_th_q   = math.sqrt(max(0.0, 1.0 - z_q * z_q))
+
+    if inclusive:
+        search_rad = radius_rad + math.sqrt(math.pi / (3.0 * nside * nside))
+    else:
+        search_rad = radius_rad
+
+    if search_rad >= math.pi:
+        for i in range(npix_total):
+            out_buf[i] = i
+        return npix_total
+
+    cos_search = math.cos(search_rad)
+
+    theta_lo = max(0.0,      theta_q - search_rad)
+    theta_hi = min(math.pi,  theta_q + search_rad)
+    ir_min   = max(1,             _ring_above_jit(nside, math.cos(theta_lo)) + 1)
+    ir_max   = min(4 * nside - 1, _ring_above_jit(nside, math.cos(theta_hi)))
+
+    if ir_min > ir_max:
+        return 0
+
+    count = 0
+
+    for ir in range(ir_min, ir_max + 1):
+        z_r      = _ring_z_jit(nside, ir)
+        sin_th_r = math.sqrt(max(0.0, 1.0 - z_r * z_r))
+        n_p, fp, phi0, dphi = _ring_info_jit(nside, ir, npix_total)
+
+        denom = sin_th_q * sin_th_r
+        if denom < 1e-12:
+            for ip in range(n_p):
+                out_buf[count] = fp + ip
+                count += 1
+            continue
+
+        x = (cos_search - z_q * z_r) / denom
+        if x > 1.0:
+            continue
+        if x <= -1.0:
+            for ip in range(n_p):
+                out_buf[count] = fp + ip
+                count += 1
+            continue
+
+        dphi_half = math.acos(x)
+
+        ip_lo = int(math.ceil( (phi_q - dphi_half - phi0) / dphi - 1e-10))
+        ip_hi = int(math.floor((phi_q + dphi_half - phi0) / dphi + 1e-10))
+
+        if ip_hi - ip_lo + 1 >= n_p:
+            for ip in range(n_p):
+                out_buf[count] = fp + ip
+                count += 1
+        else:
+            for ip_idx in range(ip_lo, ip_hi + 1):
+                out_buf[count] = fp + ip_idx % n_p
+                count += 1
+
+    return count
+
+
 def query_disc_numba(nside, vec, radius_rad, inclusive=True, nest=False):
     """
     Drop-in Numba replacement for ``hp.query_disc(nside, vec, radius, ...)``.
