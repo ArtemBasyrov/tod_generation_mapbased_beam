@@ -46,13 +46,12 @@ import numba
 
 import tod_config as config
 from tod_io import load_beam
-from tod_utils import compute_dB_threshold_from_power
+from tod_utils import _compute_dB_threshold_from_power
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-DEFAULT_N_PSI   = 720          # 0.5-degree bins; increase for wider beams
-BEAM_CENTER_IDX = (100, 100)   # must match precompute_rotation_vector_batch()
+DEFAULT_N_PSI = 720    # 0.5-degree bins; increase for wider beams
 
 
 # ── Rodrigues rotation (beam-frame, around beam_ctr) ──────────────────────────
@@ -178,7 +177,7 @@ def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=Tru
     ra, dec, pixel_map = load_beam(folder_beam, bf)
 
     # ── pixel selection (mirrors prepare_beam_data) ────────────────────────
-    dB_cut = compute_dB_threshold_from_power(pixel_map, power_threshold)
+    dB_cut = _compute_dB_threshold_from_power(pixel_map, power_threshold)
     sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > dB_cut)
     beam_vals = pixel_map[sel].astype(np.float32)
     norm      = beam_vals.sum()
@@ -196,18 +195,19 @@ def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=Tru
     print(f"    {S} selected pixels", flush=True)
 
     # ── beam-centre unit vector ────────────────────────────────────────────
-    # Must match BEAM_CENTER_IDX used in precompute_rotation_vector_batch().
-    phi_c   = float(ra [BEAM_CENTER_IDX])
-    th_c    = float(np.pi / 2 - dec[BEAM_CENTER_IDX])
+    # Centre pixel is computed from the grid shape, matching load_beam() and
+    # precompute_rotation_vector_batch().
+    center_idx = (ra.shape[0] // 2, ra.shape[1] // 2)
+    phi_c   = float(ra [center_idx])
+    th_c    = float(np.pi / 2 - dec[center_idx])
     beam_ctr = np.array([
         np.sin(th_c) * np.cos(phi_c),
         np.sin(th_c) * np.sin(phi_c),
         np.cos(th_c),
     ], dtype=np.float32)
     # ra/dec offsets are already centred, so beam_ctr = [1, 0, 0].
-    # This assertion guards against BEAM_CENTER_IDX mismatches.
     assert np.allclose(beam_ctr, [1., 0., 0.], atol=1e-4), (
-        f"Unexpected beam_ctr {beam_ctr} — check BEAM_CENTER_IDX")
+        f"Unexpected beam_ctr {beam_ctr} — check that load_beam() centres the grid correctly")
 
     # ── psi grid ──────────────────────────────────────────────────────────
     # Cover the full circle; psi outside [0, 2π] wraps via modulo at runtime.
@@ -248,7 +248,7 @@ def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=Tru
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
-def cache_filename(bf, output_dir, n_psi):
+def _cache_filename(bf, output_dir, n_psi):
     """Return the .npz cache path for a given beam filename.
 
     The cache file is named ``{beam_stem}_cache_npsi{n_psi}.npz`` inside
@@ -268,18 +268,18 @@ def cache_filename(bf, output_dir, n_psi):
     return os.path.join(output_dir, f"{stem}_cache_npsi{n_psi}.npz")
 
 
-def save_cache(cache, path):
+def _save_cache(cache, path):
     np.savez_compressed(path, **cache)
     size_mb = os.path.getsize(path) / 1e6
     print(f"    Saved → {path}  ({size_mb:.1f} MB compressed)", flush=True)
 
 
-def load_cache(path):
+def _load_cache(path):
     """Load a precomputed beam cache file.
 
     Args:
         path (str): Path to the ``.npz`` cache file produced by
-            :func:`precompute_beam` / :func:`save_cache`.
+            :func:`precompute_beam` / :func:`_save_cache`.
 
     Returns:
         dict[str, numpy.ndarray]: Dictionary of arrays. Expected keys:
@@ -292,7 +292,7 @@ def load_cache(path):
 
 # ── Runtime helper (used by main TOD script) ──────────────────────────────────
 
-def lookup_psi_bin(psi_values, psi_grid):
+def _lookup_psi_bin(psi_values, psi_grid):
     """Map psi angles to the nearest bin index in an evenly-spaced psi grid.
 
     Wraps ``psi_values`` to ``[0, 2π)`` before binning, so the input may span
@@ -344,7 +344,7 @@ def main():
     print()
 
     for bf in beam_files:
-        out_path = cache_filename(bf, output_dir, args.n_psi)
+        out_path = _cache_filename(bf, output_dir, args.n_psi)
         if os.path.exists(out_path):
             print(f"  [skip] {bf} — cache exists at {out_path}")
             continue
@@ -357,7 +357,7 @@ def main():
             power_threshold   = beam_threshold_map[bf],
             compute_offsets   = not args.no_offsets,
         )
-        save_cache(cache, out_path)
+        _save_cache(cache, out_path)
         print()
 
     print("Done.")

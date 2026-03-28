@@ -5,7 +5,7 @@ Core numerical routines for sample-based TOD generation. All public functions
 are stateless and accept only arrays as arguments.
 
 .. automodule:: tod_core
-   :members: precompute_rotation_vector_batch, recenter_and_rotate, beam_tod_batch
+   :members: precompute_rotation_vector_batch, beam_tod_batch
    :undoc-members: False
    :show-inheritance: True
 

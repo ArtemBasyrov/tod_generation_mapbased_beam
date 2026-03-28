@@ -27,12 +27,15 @@ Quick Start
    * ``path_to_map`` — HEALPix FITS file containing I, Q, U.
    * ``FOLDER_BEAM`` and ``beam_file_I/Q/U`` — beam FITS files.
 
-2. **(Optional but recommended) Pre-compute the beam rotation cache**::
+2. **(Optional) Pre-compute the beam rotation cache**::
 
        python precompute_beam_cache.py --n_psi 720
 
-   This eliminates one or both Rodrigues rotations per sample at runtime.
-   Then set ``beam_cache_dir`` in your config to the output directory.
+   This eliminates one or both Rodrigues rotations per sample at runtime,
+   yielding roughly a 25 % speed-up. However, the psi-roll is evaluated on a
+   discrete grid rather than continuously, which introduces a small interpolation
+   error. **Not recommended for experiments requiring high precision.** If you
+   do use caching, set ``beam_cache_dir`` in your config to the output directory.
 
 3. **Run the pipeline**::
 
@@ -62,7 +65,8 @@ total allocated CPUs — the calibration captures this correctly.
 Output Files
 ------------
 
-One ``.npy`` file is written per observation day::
+One ``.npy`` file is written per processing batch (the filename uses a *day*
+index by convention, but the index can represent any batching unit you choose)::
 
     FOLDER_TOD_OUTPUT/tod_day_0.npy
     FOLDER_TOD_OUTPUT/tod_day_1.npy

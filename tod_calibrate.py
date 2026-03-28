@@ -21,9 +21,9 @@ import time
 import numpy as np
 import healpy as hp
 
-from tod_io   import load_scan_data_batch
+from tod_io   import _load_scan_data_batch
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
-from tod_utils import _fmt_time, get_memory_per_process
+from tod_utils import _fmt_time, _get_memory_per_process
 
 _BYTES_PER_SAMPLE_PER_BEAM = 100   # memory model ceiling constant
 _MEMORY_SAFETY_FACTOR       = 1.5
@@ -43,7 +43,7 @@ def _candidate_batch_sizes(mem_cap):
     return [c for c in candidates if c <= mem_cap]
 
 
-def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
+def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
                          n_repeats=3, prefix=""):
     """Find the batch size that maximises sustained throughput on this hardware.
 
@@ -59,7 +59,7 @@ def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
             data.
         mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``.
         n_processes (int): Number of worker processes. Used to derive the
-            per-process memory budget via :func:`~tod_utils.get_memory_per_process`.
+            per-process memory budget via :func:`~tod_utils._get_memory_per_process`.
         n_repeats (int): Number of interleaved timing rounds per candidate.
             Defaults to ``3``.
         prefix (str): Log-message prefix (e.g. process name). Defaults to ``""``.
@@ -76,14 +76,14 @@ def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
     first_bf     = next(iter(beam_data))
     ra0, dec0    = beam_data[first_bf]['ra'], beam_data[first_bf]['dec']
 
-    max_memory_gb = get_memory_per_process(n_processes)
+    max_memory_gb = _get_memory_per_process(n_processes)
     mem_cap       = _memory_cap(max_memory_gb, max_beam_sel)
     candidates = _candidate_batch_sizes(mem_cap)
 
     # Every candidate must run at least _MIN_BATCHES_PER_PROBE full batches.
     # The largest candidate (mem_cap) is the binding constraint.
     probe_n = mem_cap * _MIN_BATCHES_PER_PROBE
-    theta_p, phi_p, psi_p = load_scan_data_batch(folder_scan, probe_day, 0, probe_n)
+    theta_p, phi_p, psi_p = _load_scan_data_batch(folder_scan, probe_day, 0, probe_n)
     probe_n = min(probe_n, len(phi_p))
 
     print(prefix + f"[calibrate] probe_n={probe_n}, mem_cap={mem_cap}, candidates={candidates}")
@@ -124,7 +124,7 @@ def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
     return best_bs, results
 
 
-def calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
+def _calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
                            n_repeats=3, prefix=""):
     """Find the optimal number of worker processes for maximum total throughput.
 
@@ -136,7 +136,7 @@ def calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
 
     Strategy:
 
-    1. Run :func:`calibrate_batch_size` once with the full available memory
+    1. Run :func:`_calibrate_batch_size` once with the full available memory
        (as if ``n = 1``) to obtain a throughput curve over all candidate batch
        sizes.
     2. For each candidate ``n`` in ``[1, n_cpu_ceiling]``, find the largest
@@ -163,13 +163,13 @@ def calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
     """
     max_beam_sel = max(d['n_sel'] for d in beam_data.values())
 
-    # Total usable memory: get_memory_per_process(1) = available × fraction / 1
-    total_memory_gb = get_memory_per_process(1)
+    # Total usable memory: _get_memory_per_process(1) = available × fraction / 1
+    total_memory_gb = _get_memory_per_process(1)
 
     # Run calibration with full memory to get throughput at all batch sizes.
     print(prefix + f"[n_proc] Calibrating throughput curve "
           f"(total_memory={total_memory_gb:.1f} GB, cpu_ceiling={n_cpu_ceiling})...")
-    _, results = calibrate_batch_size(
+    _, results = _calibrate_batch_size(
         beam_data, folder_scan, probe_day, mp,
         n_processes=1,
         n_repeats=n_repeats,

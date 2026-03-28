@@ -1,8 +1,13 @@
 # TOD Generation from Beam Convolution
 
+[![Documentation](https://img.shields.io/badge/docs-readthedocs-blue)](https://tod-generation-mapbased-beam.readthedocs.io/en/latest/index.html)
+
+> **Full documentation:** https://tod-generation-mapbased-beam.readthedocs.io/en/latest/index.html
+
 Sample-based Time-Ordered Data (TOD) generation for CMB experiments. Convolves
 polarised sky maps (I, Q, U) with pixelated beam patterns over a boresight
-scan trajectory, producing one TOD file per observation day.
+scan trajectory, producing one TOD file per processing batch (days are used as
+the default batching unit, but any convenient grouping can be used).
 
 ---
 
@@ -37,7 +42,7 @@ pip install numpy healpy pixell numba pyyaml psutil
 cp config.yaml config_local.yaml
 $EDITOR config_local.yaml   # set FOLDER_SCAN, FOLDER_TOD_OUTPUT, path_to_map, etc.
 
-# 3. (Optional but recommended) pre-compute beam rotation cache
+# 3. (Optional) pre-compute beam rotation cache (~25% speed-up, but reduced accuracy)
 python precompute_beam_cache.py --n_psi 720
 
 # 4. Run the pipeline
@@ -78,12 +83,16 @@ precedence when present). Both files use YAML syntax.
 Increase toward `1.0` for higher fidelity (more beam pixels, slower). Decrease
 toward `0.9` to aggressively prune faint sidelobes.
 
-### Day range
+### Batch range
+
+The pipeline uses the term *day* for the scan file index suffix, but this can
+represent any batching unit you choose — an observation session, a CES, an
+hour of data, etc.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `start_day` | `int` | `0` | First day index to process (inclusive). |
-| `end_day` | `int` | total days in scan | Last day index to process (exclusive). Set to `null` to process all days. |
+| `start_day` | `int` | `0` | First batch index to process (inclusive). |
+| `end_day` | `int` | total batches | Last batch index to process (exclusive). Set to `null` to process all batches. |
 
 ### Multiprocessing
 
@@ -128,7 +137,7 @@ directory produced by `precompute_beam_cache.py`.
 | Value | Description | Speed |
 |---|---|---|
 | `'nearest'` | Single nearest-pixel lookup. No blending between pixels. | Fastest |
-| `'bilinear'` | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Good balance of speed and accuracy. | Fast |
+| `'bilinear'` *(recommended)* | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy for most beams. **This is the recommended method.** | Fast |
 | `'gaussian'` | Isotropic Gaussian kernel over all pixels within `radius_deg`. Avoids grid-aligned interpolation artefacts; best for wide or asymmetric beams. | Slow |
 
 ### Example `config.yaml`
@@ -184,14 +193,16 @@ All three fields must share the same HEALPix `nside`. Values are loaded as
 
 #### Beam files (`FOLDER_BEAM / beam_file_{I,Q,U}`)
 
-pixell / enmap FITS format (2D map). The map must be centred on the beam axis;
+[pixell / enmap](https://pixell.readthedocs.io/en/latest/usage.html#usagepage) FITS format (2D map). The map must be centred on the beam axis;
 the pixel at index `(100, 100)` is taken as the beam centre. RA and Dec
 coordinates are read from the map's WCS header and converted to offsets
 relative to the beam centre. Values represent beam amplitude (linear, not dB).
 
 #### Scan files (`FOLDER_SCAN`)
 
-One triplet of `.npy` files per observation day, named:
+One triplet of `.npy` files per processing batch (referred to as a *day* in
+the filenames, but this can represent any convenient grouping — an observation
+session, a CES, an hour of data, etc.):
 
 ```
 theta_{day_index}.npy   # boresight colatitude  [rad], float32 or float64
@@ -203,9 +214,9 @@ Each file is a 1-D array with one element per detector sample. The files are
 opened as memory-maps, so only the batch currently being processed is resident
 in RAM.
 
-The number of days is inferred from the highest-indexed `psi_*.npy` file in
-the scan folder. The sample rate is estimated as `len(psi_0.npy) / 86400`
-(samples per second).
+The total number of batches is inferred from the highest-indexed `psi_*.npy`
+file in the scan folder. The sample rate is estimated as
+`len(psi_0.npy) / 86400` (samples per second).
 
 #### Beam rotation cache (`beam_cache_dir`)
 
@@ -230,7 +241,7 @@ Cache filenames follow the pattern:
 
 #### TOD files (`FOLDER_TOD_OUTPUT`)
 
-One `.npy` file per observation day:
+One `.npy` file per processing batch:
 
 ```
 tod_day_{day_index}.npy   # shape (3, n_samples), dtype float32
@@ -243,10 +254,14 @@ Axis 1 indexes the detector sample.
 
 ## Pre-computing the Beam Cache
 
-The beam cache eliminates the psi-roll Rodrigues rotation at runtime (roughly
-halving rotation cost). For very narrow beams the flat-sky approximation
+The beam cache eliminates the psi-roll Rodrigues rotation at runtime, yielding
+roughly a **25% speed-up**. For very narrow beams the flat-sky approximation
 additionally eliminates the recentering rotation and the `vec2ang` call,
 leaving only a table lookup and HEALPix interpolation.
+
+> **Note:** Because the psi-roll is evaluated on a discrete grid rather than
+> continuously, using the cache introduces a small interpolation error.
+> **Not recommended for experiments requiring high precision.**
 
 ```bash
 python precompute_beam_cache.py [--n_psi 720] [--config config.yaml]

@@ -8,11 +8,11 @@ import numpy as np
 import healpy as hp
 
 import tod_config as config
-from tod_io              import load_beam, load_scan_information, load_scan_data_batch, open_scan_day
+from tod_io              import load_beam, load_scan_information, open_scan_day
 from tod_core            import precompute_rotation_vector_batch, beam_tod_batch
-from tod_calibrate       import calibrate_n_processes
-from tod_utils           import get_ncpus, _fmt_time, should_print_batch, compute_dB_threshold_from_power
-from precompute_beam_cache import cache_filename, load_cache
+from tod_calibrate       import _calibrate_n_processes
+from tod_utils           import _get_ncpus, _fmt_time, _should_print_batch, _compute_dB_threshold_from_power
+from precompute_beam_cache import _cache_filename, _load_cache
 
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -146,7 +146,7 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
     for bf, comp_indices in beam_groups.items():
         ra, dec, pixel_map = load_beam(folder_beam, bf)
 
-        db_cut = compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
+        db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
         sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut)
         beam_vals = pixel_map[sel].astype(np.float32)
         norm      = beam_vals.sum()
@@ -169,9 +169,9 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
         print(f"  Beam {bf}: {sel.sum()} selected pixels")
 
         if cache_dir is not None:
-            cache_path = cache_filename(bf, cache_dir, cache_n_psi)
+            cache_path = _cache_filename(bf, cache_dir, cache_n_psi)
             if os.path.exists(cache_path):
-                cache = load_cache(cache_path)
+                cache = _load_cache(cache_path)
                 beam_data[bf]['vec_rolled'] = cache['vec_rolled']  # (N_psi, S, 3)
                 beam_data[bf]['psi_grid']   = cache['psi_grid']    # (N_psi,)
                 mode = "single-Rodrigues"
@@ -206,7 +206,7 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
         mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``. Used on
             the fallback (non-stacked) path only.
         batch_size (int): Number of detector samples per processing batch. Use
-            the value returned by :func:`~tod_calibrate.calibrate_n_processes`.
+            the value returned by :func:`~tod_calibrate._calibrate_n_processes`.
         process_name (str | None): Label for log messages (e.g. the
             ``multiprocessing.Process`` name). Defaults to ``None``.
 
@@ -237,7 +237,7 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
         be = min(bs + batch_size, n_samples)
 
         #ETA
-        if should_print_batch(batch_idx, n_batches):
+        if _should_print_batch(batch_idx, n_batches):
             elapsed = time.time() - start_time
             if batch_idx > 0:
                 eta = elapsed / batch_idx * (n_batches - batch_idx)
@@ -270,7 +270,7 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
 
 # ── Per-day worker (used by multiprocessing pool) ─────────────────────────────
 
-def process_day(day_index, batch_size, Nb):
+def _process_day(day_index, batch_size, Nb):
     """
     Worker entry point.  beam_data and mp are *not* passed as arguments —
     they live in the module-level globals populated by _worker_init, so no
@@ -350,7 +350,7 @@ def main(n_cpu_ceiling):
         print(f"Using cached calibration: n_processes={ncpus}, batch_size={batch_size}")
     else:
         print("Calibrating optimal worker count and batch size...")
-        ncpus, batch_size = calibrate_n_processes(
+        ncpus, batch_size = _calibrate_n_processes(
             beam_data, folder_scan, probe_day=start,
             mp=MP, n_cpu_ceiling=n_cpu_ceiling,
         )
@@ -401,7 +401,7 @@ def main(n_cpu_ceiling):
             for bf, data in beam_data.items()
         }
 
-        worker = partial(process_day, batch_size=batch_size, Nb=Nb)
+        worker = partial(_process_day, batch_size=batch_size, Nb=Nb)
         try:
             with multiprocessing.Pool(
                     processes=ncpus,
@@ -433,4 +433,4 @@ def main(n_cpu_ceiling):
 
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn')
-    main(get_ncpus())
+    main(_get_ncpus())

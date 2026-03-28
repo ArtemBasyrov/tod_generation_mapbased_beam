@@ -972,7 +972,7 @@ def _gaussian_accum_flatsky(dtheta_tile, dphi_tile, k_b, theta_b, phi_b,
 
 # ── Public numpy functions ────────────────────────────────────────────────────
 
-def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=(100, 100)):
+def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=None):
     """Compute Rodrigues rotation vectors and polarisation angle offsets for a batch.
 
     For each boresight pointing ``(phi_b, theta_b)`` in the batch, computes
@@ -991,9 +991,12 @@ def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx
             shape ``(B,)``.
         theta_batch (numpy.ndarray): Boresight colatitude for each sample [rad],
             shape ``(B,)``.
-        center_idx (tuple[int, int]): 2-D index of the beam-centre pixel in the
-            ``ra``/``dec`` arrays. Must match ``BEAM_CENTER_IDX`` used in
-            :mod:`precompute_beam_cache`. Defaults to ``(100, 100)``.
+        center_idx (tuple[int, int] or None): 2-D index of the beam-centre
+            pixel in the ``ra``/``dec`` arrays. When ``None`` (default), the
+            centre is derived from the array shape as
+            ``(ra.shape[0] // 2, ra.shape[1] // 2)``, which matches the
+            convention used by :func:`~tod_io.load_beam` and
+            :mod:`precompute_beam_cache`.
 
     Returns:
         tuple:
@@ -1002,6 +1005,9 @@ def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx
             - **beta** (*numpy.ndarray*) – Polarisation angle offset [rad],
               shape ``(B,)``.  Always in ``[0, 2π)``.
     """
+    if center_idx is None:
+        center_idx = (ra.shape[0] // 2, ra.shape[1] // 2)
+
     def sph2vec(phi, theta):
         return np.stack([np.sin(theta)*np.cos(phi),
                          np.sin(theta)*np.sin(phi),
@@ -1071,7 +1077,7 @@ def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
     return axes, cos_a, sin_a, ax_pts, cos_p, sin_p
 
 
-def recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
+def _recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
     """Apply a fused recenter + polarisation-roll rotation to beam pixel vectors.
 
     Executes the double Rodrigues rotation via the

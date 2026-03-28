@@ -23,11 +23,12 @@ is accepted.
 Beam Files (``FOLDER_BEAM / beam_file_{I,Q,U}``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-pixell / enmap FITS format (2-D map). Requirements:
+`pixell / enmap <https://pixell.readthedocs.io/en/latest/usage.html#usagepage>`_ FITS format (2-D map). Requirements:
 
-* The beam must be centred such that pixel ``(100, 100)`` is the beam axis.
-  RA and Dec coordinates are read from the WCS header and expressed as offsets
-  relative to that centre pixel.
+* The beam must be centred such that the beam axis falls on the grid centre
+  pixel ``(H // 2, W // 2)`` for a map of shape ``(H, W)``.  RA and Dec
+  coordinates are read from the WCS header and expressed as offsets relative
+  to that centre pixel.
 * Values represent beam amplitude in linear units (not dB).
 * The I, Q and U beams may share the same file (set all three ``beam_file_*``
   keys to the same filename).
@@ -35,7 +36,9 @@ pixell / enmap FITS format (2-D map). Requirements:
 Scan Files (``FOLDER_SCAN``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-One triplet of ``.npy`` files per observation day:
+One triplet of ``.npy`` files per processing unit (referred to as a *day* in
+the filenames, but this can represent any convenient batch — an observation
+session, a CES, an hour of data, etc.):
 
 .. code-block:: text
 
@@ -48,7 +51,7 @@ be ``float32`` or ``float64``; all three are converted to ``float32`` when
 loaded. Files are opened as ``numpy`` memory-maps so only the currently
 processed batch is resident in RAM.
 
-The total number of observation days is inferred from the highest index found
+The total number of processing units is inferred from the highest index found
 among ``psi_*.npy`` files. The sampling rate is estimated as
 ``len(psi_0.npy) / 86400`` samples per second.
 

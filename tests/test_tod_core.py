@@ -2,7 +2,7 @@
 Tests for the tod_core module.
 
 - tod_core    : _rotation_params, _rodrigues_jit, _gather_accum_jit,
-                    recenter_and_rotate, precompute_rotation_vector_batch, beam_tod_batch,
+                    _recenter_and_rotate, precompute_rotation_vector_batch, beam_tod_batch,
                     get_interp_weights_numba, _gather_accum_fused_jit
 
 Can be run independently:
@@ -44,7 +44,7 @@ from tod_core import (
     _gather_accum_fused_jit,
     _gather_accum_flatsky_jit,
     get_interp_weights_numba,
-    recenter_and_rotate,
+    _recenter_and_rotate,
     precompute_rotation_vector_batch,
     beam_tod_batch,
 )
@@ -68,7 +68,7 @@ def _random_unit_vectors(n, rng=_RNG):
 def _numpy_ref_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
     """
     Pure-numpy double-Rodrigues reference implementation used to validate
-    the Numba kernel in recenter_and_rotate.
+    the Numba kernel in _recenter_and_rotate.
     """
     angles = np.linalg.norm(rot_vecs, axis=-1, keepdims=True)
     safe   = angles > 1e-10
@@ -335,7 +335,7 @@ class TestGatherAccumJit:
 # ===========================================================================
 
 class TestRecenterAndRotate:
-    """Tests for tod_core.recenter_and_rotate."""
+    """Tests for tod_core._recenter_and_rotate."""
 
     def _make_inputs(self, B, S, rng=_RNG):
         vec_orig = _random_unit_vectors(S, rng)
@@ -349,14 +349,14 @@ class TestRecenterAndRotate:
         """Output shape is (B, S, 3) for B pointing directions and S beam pixels."""
         B, S = 5, 12
         vec_orig, rot_vecs, phi_b, theta_b, psis = self._make_inputs(B, S)
-        out = recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
+        out = _recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
         assert out.shape == (B, S, 3)
 
     def test_output_dtype_float32(self):
         """Output dtype is float32."""
         B, S = 3, 8
         vec_orig, rot_vecs, phi_b, theta_b, psis = self._make_inputs(B, S)
-        out = recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
+        out = _recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
         assert out.dtype == np.float32
 
     def test_identity_zero_rot_vecs_zero_psis(self):
@@ -368,7 +368,7 @@ class TestRecenterAndRotate:
         phi_b    = rng.uniform(0, 2 * np.pi, B)
         theta_b  = rng.uniform(0.1, np.pi - 0.1, B)
         psis     = np.zeros(B)
-        out = recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
+        out = _recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
         for b in range(B):
             npt.assert_allclose(out[b], vec_orig.astype(np.float32), atol=1e-5)
 
@@ -376,7 +376,7 @@ class TestRecenterAndRotate:
         """All output vectors have L2 norm ≈ 1 when inputs are unit vectors."""
         B, S = 6, 10
         vec_orig, rot_vecs, phi_b, theta_b, psis = self._make_inputs(B, S)
-        out   = recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
+        out   = _recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
         norms = np.linalg.norm(out.astype(np.float64), axis=-1)
         npt.assert_allclose(norms, np.ones((B, S)), atol=1e-4)
 
@@ -390,7 +390,7 @@ class TestRecenterAndRotate:
         theta_b  = rng.uniform(0.1, np.pi - 0.1, B)
         psis     = rng.uniform(0, 2 * np.pi, B)
 
-        out_numba = recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
+        out_numba = _recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
         out_numpy = _numpy_ref_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
         npt.assert_allclose(out_numba.astype(np.float64), out_numpy, atol=1e-4)
 
@@ -416,7 +416,7 @@ class TestPrecomputeRotationVectorBatch:
         phi_batch   = np.linspace(0, np.pi / 4, B)
         theta_batch = np.linspace(np.pi / 4, np.pi / 2, B)
         rot_vector, beta = precompute_rotation_vector_batch(
-            ra, dec, phi_batch, theta_batch, center_idx=(100, 100)
+            ra, dec, phi_batch, theta_batch, center_idx=(N//2, N//2)
         )
         assert rot_vector.shape == (B, 3)
         assert beta.shape       == (B,)
@@ -430,7 +430,7 @@ class TestPrecomputeRotationVectorBatch:
         phi_batch   = rng.uniform(0, np.pi / 6, B)
         theta_batch = rng.uniform(np.pi / 3, 2 * np.pi / 3, B)
         _, beta = precompute_rotation_vector_batch(
-            ra, dec, phi_batch, theta_batch, center_idx=(100, 100)
+            ra, dec, phi_batch, theta_batch, center_idx=(N//2, N//2)
         )
         assert np.all(beta >= 0.0), "Some beta values are negative"
         assert np.all(beta < 2 * np.pi), "Some beta values exceed 2pi"
@@ -439,11 +439,11 @@ class TestPrecomputeRotationVectorBatch:
         """Pointing at the beam centre produces |rot_vector| < 1e-10."""
         N   = 201
         ra, dec = self._make_grid(N)
-        # centre_idx=(100,100), ra=0, dec=0 -> phi=0, theta=pi/2
+        # centre_idx=(N//2, N//2)=(100,100), ra=0, dec=0 -> phi=0, theta=pi/2
         phi_batch   = np.array([0.0])
         theta_batch = np.array([np.pi / 2])
         rot_vector, _ = precompute_rotation_vector_batch(
-            ra, dec, phi_batch, theta_batch, center_idx=(100, 100)
+            ra, dec, phi_batch, theta_batch, center_idx=(N//2, N//2)
         )
         npt.assert_array_less(np.linalg.norm(rot_vector, axis=-1), 1e-10)
 
@@ -456,7 +456,7 @@ class TestPrecomputeRotationVectorBatch:
         phi_batch   = np.array([np.pi / 2])
         theta_batch = np.array([np.pi / 2])
         rot_vector, _ = precompute_rotation_vector_batch(
-            ra, dec, phi_batch, theta_batch, center_idx=(100, 100)
+            ra, dec, phi_batch, theta_batch, center_idx=(N//2, N//2)
         )
         npt.assert_allclose(np.linalg.norm(rot_vector, axis=-1), np.pi / 2, atol=1e-6)
 
@@ -467,7 +467,7 @@ class TestPrecomputeRotationVectorBatch:
         phi_batch   = np.array([0.1])
         theta_batch = np.array([np.pi / 2])
         rot_vector, _ = precompute_rotation_vector_batch(
-            ra, dec, phi_batch, theta_batch, center_idx=(100, 100)
+            ra, dec, phi_batch, theta_batch, center_idx=(N//2, N//2)
         )
         assert rot_vector.dtype == np.float64
 
@@ -518,7 +518,7 @@ class TestBeamTodBatch:
         phi_batch  = rng.uniform(0, 0.04, B)
         theta_batch = rng.uniform(np.pi / 2 - 0.04, np.pi / 2, B)
         rot_vecs, betas = precompute_rotation_vector_batch(
-            ra, dec, phi_batch, theta_batch, center_idx=(100, 100)
+            ra, dec, phi_batch, theta_batch, center_idx=(N//2, N//2)
         )
         psis_b = -betas
         return phi_batch, theta_batch, psis_b, rot_vecs

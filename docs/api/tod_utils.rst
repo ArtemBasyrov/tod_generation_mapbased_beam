@@ -1,9 +1,11 @@
 tod\_utils
 ==========
 
-CPU / memory detection and miscellaneous utilities.
+CPU / memory detection and miscellaneous utilities. All functions in this
+module are internal helpers (prefixed with ``_``) and are not part of the
+public API. They are used internally by the pipeline to auto-detect available
+CPUs, estimate per-process memory budgets, and compute beam power thresholds.
 
 .. automodule:: tod_utils
-   :members: get_ncpus, get_memory_per_process, compute_dB_threshold_from_power
    :undoc-members: False
    :show-inheritance: True

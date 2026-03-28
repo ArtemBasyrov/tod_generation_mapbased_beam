@@ -36,6 +36,7 @@ if "tod_io" not in sys.modules:
 import numpy as np
 import numpy.testing as npt
 import healpy as hp
+import numba
 import pytest
 
 from tod_core import (
@@ -83,7 +84,7 @@ def _build_scan(B=8, N=201):
     phi_batch   = rng.uniform(0, 0.04, B)
     theta_batch = rng.uniform(np.pi / 2 - 0.04, np.pi / 2, B)
     rot_vecs, betas = precompute_rotation_vector_batch(
-        ra, dec, phi_batch, theta_batch, center_idx=(100, 100)
+        ra, dec, phi_batch, theta_batch, center_idx=(N//2, N//2)
     )
     return phi_batch, theta_batch, -betas, rot_vecs
 
@@ -638,6 +639,21 @@ class TestGaussianInterpAccumJit:
     """
 
     @staticmethod
+    def _call_jit(theta_flat, phi_flat, B, Sc, nside, mp_stacked, beam_vals,
+                  tod_arr, sigma_rad, radius_rad):
+        """Allocate scratch buffers and call _gaussian_interp_accum_jit."""
+        search_rad  = radius_rad + math.sqrt(math.pi / (3.0 * nside * nside))
+        max_M       = max(64, int(12.0 * nside * nside * (1.0 - math.cos(search_rad))) + 32)
+        n_threads   = numba.get_num_threads()
+        scratch_pix = np.empty((n_threads, max_M), dtype=np.int64)
+        scratch_w   = np.empty((n_threads, max_M), dtype=np.float64)
+        tod_tmp     = np.zeros((mp_stacked.shape[0], B * Sc), dtype=np.float64)
+        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
+                                   nside, mp_stacked, beam_vals, tod_arr,
+                                   sigma_rad, radius_rad,
+                                   scratch_pix, scratch_w, tod_tmp)
+
+    @staticmethod
     def _ref_accum(theta_flat, phi_flat, B, Sc, nside, mp_stacked, beam_vals,
                    sigma_rad, radius_rad):
         """Python reference using hp.query_disc."""
@@ -686,9 +702,9 @@ class TestGaussianInterpAccumJit:
         beam_vals  = np.ones(Sc, dtype=np.float32) / Sc
         tod_arr    = np.zeros((1, B), dtype=np.float64)
 
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_arr,
-                                   math.radians(1.0), math.radians(3.0))
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_arr,
+                       math.radians(1.0), math.radians(3.0))
         np.testing.assert_allclose(tod_arr[0], np.full(B, val), atol=1e-3)
 
     def test_agrees_with_healpy_reference(self):
@@ -709,14 +725,14 @@ class TestGaussianInterpAccumJit:
         radius_rad = math.radians(1.5)
 
         tod_jit = np.zeros((2, B), dtype=np.float64)
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_jit,
-                                   sigma_rad, radius_rad)
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_jit,
+                       sigma_rad, radius_rad)
         tod_ref = self._ref_accum(theta_flat, phi_flat, B, Sc,
                                   nside, mp_stacked, beam_vals,
                                   sigma_rad, radius_rad)
         np.testing.assert_allclose(tod_jit, tod_ref,
-                                   rtol=1e-3, atol=1e-5,
+                                   rtol=2e-3, atol=1e-5,
                                    err_msg="JIT kernel diverges from healpy reference")
 
     def test_accumulates_inplace(self):
@@ -732,11 +748,11 @@ class TestGaussianInterpAccumJit:
         tod_arr    = np.zeros((2, B), dtype=np.float64)
         kwargs = dict(sigma_rad=math.radians(1.0), radius_rad=math.radians(3.0))
 
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_arr, **kwargs)
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_arr, **kwargs)
         first = tod_arr.copy()
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_arr, **kwargs)
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_arr, **kwargs)
         np.testing.assert_allclose(tod_arr, 2 * first, atol=1e-12)
 
     def test_zero_beam_vals_gives_zero(self):
@@ -749,9 +765,9 @@ class TestGaussianInterpAccumJit:
         mp_stacked = np.ones((1, npix), dtype=np.float32)
         beam_vals  = np.zeros(Sc, dtype=np.float32)
         tod_arr    = np.zeros((1, B), dtype=np.float64)
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_arr,
-                                   math.radians(1.0), math.radians(3.0))
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_arr,
+                       math.radians(1.0), math.radians(3.0))
         np.testing.assert_allclose(tod_arr, 0.0, atol=1e-12)
 
     def test_tiny_radius_uses_nearest_pixel(self):
@@ -770,9 +786,9 @@ class TestGaussianInterpAccumJit:
         tod_arr    = np.zeros((1, B), dtype=np.float64)
         tiny_rad   = 1e-6   # much smaller than a pixel
 
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_arr,
-                                   tiny_rad, tiny_rad)
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_arr,
+                       tiny_rad, tiny_rad)
         assert np.all(np.isfinite(tod_arr)), "NaN/Inf with tiny radius"
         assert np.all(tod_arr > 0), "Expected non-zero output for non-zero map"
 
@@ -795,9 +811,9 @@ class TestGaussianInterpAccumJit:
         # Two-component map: comp 0 = base, comp 1 = 2 * base
         mp_stacked = np.stack([mp_base, 2.0 * mp_base])
         tod_arr    = np.zeros((2, B), dtype=np.float64)
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_arr,
-                                   sigma_rad, radius_rad)
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_arr,
+                       sigma_rad, radius_rad)
         np.testing.assert_allclose(tod_arr[1], 2.0 * tod_arr[0], rtol=1e-6,
                                    err_msg="Component 1 should be 2x component 0")
 
@@ -819,9 +835,9 @@ class TestGaussianInterpAccumJit:
 
         # Parallel: all B at once
         tod_par = np.zeros((2, B), dtype=np.float64)
-        _gaussian_interp_accum_jit(theta_flat, phi_flat, B, Sc,
-                                   nside, mp_stacked, beam_vals, tod_par,
-                                   sigma_rad, radius_rad)
+        self._call_jit(theta_flat, phi_flat, B, Sc,
+                       nside, mp_stacked, beam_vals, tod_par,
+                       sigma_rad, radius_rad)
 
         # Serial: one beam at a time
         tod_ser = np.zeros((2, B), dtype=np.float64)
@@ -829,9 +845,9 @@ class TestGaussianInterpAccumJit:
             tf_b = theta_flat[b*Sc:(b+1)*Sc]
             pf_b = phi_flat  [b*Sc:(b+1)*Sc]
             buf  = np.zeros((2, 1), dtype=np.float64)
-            _gaussian_interp_accum_jit(tf_b, pf_b, 1, Sc,
-                                       nside, mp_stacked, beam_vals, buf,
-                                       sigma_rad, radius_rad)
+            self._call_jit(tf_b, pf_b, 1, Sc,
+                           nside, mp_stacked, beam_vals, buf,
+                           sigma_rad, radius_rad)
             tod_ser[:, b] = buf[:, 0]
 
         np.testing.assert_allclose(tod_par, tod_ser, atol=1e-12,

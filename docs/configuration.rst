@@ -33,6 +33,7 @@ Paths
    * - ``beam_file_I``
      - ``str``
      - Filename of the intensity (I) beam map inside ``FOLDER_BEAM``.
+       Must be a `pixell / enmap <https://pixell.readthedocs.io/en/latest/usage.html#usagepage>`_ FITS file.
    * - ``beam_file_Q``
      - ``str``
      - Filename of the Q-polarisation beam map inside ``FOLDER_BEAM``.
@@ -67,8 +68,13 @@ Beam Pixel Selection
      - ``0.99``
      - Same for the U beam.
 
-Day Range
----------
+Batch Range
+-----------
+
+These keys control which scan files are processed. The pipeline uses the term
+*day* for the index suffix of the scan files (``theta_N.npy``, etc.), but the
+index can represent any batching unit you choose — an observation session, a
+CES, an hour of data, etc.
 
 .. list-table::
    :header-rows: 1
@@ -81,12 +87,12 @@ Day Range
    * - ``start_day``
      - ``int``
      - ``0``
-     - First day index to process (inclusive).
+     - First batch index to process (inclusive).
    * - ``end_day``
      - ``int``
-     - total days
-     - Last day index to process (exclusive). Set to ``null`` to process all
-       days found in ``FOLDER_SCAN``.
+     - total batches
+     - Last batch index to process (exclusive). Set to ``null`` to process all
+       batches found in ``FOLDER_SCAN``.
 
 Multiprocessing
 ---------------
@@ -140,8 +146,12 @@ Beam Rotation Cache
 -------------------
 
 Pre-computing the psi-roll rotation (via :mod:`precompute_beam_cache`)
-eliminates one of the two Rodrigues rotations per sample. An additional
-flat-sky approximation can eliminate the second rotation for narrow beams.
+eliminates one of the two Rodrigues rotations per sample, yielding roughly a
+25 % speed-up. An additional flat-sky approximation can eliminate the second
+rotation for narrow beams. Because the psi-roll is evaluated on a discrete
+grid rather than continuously, using the cache introduces a small
+interpolation error. **Not recommended for experiments requiring high
+precision.**
 
 .. list-table::
    :header-rows: 1
@@ -202,9 +212,10 @@ Beam Interpolation
        Fastest option; suitable when the beam pixel resolution is much finer
        than the sky-map resolution.
      - Fastest
-   * - ``'bilinear'``
+   * - ``'bilinear'`` *(recommended)*
      - 4-pixel bilinear HEALPix interpolation via a fused Numba kernel.
-       Good balance of speed and accuracy for most beams.
+       Best balance of speed and accuracy for most beams. **This is the
+       recommended method.**
      - Fast
    * - ``'gaussian'``
      - Isotropic Gaussian kernel over all HEALPix pixels within

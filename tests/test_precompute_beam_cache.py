@@ -2,7 +2,7 @@
 Tests for precompute_beam_cache module.
 
 Covers: _roll_vectors_jit, _compute_angular_offsets,
-        cache_filename, save_cache, load_cache, lookup_psi_bin.
+        _cache_filename, _save_cache, _load_cache, _lookup_psi_bin.
 
 Can be run independently:
     pytest tests/test_precompute_beam_cache.py -v
@@ -39,10 +39,10 @@ if "tod_io" not in sys.modules:
 from precompute_beam_cache import (
     _roll_vectors_jit,
     _compute_angular_offsets,
-    cache_filename,
-    save_cache,
-    load_cache,
-    lookup_psi_bin,
+    _cache_filename,
+    _save_cache,
+    _load_cache,
+    _lookup_psi_bin,
 )
 
 
@@ -182,33 +182,33 @@ class TestComputeAngularOffsets:
 # ===========================================================================
 
 class TestCacheFilename:
-    """Tests for precompute_beam_cache.cache_filename."""
+    """Tests for precompute_beam_cache._cache_filename."""
 
     def test_basic_filename(self):
         """Generates expected path from a simple beam filename."""
-        result = cache_filename("beam_I.fits", "/cache", 720)
+        result = _cache_filename("beam_I.fits", "/cache", 720)
         assert result == "/cache/beam_I_cache_npsi720.npz"
 
     def test_strips_directory_from_bf(self):
         """Strips leading directory from bf; only the stem is used."""
-        result = cache_filename("/some/dir/beam_Q.fits", "/out", 360)
+        result = _cache_filename("/some/dir/beam_Q.fits", "/out", 360)
         assert result == "/out/beam_Q_cache_npsi360.npz"
 
     def test_n_psi_embedded_in_filename(self):
         """n_psi value is embedded in the filename."""
         for n_psi in [1, 180, 720, 4096]:
-            result = cache_filename("b.fits", "/d", n_psi)
+            result = _cache_filename("b.fits", "/d", n_psi)
             assert f"npsi{n_psi}" in os.path.basename(result)
 
     def test_output_ends_with_npz(self):
         """Output always ends with .npz regardless of input extension."""
         for ext in [".fits", ".npy", ".npz", ".dat", ""]:
-            result = cache_filename(f"beam{ext}", "/d", 720)
+            result = _cache_filename(f"beam{ext}", "/d", 720)
             assert result.endswith(".npz")
 
     def test_output_dir_is_dirname(self):
         """output_dir is the directory component of the returned path."""
-        result = cache_filename("b.fits", "/my/cache", 100)
+        result = _cache_filename("b.fits", "/my/cache", 100)
         assert os.path.dirname(result) == "/my/cache"
 
 
@@ -217,7 +217,7 @@ class TestCacheFilename:
 # ===========================================================================
 
 class TestSaveCacheLoadCache:
-    """Tests for precompute_beam_cache.save_cache and load_cache."""
+    """Tests for precompute_beam_cache._save_cache and _load_cache."""
 
     @staticmethod
     def _make_cache(rng=None):
@@ -231,13 +231,13 @@ class TestSaveCacheLoadCache:
         }
 
     def test_round_trip_values(self):
-        """save_cache → load_cache recovers the same arrays."""
+        """_save_cache → _load_cache recovers the same arrays."""
         cache = self._make_cache()
         with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
             path = f.name
         try:
-            save_cache(cache, path)
-            loaded = load_cache(path)
+            _save_cache(cache, path)
+            loaded = _load_cache(path)
             assert set(loaded.keys()) == set(cache.keys())
             for key in cache:
                 npt.assert_array_equal(loaded[key], cache[key],
@@ -251,8 +251,8 @@ class TestSaveCacheLoadCache:
         with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
             path = f.name
         try:
-            save_cache(cache, path)
-            loaded = load_cache(path)
+            _save_cache(cache, path)
+            loaded = _load_cache(path)
             for key in cache:
                 assert loaded[key].dtype == cache[key].dtype, \
                     f"dtype mismatch for '{key}': {loaded[key].dtype} vs {cache[key].dtype}"
@@ -260,13 +260,13 @@ class TestSaveCacheLoadCache:
             os.unlink(path)
 
     def test_load_returns_dict(self):
-        """load_cache returns a plain dict, not an NpzFile object."""
+        """_load_cache returns a plain dict, not an NpzFile object."""
         cache = self._make_cache()
         with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
             path = f.name
         try:
-            save_cache(cache, path)
-            loaded = load_cache(path)
+            _save_cache(cache, path)
+            loaded = _load_cache(path)
             assert isinstance(loaded, dict)
         finally:
             os.unlink(path)
@@ -280,8 +280,8 @@ class TestSaveCacheLoadCache:
         with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
             path = f.name
         try:
-            save_cache(cache, path)
-            loaded = load_cache(path)
+            _save_cache(cache, path)
+            loaded = _load_cache(path)
             for key in cache:
                 npt.assert_array_equal(loaded[key], cache[key])
         finally:
@@ -293,7 +293,7 @@ class TestSaveCacheLoadCache:
 # ===========================================================================
 
 class TestLookupPsiBin:
-    """Tests for precompute_beam_cache.lookup_psi_bin."""
+    """Tests for precompute_beam_cache._lookup_psi_bin."""
 
     @staticmethod
     def _make_grid(n_psi):
@@ -303,14 +303,14 @@ class TestLookupPsiBin:
         """psi_grid[k] maps to bin index k for all k."""
         n_psi    = 12
         psi_grid = self._make_grid(n_psi)
-        indices  = lookup_psi_bin(psi_grid.astype(np.float64), psi_grid)
+        indices  = _lookup_psi_bin(psi_grid.astype(np.float64), psi_grid)
         npt.assert_array_equal(indices, np.arange(n_psi))
 
     def test_wrapping_full_circle(self):
         """psi = 2π wraps to bin 0."""
         n_psi    = 8
         psi_grid = self._make_grid(n_psi)
-        idx = lookup_psi_bin(np.array([2 * np.pi]), psi_grid)
+        idx = _lookup_psi_bin(np.array([2 * np.pi]), psi_grid)
         assert idx[0] == 0
 
     def test_wrapping_negative_psi(self):
@@ -318,7 +318,7 @@ class TestLookupPsiBin:
         n_psi    = 8
         psi_grid = self._make_grid(n_psi)
         dpsi     = 2 * np.pi / n_psi
-        idx = lookup_psi_bin(np.array([-dpsi]), psi_grid)
+        idx = _lookup_psi_bin(np.array([-dpsi]), psi_grid)
         assert idx[0] == n_psi - 1
 
     def test_output_in_valid_range(self):
@@ -327,7 +327,7 @@ class TestLookupPsiBin:
         n_psi      = 720
         psi_grid   = self._make_grid(n_psi)
         psi_values = rng.uniform(-10 * np.pi, 10 * np.pi, 100)
-        indices    = lookup_psi_bin(psi_values, psi_grid)
+        indices    = _lookup_psi_bin(psi_values, psi_grid)
         assert np.all(indices >= 0)
         assert np.all(indices < n_psi)
 
@@ -335,21 +335,21 @@ class TestLookupPsiBin:
         """Output shape matches the input psi_values shape."""
         psi_grid   = self._make_grid(4)
         psi_values = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
-        indices    = lookup_psi_bin(psi_values, psi_grid)
+        indices    = _lookup_psi_bin(psi_values, psi_grid)
         assert indices.shape == psi_values.shape
 
     def test_output_dtype_int64(self):
         """Output array has dtype int64."""
         psi_grid   = self._make_grid(4)
         psi_values = np.array([0.0, 1.0])
-        indices    = lookup_psi_bin(psi_values, psi_grid)
+        indices    = _lookup_psi_bin(psi_values, psi_grid)
         assert indices.dtype == np.int64
 
     def test_large_positive_psi_wraps(self):
         """psi = 4π (two full rotations) maps to bin 0."""
         n_psi    = 8
         psi_grid = self._make_grid(n_psi)
-        idx = lookup_psi_bin(np.array([4 * np.pi]), psi_grid)
+        idx = _lookup_psi_bin(np.array([4 * np.pi]), psi_grid)
         assert idx[0] == 0
 
     @pytest.mark.parametrize("n_psi", [4, 12, 360, 720])
@@ -359,7 +359,7 @@ class TestLookupPsiBin:
         dpsi     = 2 * np.pi / n_psi
         # Sample psi values covering [0, 2π - 2*dpsi], well clear of the wrap boundary.
         psi_values = np.linspace(0, 2 * np.pi - 2 * dpsi, n_psi)
-        indices    = lookup_psi_bin(psi_values, psi_grid)
+        indices    = _lookup_psi_bin(psi_values, psi_grid)
         assert np.all(np.diff(indices) >= 0)
 
 

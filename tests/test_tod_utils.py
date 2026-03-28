@@ -1,8 +1,8 @@
 """
 Tests for the tod_utils module.
 
-Covers: _fmt_time, should_print_batch, _is_cluster,
-        get_memory_per_process, get_ncpus.
+Covers: _fmt_time, _should_print_batch, _is_cluster,
+        _get_memory_per_process, _get_ncpus.
 
 Can be run independently:
     pytest tests/test_tod_utils.py -v
@@ -37,10 +37,10 @@ if "tod_io" not in sys.modules:
 # ---------------------------------------------------------------------------
 from tod_utils import (
     _fmt_time,
-    should_print_batch,
+    _should_print_batch,
     _is_cluster,
-    get_memory_per_process,
-    get_ncpus,
+    _get_memory_per_process,
+    _get_ncpus,
 )
 import tod_config as config
 
@@ -86,36 +86,36 @@ class TestFmtTime:
 # ===========================================================================
 
 class TestShouldPrintBatch:
-    """Tests for tod_utils.should_print_batch."""
+    """Tests for tod_utils._should_print_batch."""
 
     def test_always_true_when_few_batches(self):
         """Returns True for all indices when n_batches <= max_prints."""
         for idx in range(10):
-            assert should_print_batch(idx, 10, max_prints=100) is True
+            assert _should_print_batch(idx, 10, max_prints=100) is True
 
     def test_always_true_for_first_batch(self):
         """Returns True for batch_idx=0 regardless of n_batches."""
-        assert should_print_batch(0, 10000, max_prints=100) is True
+        assert _should_print_batch(0, 10000, max_prints=100) is True
 
     def test_always_true_for_last_batch(self):
         """Returns True for batch_idx == n_batches - 1."""
-        assert should_print_batch(9999, 10000, max_prints=100) is True
+        assert _should_print_batch(9999, 10000, max_prints=100) is True
 
     def test_true_at_step_multiples(self):
         """Returns True at multiples of step = n_batches // max_prints."""
         n_batches  = 1000
         max_prints = 100
         step = n_batches // max_prints  # == 10
-        assert should_print_batch(step,     n_batches, max_prints=max_prints) is True
-        assert should_print_batch(2 * step, n_batches, max_prints=max_prints) is True
+        assert _should_print_batch(step,     n_batches, max_prints=max_prints) is True
+        assert _should_print_batch(2 * step, n_batches, max_prints=max_prints) is True
 
     def test_false_at_non_step_non_boundary(self):
         """Returns False at indices that are not step multiples or boundaries."""
         n_batches  = 1000
         max_prints = 100
         step = n_batches // max_prints  # == 10
-        assert should_print_batch(1,          n_batches, max_prints=max_prints) is False
-        assert should_print_batch(step - 1,   n_batches, max_prints=max_prints) is False
+        assert _should_print_batch(1,          n_batches, max_prints=max_prints) is False
+        assert _should_print_batch(step - 1,   n_batches, max_prints=max_prints) is False
 
 
 # ===========================================================================
@@ -153,7 +153,7 @@ class TestIsCluster:
 # ===========================================================================
 
 class TestGetMemoryPerProcess:
-    """Tests for tod_utils.get_memory_per_process."""
+    """Tests for tod_utils._get_memory_per_process."""
 
     _HPC_VARS = ("SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID")
 
@@ -176,7 +176,7 @@ class TestGetMemoryPerProcess:
                 import importlib
                 import tod_utils as _tu
                 importlib.reload(_tu)
-                result = _tu.get_memory_per_process(n_processes)
+                result = _tu._get_memory_per_process(n_processes)
 
         expected = available_gb * 0.75 / n_processes
         npt.assert_allclose(result, expected, rtol=1e-6)
@@ -197,7 +197,7 @@ class TestGetMemoryPerProcess:
                 import importlib
                 import tod_utils as _tu
                 importlib.reload(_tu)
-                result = _tu.get_memory_per_process(n_processes)
+                result = _tu._get_memory_per_process(n_processes)
 
         expected = available_gb * 1.0 / n_processes
         npt.assert_allclose(result, expected, rtol=1e-6)
@@ -209,7 +209,7 @@ class TestGetMemoryPerProcess:
             import importlib
             import tod_utils as _tu
             importlib.reload(_tu)
-            result = _tu.get_memory_per_process(n_processes)
+            result = _tu._get_memory_per_process(n_processes)
 
         assert result == config.max_memory_per_process
 
@@ -219,7 +219,7 @@ class TestGetMemoryPerProcess:
 # ===========================================================================
 
 class TestGetNcpus:
-    """Tests for tod_utils.get_ncpus."""
+    """Tests for tod_utils._get_ncpus."""
 
     _HPC_VARS = ("SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID")
 
@@ -245,7 +245,7 @@ class TestGetNcpus:
                 importlib.reload(_tu)
                 with patch.object(_tu.os, "sched_getaffinity", return_value=affinity_set,
                                   create=True):
-                    result = _tu.get_ncpus()
+                    result = _tu._get_ncpus()
 
         nthreads_per_core = logical_cpus // physical_cpus   # 2
         ncores_available  = len(affinity_set) // nthreads_per_core  # 6
@@ -266,7 +266,7 @@ class TestGetNcpus:
                 import importlib
                 import tod_utils as _tu
                 importlib.reload(_tu)
-                result = _tu.get_ncpus()
+                result = _tu._get_ncpus()
 
         assert result == slurm_cpus
 
@@ -283,7 +283,7 @@ class TestGetNcpus:
                 import importlib
                 import tod_utils as _tu
                 importlib.reload(_tu)
-                result = _tu.get_ncpus()
+                result = _tu._get_ncpus()
 
         assert result == config.n_processes
 

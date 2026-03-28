@@ -38,7 +38,7 @@ def _cpu_ceiling():
     return os.cpu_count() or config.n_processes
 
 
-def get_ncpus():
+def _get_ncpus():
     """Return the CPU ceiling for this job.
 
     On a cluster (SLURM / PBS / LSF / SGE detected) this is the number of
@@ -46,7 +46,7 @@ def get_ncpus():
     capped at ``config.n_processes`` to keep the machine responsive.
 
     The actual number of worker processes to launch is determined later by
-    :func:`~tod_calibrate.calibrate_n_processes`, which balances CPU count
+    :func:`~tod_calibrate._calibrate_n_processes`, which balances CPU count
     against per-process memory to maximise total throughput.
 
     Returns:
@@ -70,7 +70,8 @@ def get_ncpus():
 _LOCAL_RAM_FRACTION = 0.75
 
 # HPC scheduler env vars whose presence indicates a batch/cluster job.
-_CLUSTER_ENV_VARS = ("SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID")
+_CLUSTER_ENV_VARS = ("SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID",
+                     "SLURM_CPUS_PER_TASK")
 
 
 def _is_cluster():
@@ -78,7 +79,7 @@ def _is_cluster():
     return any(os.environ.get(v) for v in _CLUSTER_ENV_VARS)
 
 
-def get_memory_per_process(n_processes):
+def _get_memory_per_process(n_processes):
     """Determine the per-process memory budget in GB.
 
     On a cluster (SLURM / PBS / LSF / SGE detected) the job owns the node and
@@ -125,7 +126,7 @@ def _fmt_time(seconds):
         return f"{seconds/3600:.2f}h"
     
 
-def should_print_batch(batch_idx, n_batches, max_prints=100):
+def _should_print_batch(batch_idx, n_batches, max_prints=100):
     """
     Returns True if this batch index should print a progress message.
     Always prints first and last batch. For everything in between,
@@ -139,7 +140,7 @@ def should_print_batch(batch_idx, n_batches, max_prints=100):
     return batch_idx % step == 0
 
 
-def compute_dB_threshold_from_power(beam_vals, power_cut):
+def _compute_dB_threshold_from_power(beam_vals, power_cut):
     """Compute the dB threshold that retains a given fraction of total beam power.
 
     Finds the dB level such that the sum of all pixel amplitudes whose dB value

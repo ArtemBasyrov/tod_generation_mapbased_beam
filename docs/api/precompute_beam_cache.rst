@@ -39,6 +39,6 @@ Command-line arguments:
      - Path to the config file to read beam settings from.
 
 .. automodule:: precompute_beam_cache
-   :members: precompute_beam, cache_filename, load_cache, lookup_psi_bin
+   :members: precompute_beam
    :undoc-members: False
    :show-inheritance: True

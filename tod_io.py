@@ -7,7 +7,8 @@ def load_beam(folder_beam, filename):
     """Load a beam map and return RA/Dec offsets and pixel amplitudes.
 
     Reads a pixell/enmap FITS beam map, extracts the WCS-based sky coordinates,
-    and returns them as offsets relative to the beam centre pixel ``(100, 100)``.
+    and returns them as offsets relative to the beam centre pixel (the grid
+    centre, computed as ``(H // 2, W // 2)`` from the map shape ``(H, W)``).
 
     Args:
         folder_beam (str): Path to the directory containing beam FITS files.
@@ -26,8 +27,11 @@ def load_beam(folder_beam, filename):
     """
     beam_map = enmap.read_map(folder_beam + filename)
     ra, dec = beam_map.posmap()
-    ra  = np.array(ra)  - ra[100, 100]
-    dec = np.array(dec) - dec[100, 100]
+    ra  = np.array(ra)
+    dec = np.array(dec)
+    center_idx = (ra.shape[0] // 2, ra.shape[1] // 2)
+    ra  = ra  - ra[center_idx]
+    dec = dec - dec[center_idx]
     pixel_map = np.array(beam_map[0])
     return ra, dec, pixel_map
 
@@ -61,7 +65,7 @@ def open_scan_day(folder_scan, day_index):
     The caller is responsible for holding the returned objects alive for as
     long as slices from them are needed.  Keeping the mmaps open across all
     batches avoids the repeated open/header-parse/mmap syscalls that
-    :func:`load_scan_data_batch` would otherwise incur on every batch call.
+    :func:`_load_scan_data_batch` would otherwise incur on every batch call.
 
     Args:
         folder_scan (str): Path to the scan data directory. Must end with a
@@ -80,7 +84,7 @@ def open_scan_day(folder_scan, day_index):
     return theta_mmap, phi_mmap, psi_mmap
 
 
-def load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
+def _load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
     """Load a contiguous batch of scan samples for one day into RAM.
 
     Opens the three scan files for ``day_index`` as memory-maps, slices the
@@ -113,7 +117,7 @@ def load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
     return theta, phi, psi
 
 
-def count_scan_samples(folder_scan, day_index):
+def _count_scan_samples(folder_scan, day_index):
     """Return the total number of detector samples for one observation day.
 
     Args:

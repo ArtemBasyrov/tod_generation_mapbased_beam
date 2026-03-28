@@ -1,7 +1,7 @@
 """
 Tests for the tod_calibrate module.
 
-Covers: _memory_cap, _candidate_batch_sizes, calibrate_n_processes.
+Covers: _memory_cap, _candidate_batch_sizes, _calibrate_n_processes.
 
 Can be run independently:
     pytest tests/test_tod_calibrate.py -v
@@ -31,7 +31,7 @@ if "tod_io" not in sys.modules:
 # ---------------------------------------------------------------------------
 # Imports under test
 # ---------------------------------------------------------------------------
-from tod_calibrate import _memory_cap, _candidate_batch_sizes, calibrate_n_processes
+from tod_calibrate import _memory_cap, _candidate_batch_sizes, _calibrate_n_processes
 
 
 # ===========================================================================
@@ -117,9 +117,9 @@ class TestCandidateBatchSizes:
 
 class TestCalibrateNProcesses:
     """
-    Tests for tod_calibrate.calibrate_n_processes.
+    Tests for tod_calibrate._calibrate_n_processes.
 
-    calibrate_batch_size and get_memory_per_process are mocked so that the
+    _calibrate_batch_size and _get_memory_per_process are mocked so that the
     logic under test is the n-process selection algorithm only.
     """
 
@@ -129,9 +129,9 @@ class TestCalibrateNProcesses:
     def test_returns_n_within_ceiling(self):
         """n_optimal is always in [1, n_cpu_ceiling]."""
         results = [(1, 100), (2, 300), (3, 350), (4, 400), (6, 380)]
-        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
-             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
-            n_opt, _ = calibrate_n_processes(
+        with patch("tod_calibrate._calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate._get_memory_per_process", return_value=1.0):
+            n_opt, _ = _calibrate_n_processes(
                 self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=4,
             )
         assert 1 <= n_opt <= 4
@@ -139,9 +139,9 @@ class TestCalibrateNProcesses:
     def test_returns_at_least_one(self):
         """n_optimal is always >= 1."""
         results = [(1, 50), (2, 100)]
-        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
-             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
-            n_opt, _ = calibrate_n_processes(
+        with patch("tod_calibrate._calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate._get_memory_per_process", return_value=1.0):
+            n_opt, _ = _calibrate_n_processes(
                 self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=1,
             )
         assert n_opt >= 1
@@ -149,9 +149,9 @@ class TestCalibrateNProcesses:
     def test_ceiling_one_returns_one(self):
         """With n_cpu_ceiling=1, n_optimal is always 1."""
         results = [(1, 1000), (2, 2000), (4, 3000)]
-        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
-             patch("tod_calibrate.get_memory_per_process", return_value=8.0):
-            n_opt, _ = calibrate_n_processes(
+        with patch("tod_calibrate._calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate._get_memory_per_process", return_value=8.0):
+            n_opt, _ = _calibrate_n_processes(
                 self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=1,
             )
         assert n_opt == 1
@@ -168,9 +168,9 @@ class TestCalibrateNProcesses:
             n=4 → cap=1,  bs=1  (tp=100), total=  400
         """
         results = [(1, 100), (2, 300), (3, 350), (4, 400), (6, 380)]
-        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
-             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
-            n_opt, bs_opt = calibrate_n_processes(
+        with patch("tod_calibrate._calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate._get_memory_per_process", return_value=1.0):
+            n_opt, bs_opt = _calibrate_n_processes(
                 self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=4,
             )
         assert n_opt  == 3
@@ -182,9 +182,9 @@ class TestCalibrateNProcesses:
         """
         results = [(1, 100), (2, 300), (3, 350), (4, 400), (6, 380)]
         total_gb = 1.0
-        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
-             patch("tod_calibrate.get_memory_per_process", return_value=total_gb):
-            n_opt, bs_opt = calibrate_n_processes(
+        with patch("tod_calibrate._calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate._get_memory_per_process", return_value=total_gb):
+            n_opt, bs_opt = _calibrate_n_processes(
                 self._BEAM_DATA, ".", 0, [None], n_cpu_ceiling=4,
             )
         max_beam_sel = 1_000_000
@@ -202,9 +202,9 @@ class TestCalibrateNProcesses:
         # _memory_cap(0.5, 1e8) = max(1, int(0.5e9/1.5/1e10)) = max(1, 0) = 1
         # So cap=1 for all n; results must contain bs=1 to avoid "no affordable" skips.
         results = [(1, 500)]
-        with patch("tod_calibrate.calibrate_batch_size", return_value=(None, results)), \
-             patch("tod_calibrate.get_memory_per_process", return_value=1.0):
-            n_opt, bs_opt = calibrate_n_processes(
+        with patch("tod_calibrate._calibrate_batch_size", return_value=(None, results)), \
+             patch("tod_calibrate._get_memory_per_process", return_value=1.0):
+            n_opt, bs_opt = _calibrate_n_processes(
                 beam_data, ".", 0, [None], n_cpu_ceiling=4,
             )
         # Any n in [1,4] is valid; what matters is the result is sane.
