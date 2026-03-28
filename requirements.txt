@@ -1,0 +1,6 @@
+numpy
+healpy
+pixell
+numba
+pyyaml
+psutil

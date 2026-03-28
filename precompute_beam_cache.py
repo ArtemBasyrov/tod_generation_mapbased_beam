@@ -137,22 +137,42 @@ def _compute_angular_offsets(vec_rolled, beam_ctr):
 # ── Per-beam precomputation ───────────────────────────────────────────────────
 
 def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=True):
-    """
-    Load one beam file, apply pixel selection, and precompute vec_rolled.
+    """Load one beam file, select pixels by power, and precompute psi-rolled vectors.
 
-    Parameters
-    ----------
-    bf              : str   – beam filename (relative to folder_beam)
-    folder_beam     : str   – beam folder path
-    n_psi           : int   – number of psi bins
-    power_threshold : float – fraction of total power for pixel selection (e.g. 0.99)
-    compute_offsets : bool  – also compute flat-sky angular offsets (Phase 2)
+    Mirrors the pixel-selection logic in
+    :func:`~sample_based_tod_generation_gridint.prepare_beam_data` so that the
+    same ``S`` pixels and normalisation are used at cache-generation time and at
+    runtime.
 
-    Returns
-    -------
-    dict with keys:
-        psi_grid, vec_rolled, beam_vals, beam_ctr
-        [dtheta, dphi]  if compute_offsets=True
+    Args:
+        bf (str): Beam filename relative to ``folder_beam``.
+        folder_beam (str): Path to the beam data directory.
+        n_psi (int): Number of psi bins. 720 gives 0.5° resolution. Increase
+            for beams wider than ~5°.
+        power_threshold (float): Fraction of total beam power to retain for
+            pixel selection (e.g. ``0.99`` keeps 99 % of power).
+        compute_offsets (bool): If ``True`` (default), also compute flat-sky
+            angular offsets ``dtheta`` and ``dphi`` for the fastest runtime
+            path. Set to ``False`` for beams wider than ~5° where the
+            flat-sky approximation is invalid.
+
+    Returns:
+        dict: Cache dictionary with the following keys:
+
+            - ``'psi_grid'`` (*numpy.ndarray*, ``(N_psi,)``) – psi bin centres
+              [rad].
+            - ``'vec_rolled'`` (*numpy.ndarray*, ``(N_psi, S, 3)``) – beam-pixel
+              unit vectors after psi-roll for each bin.
+            - ``'beam_vals'`` (*numpy.ndarray*, ``(S,)``) – normalised beam
+              weights.
+            - ``'beam_ctr'`` (*numpy.ndarray*, ``(3,)``) – beam-centre unit
+              vector (always ``[1, 0, 0]``).
+            - ``'dtheta'`` (*numpy.ndarray*, ``(N_psi, S)``) – flat-sky
+              colatitude offsets [rad]. Present only when
+              ``compute_offsets=True``.
+            - ``'dphi'`` (*numpy.ndarray*, ``(N_psi, S)``) – flat-sky phi
+              offsets [rad] (divide by ``sin(theta_b)`` at runtime). Present
+              only when ``compute_offsets=True``.
     """
     print(f"  Loading {bf} ...", flush=True)
     ra, dec, pixel_map = load_beam(folder_beam, bf)
@@ -229,7 +249,21 @@ def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=Tru
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
 def cache_filename(bf, output_dir, n_psi):
-    """Return the .npz path for a given beam file."""
+    """Return the .npz cache path for a given beam filename.
+
+    The cache file is named ``{beam_stem}_cache_npsi{n_psi}.npz`` inside
+    ``output_dir``. This naming scheme allows multiple psi-bin resolutions to
+    coexist in the same directory.
+
+    Args:
+        bf (str): Beam filename (basename or full path; only the stem is used).
+        output_dir (str): Directory where cache files are stored.
+        n_psi (int): Number of psi bins; embedded in the filename so the main
+            script can verify it matches ``config.beam_cache_n_psi``.
+
+    Returns:
+        str: Absolute path to the ``.npz`` cache file.
+    """
     stem = os.path.splitext(os.path.basename(bf))[0]
     return os.path.join(output_dir, f"{stem}_cache_npsi{n_psi}.npz")
 
@@ -241,7 +275,17 @@ def save_cache(cache, path):
 
 
 def load_cache(path):
-    """Load a precomputed cache file. Returns dict of arrays."""
+    """Load a precomputed beam cache file.
+
+    Args:
+        path (str): Path to the ``.npz`` cache file produced by
+            :func:`precompute_beam` / :func:`save_cache`.
+
+    Returns:
+        dict[str, numpy.ndarray]: Dictionary of arrays. Expected keys:
+            ``'psi_grid'``, ``'vec_rolled'``, ``'beam_vals'``, ``'beam_ctr'``,
+            and optionally ``'dtheta'`` and ``'dphi'``.
+    """
     data = np.load(path)
     return {k: data[k] for k in data.files}
 
@@ -249,18 +293,20 @@ def load_cache(path):
 # ── Runtime helper (used by main TOD script) ──────────────────────────────────
 
 def lookup_psi_bin(psi_values, psi_grid):
-    """
-    Map an array of psi angles (radians, arbitrary range) to the nearest bin
-    index in psi_grid.
+    """Map psi angles to the nearest bin index in an evenly-spaced psi grid.
 
-    Parameters
-    ----------
-    psi_values : (B,) float32 or float64
-    psi_grid   : (N_psi,) float32   evenly spaced on [0, 2π)
+    Wraps ``psi_values`` to ``[0, 2π)`` before binning, so the input may span
+    any range.
 
-    Returns
-    -------
-    indices : (B,) int64
+    Args:
+        psi_values (numpy.ndarray): Psi angles [rad], shape ``(B,)``.
+            Any dtype is accepted.
+        psi_grid (numpy.ndarray): Evenly-spaced psi bin centres [rad] covering
+            ``[0, 2π)``, shape ``(N_psi,)``.
+
+    Returns:
+        numpy.ndarray: Nearest-bin indices, shape ``(B,)``, dtype ``int64``.
+            Values are in ``[0, N_psi)``.
     """
     n_psi = len(psi_grid)
     dpsi  = 2 * np.pi / n_psi

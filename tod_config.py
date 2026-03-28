@@ -36,9 +36,21 @@ calibration_batch_size  = _cfg.get("calibration_batch_size", None)
 beam_cache_dir  = _cfg.get("beam_cache_dir", None)
 beam_cache_n_psi = _cfg.get("beam_cache_n_psi", 720)
 
-# Beam grid interpolation mode
-# beam_interp_gaussian: true  → isotropic Gaussian kernel (slower, no grid artefacts)
-#                       false → bilinear HEALPix (default, fast Numba kernel)
-beam_interp_gaussian   = _cfg.get("beam_interp_gaussian",   False)
+# Beam grid interpolation method
+# beam_interp_method: 'nearest'  → single nearest-pixel lookup (fastest)
+#                     'bilinear' → 4-pixel bilinear HEALPix (default, fast Numba kernel)
+#                     'gaussian' → isotropic Gaussian kernel (slower, no grid artefacts)
+# Backward-compat: if only the old beam_interp_gaussian flag is set, map it.
+_interp_method_raw = _cfg.get("beam_interp_method", None)
+if _interp_method_raw is None:
+    _old_gaussian      = _cfg.get("beam_interp_gaussian", False)
+    _interp_method_raw = 'gaussian' if _old_gaussian else 'bilinear'
+_VALID_INTERP = {'nearest', 'bilinear', 'gaussian'}
+if _interp_method_raw not in _VALID_INTERP:
+    raise ValueError(
+        f"beam_interp_method must be one of {sorted(_VALID_INTERP)!r}, "
+        f"got {_interp_method_raw!r}"
+    )
+beam_interp_method     = _interp_method_raw
 beam_interp_sigma_deg  = _cfg.get("beam_interp_sigma_deg",  None)   # None → pixel resolution
 beam_interp_radius_deg = _cfg.get("beam_interp_radius_deg", None)   # None → 3 × sigma

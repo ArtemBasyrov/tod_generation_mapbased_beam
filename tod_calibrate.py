@@ -45,25 +45,31 @@ def _candidate_batch_sizes(mem_cap):
 
 def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
                          n_repeats=3, prefix=""):
-    """
-    Run once before the day loop to find a batch size optimal for the hardware,
-    consistent across all days.
+    """Find the batch size that maximises sustained throughput on this hardware.
 
-    Parameters
-    ----------
-    beam_data   : dict — loaded beam data (from prepare_beam_data)
-    folder_scan : str  — path to scan data folder
-    probe_day   : int  — any valid day index; used to load probe data
-    mp          : list — sky maps [I, Q, U]
-    n_processes : int  — number of worker processes; used to auto-determine
-                         per-process memory budget via get_memory_per_process()
-    n_repeats   : int  — timing repeats per candidate (default 3)
-    prefix      : str  — log prefix
+    Runs once before the day loop. Generates candidate batch sizes from a power-
+    of-two sequence capped by an empirical memory model, then measures sustained
+    throughput using interleaved timing repeats (one full pass over all
+    candidates per repeat round) to avoid L3 cache warm-up bias.
 
-    Returns
-    -------
-    best_batch_size : int
-    results         : list of (batch_size, throughput_samp_per_s)
+    Args:
+        beam_data (dict): Loaded beam data from :func:`prepare_beam_data`.
+        folder_scan (str): Path to the scan data directory.
+        probe_day (int): Any valid day index; used to load the timing probe
+            data.
+        mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``.
+        n_processes (int): Number of worker processes. Used to derive the
+            per-process memory budget via :func:`~tod_utils.get_memory_per_process`.
+        n_repeats (int): Number of interleaved timing rounds per candidate.
+            Defaults to ``3``.
+        prefix (str): Log-message prefix (e.g. process name). Defaults to ``""``.
+
+    Returns:
+        tuple:
+            - **best_batch_size** (*int*) – Batch size with highest mean
+              throughput.
+            - **results** (*list[tuple[int, float]]*) – Per-candidate list of
+              ``(batch_size, throughput_samples_per_second)``.
     """
     nside        = hp.get_nside(mp[0])
     max_beam_sel = max(d['n_sel'] for d in beam_data.values())
@@ -120,37 +126,40 @@ def calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
 
 def calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
                            n_repeats=3, prefix=""):
-    """
-    Find the optimal number of worker processes by maximising estimated total
-    throughput = throughput_per_process(n) × n.
+    """Find the optimal number of worker processes for maximum total throughput.
 
-    Runs batch-size calibration once with the full available memory budget
-    (as if only one process is running), which produces a throughput curve
-    over all candidate batch sizes.  Then, for each candidate n in
-    [1 … n_cpu_ceiling], it determines the largest batch size that fits in
-    memory/n and reads off the corresponding per-process throughput from the
-    curve.  The n that maximises n × per-process-throughput is returned.
+    Estimates total throughput as ``throughput_per_process(n) × n`` and returns
+    the ``n`` that maximises it. This correctly handles the HPC pattern where
+    using all allocated cores gives each process too little RAM, leading to tiny
+    batches with high Python overhead that make fewer-but-larger workers faster
+    end-to-end.
 
-    This correctly captures the NERSC / HPC pattern where using all available
-    cores gives each process too little RAM (→ tiny batches → high overhead),
-    so fewer processes with larger per-process memory actually runs faster end-
-    to-end.
+    Strategy:
 
-    Parameters
-    ----------
-    beam_data      : dict — loaded beam data (from prepare_beam_data)
-    folder_scan    : str  — path to scan data folder
-    probe_day      : int  — any valid day index for the timing probe
-    mp             : list — sky maps [I, Q, U]
-    n_cpu_ceiling  : int  — maximum number of processes allowed (from scheduler
-                            or config)
-    n_repeats      : int  — timing repeats for the calibration run (default 3)
-    prefix         : str  — log prefix
+    1. Run :func:`calibrate_batch_size` once with the full available memory
+       (as if ``n = 1``) to obtain a throughput curve over all candidate batch
+       sizes.
+    2. For each candidate ``n`` in ``[1, n_cpu_ceiling]``, find the largest
+       batch size that fits in ``total_memory / n`` and read off its per-process
+       throughput from the curve.
+    3. Return the ``n`` with the highest ``n × per_process_throughput``.
 
-    Returns
-    -------
-    n_optimal  : int  — optimal number of worker processes
-    batch_size : int  — optimal batch size for that process count
+    Args:
+        beam_data (dict): Loaded beam data from :func:`prepare_beam_data`.
+        folder_scan (str): Path to the scan data directory.
+        probe_day (int): Any valid day index for the timing probe.
+        mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``.
+        n_cpu_ceiling (int): Maximum number of worker processes allowed
+            (from the scheduler allocation or ``config.n_processes``).
+        n_repeats (int): Timing rounds for the calibration run. Defaults to
+            ``3``.
+        prefix (str): Log-message prefix. Defaults to ``""``.
+
+    Returns:
+        tuple:
+            - **n_optimal** (*int*) – Optimal number of worker processes.
+            - **batch_size** (*int*) – Optimal batch size for that process
+              count.
     """
     max_beam_sel = max(d['n_sel'] for d in beam_data.values())
 

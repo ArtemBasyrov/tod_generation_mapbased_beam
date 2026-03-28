@@ -25,7 +25,7 @@ beam_files           = [config.beam_file_I, config.beam_file_Q, config.beam_file
 start_day = config.start_day
 end_day   = config.end_day
 
-interp_mode          = 'gaussian' if config.beam_interp_gaussian else 'bilinear'
+interp_mode          = config.beam_interp_method
 interp_sigma_deg     = config.beam_interp_sigma_deg
 interp_radius_deg    = config.beam_interp_radius_deg
 
@@ -90,14 +90,47 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
 # ── Beam preparation ──────────────────────────────────────────────────────────
 
 def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
-    """
-    Load and preprocess all unique beam files. Returns beam_data dict.
+    """Load and preprocess all unique beam files into a beam-data dictionary.
 
-    If cache_dir is given, attempts to load precomputed vec_rolled / psi_grid
-    from the .npz files produced by precompute_beam_cache.py.  When found,
-    beam_tod_batch will apply only Rodrigues 1 (recentering) at runtime,
-    skipping the psi-roll rotation entirely.  Falls back silently to the
-    full double-Rodrigues path when no cache file is found.
+    For each unique beam filename, loads the FITS map, selects pixels by power
+    threshold, normalises beam weights, and precomputes unit vectors. If
+    ``cache_dir`` is given, attempts to load a precomputed rotation cache
+    (``.npz``) produced by :mod:`precompute_beam_cache`. When a cache is found
+    the runtime path in :func:`~tod_core.beam_tod_batch` skips the psi-roll
+    (single-Rodrigues) or both rotations (flat-sky). Falls back silently to the
+    full double-Rodrigues path when no cache file exists.
+
+    Args:
+        beam_filenames (list[str]): List of beam filenames (one per Stokes
+            component, in the order ``[I, Q, U]``). Duplicate filenames are
+            de-duplicated; the corresponding ``comp_indices`` lists which Stokes
+            components share a given beam file.
+        cache_dir (str | None): Path to the directory containing ``.npz``
+            cache files. ``None`` disables caching.
+        cache_n_psi (int): Number of psi bins to look for in the cache
+            filenames. Must match the ``--n_psi`` value used when generating
+            the cache. Defaults to ``720``.
+
+    Returns:
+        dict[str, dict]: Beam-data dictionary keyed by beam filename. Each
+            value is a dict with the following entries:
+
+            - ``'ra'`` – RA offset grid [rad]
+            - ``'dec'`` – Dec offset grid [rad]
+            - ``'beam_vals'`` – Normalised beam weights, shape ``(S,)``
+            - ``'sel'`` – Boolean selection mask over the full beam map
+            - ``'comp_indices'`` – List of Stokes component indices using this
+              beam (e.g. ``[0]`` for I-only, ``[1, 2]`` if Q and U share a map)
+            - ``'n_sel'`` – Number of selected pixels ``S``
+            - ``'vec_orig'`` – Beam-pixel unit vectors, shape ``(S, 3)``
+            - ``'vec_rolled'`` *(optional)* – Pre-rolled vectors from cache,
+              shape ``(N_psi, S, 3)``
+            - ``'psi_grid'`` *(optional)* – psi bin centres [rad] from cache,
+              shape ``(N_psi,)``
+            - ``'dtheta'`` *(optional)* – Flat-sky colatitude offsets from
+              cache, shape ``(N_psi, S)``
+            - ``'dphi'`` *(optional)* – Flat-sky phi offsets from cache,
+              shape ``(N_psi, S)``
     """
     beam_groups = {}
     for i, bf in enumerate(beam_filenames):
@@ -158,14 +191,28 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
 # ── TOD generation ────────────────────────────────────────────────────────────
 
 def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=None):
-    """
-    Generate TOD for one day using batched memory-mapped loading and
-    bilinear HEALPix interpolation.
+    """Generate TOD for a single observation day using batched processing.
 
-    Parameters
-    ----------
-    beam_data  : dict  — pre-loaded beam data from prepare_beam_data()
-    batch_size : int   — pre-calibrated batch size, uniform across all days
+    Opens the scan files as persistent memory-maps (avoiding repeated
+    ``open``/``mmap`` syscalls per batch), then processes the day in
+    ``ceil(n_samples / batch_size)`` batches. Each batch computes Rodrigues
+    rotation vectors, calls :func:`~tod_core.beam_tod_batch` for every beam
+    entry, and accumulates the results.
+
+    Args:
+        beam_data (dict): Pre-loaded beam data from :func:`prepare_beam_data`.
+            Must include ``'mp_stacked'`` for the Numba gather path.
+        day_index (int): Zero-based index of the observation day.
+        mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``. Used on
+            the fallback (non-stacked) path only.
+        batch_size (int): Number of detector samples per processing batch. Use
+            the value returned by :func:`~tod_calibrate.calibrate_n_processes`.
+        process_name (str | None): Label for log messages (e.g. the
+            ``multiprocessing.Process`` name). Defaults to ``None``.
+
+    Returns:
+        numpy.ndarray: TOD array of shape ``(3, n_samples)``, dtype
+            ``float64``. Axis 0 is the Stokes component index ``[I, Q, U]``.
     """
     prefix    = f"[{process_name}] " if process_name else ""
     nside     = hp.get_nside(mp[0])

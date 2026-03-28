@@ -561,6 +561,157 @@ def _gather_accum_flatsky_jit(dtheta_tile, dphi_tile, k_b, theta_b, phi_b,
                               + mp_stacked[c, p3] * w3) * bv
 
 
+# ── Nearest-pixel kernels ─────────────────────────────────────────────────────
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
+    """
+    Fully fused vec2ang + HEALPix nearest-pixel lookup + beam accumulation.
+
+    For each rotated beam vector the single nearest RING-scheme pixel is found
+    via the inline ang2pix algorithm (_ang2pix_ring_jit inlined) and its
+    sky-map value is accumulated with the beam weight.  Parallelised over B.
+
+    Parameters
+    ----------
+    vec_rot    : (B, Sc, 3)   float32   rotated beam unit vectors
+    nside      : int
+    mp_stacked : (C, N_hp)    float32   stacked sky-map components
+    beam_vals  : (Sc,)        float32   beam weights for this tile
+    B, Sc      : int
+    tod        : (C, B)       float64   accumulated in place
+    """
+    C          = mp_stacked.shape[0]
+    npix_total = 12 * nside * nside
+
+    for b in numba.prange(B):
+        for s in range(Sc):
+
+            # vec2ang (inline)
+            vx = float(vec_rot[b, s, 0])
+            vy = float(vec_rot[b, s, 1])
+            vz = float(vec_rot[b, s, 2])
+            theta = math.atan2(math.sqrt(vx*vx + vy*vy), vz)
+            phi   = math.atan2(vy, vx)
+            if phi < 0.0:
+                phi += _TWO_PI
+
+            # nearest-pixel lookup (inlined _ang2pix_ring_jit)
+            z     = vz / math.sqrt(vx*vx + vy*vy + vz*vz)  # cos(theta)
+            phi_w = phi  # already in [0, 2π)
+
+            ir_above = _ring_above_jit(nside, z)
+            if ir_above < 1:
+                ir_above = 1
+            elif ir_above > 4 * nside - 2:
+                ir_above = 4 * nside - 2
+            ir_below = ir_above + 1
+
+            best_pix = 0
+            best_cos = -2.0
+            sin_th   = math.sin(theta)
+
+            for ir_g in (ir_above, ir_below):
+                if ir_g < 1 or ir_g > 4 * nside - 1:
+                    continue
+                n_pix, first_pix, phi0, dphi_r = _ring_info_jit(nside, ir_g, npix_total)
+                z_c     = _ring_z_jit(nside, ir_g)
+                sin_z_c = math.sqrt(max(0.0, 1.0 - z_c * z_c))
+                ip_base = int(phi_w * n_pix / _TWO_PI) % n_pix
+                for ip_try in (ip_base, (ip_base + 1) % n_pix):
+                    phi_c = phi0 + ip_try * dphi_r
+                    cos_d = sin_th * sin_z_c * math.cos(phi_w - phi_c) + z * z_c
+                    if cos_d > best_cos:
+                        best_cos = cos_d
+                        best_pix = first_pix + ip_try
+
+            bv = float(beam_vals[s])
+            for c in range(C):
+                tod[c, b] += mp_stacked[c, best_pix] * bv
+
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _gather_accum_nearest_flatsky_jit(dtheta_tile, dphi_tile, k_b, theta_b, phi_b,
+                                       nside, mp_stacked, beam_vals, B, Sc, tod):
+    """
+    Flat-sky nearest-pixel HEALPix interpolation + beam accumulation.
+
+    Same flat-sky approximation as _gather_accum_flatsky_jit but replaces the
+    4-pixel bilinear step with a single nearest-pixel lookup.  Parallelised over B.
+
+    Parameters
+    ----------
+    dtheta_tile : (N_psi, Sc)  float32  — colatitude offsets for this S-tile
+    dphi_tile   : (N_psi, Sc)  float32  — raw phi offsets (divide by sin(theta_b))
+    k_b         : (B,)         int64    — psi bin index per sample
+    theta_b     : (B,)         float32  — pointing colatitude [rad]
+    phi_b       : (B,)         float32  — pointing longitude  [rad]
+    nside       : int
+    mp_stacked  : (C, N_hp)    float32  — stacked sky-map components
+    beam_vals   : (Sc,)        float32  — beam weights for this tile
+    B, Sc       : int
+    tod         : (C, B)       float64  — accumulated in place
+    """
+    C          = mp_stacked.shape[0]
+    npix_total = 12 * nside * nside
+
+    for b in numba.prange(B):
+        th_point = float(theta_b[b])
+        ph_point = float(phi_b[b])
+        kb       = k_b[b]
+        sin_th   = math.sin(th_point)
+        inv_sin  = 1.0 / sin_th if sin_th > 1e-10 else 0.0
+
+        for s in range(Sc):
+            theta = th_point + float(dtheta_tile[kb, s])
+            phi   = ph_point + float(dphi_tile[kb, s]) * inv_sin
+
+            if theta < 0.0:
+                theta = -theta
+                phi  += math.pi
+            elif theta > math.pi:
+                theta = _TWO_PI - theta
+                phi  += math.pi
+
+            if phi < 0.0:
+                phi += _TWO_PI
+            elif phi >= _TWO_PI:
+                phi -= _TWO_PI
+
+            # nearest-pixel lookup
+            z     = math.cos(theta)
+            phi_w = phi
+
+            ir_above = _ring_above_jit(nside, z)
+            if ir_above < 1:
+                ir_above = 1
+            elif ir_above > 4 * nside - 2:
+                ir_above = 4 * nside - 2
+            ir_below = ir_above + 1
+
+            best_pix = 0
+            best_cos = -2.0
+            sin_th_s = math.sin(theta)
+
+            for ir_g in (ir_above, ir_below):
+                if ir_g < 1 or ir_g > 4 * nside - 1:
+                    continue
+                n_pix, first_pix, phi0, dphi_r = _ring_info_jit(nside, ir_g, npix_total)
+                z_c     = _ring_z_jit(nside, ir_g)
+                sin_z_c = math.sqrt(max(0.0, 1.0 - z_c * z_c))
+                ip_base = int(phi_w * n_pix / _TWO_PI) % n_pix
+                for ip_try in (ip_base, (ip_base + 1) % n_pix):
+                    phi_c = phi0 + ip_try * dphi_r
+                    cos_d = sin_th_s * sin_z_c * math.cos(phi_w - phi_c) + z * z_c
+                    if cos_d > best_cos:
+                        best_cos = cos_d
+                        best_pix = first_pix + ip_try
+
+            bv = float(beam_vals[s])
+            for c in range(C):
+                tod[c, b] += mp_stacked[c, best_pix] * bv
+
+
 # ── Gaussian kernel interpolation helpers ────────────────────────────────────
 
 def _angular_distance(th1, ph1, th2, ph2):
@@ -822,14 +973,34 @@ def _gaussian_accum_flatsky(dtheta_tile, dphi_tile, k_b, theta_b, phi_b,
 # ── Public numpy functions ────────────────────────────────────────────────────
 
 def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=(100, 100)):
-    """
-    Compute Rodrigues rotation vectors and polarisation angle offsets (beta)
-    that bring the beam centre to each pointing direction in the batch.
+    """Compute Rodrigues rotation vectors and polarisation angle offsets for a batch.
 
-    Returns
-    -------
-    rot_vector : (B, 3)
-    beta       : (B,)
+    For each boresight pointing ``(phi_b, theta_b)`` in the batch, computes
+    the Rodrigues rotation vector that brings the beam centre
+    ``(ra[center_idx], dec[center_idx])`` to that pointing direction, together
+    with the parallactic angle offset ``beta`` needed to align the polarisation
+    frame.  The combined rotation angle applied at sample time is
+    ``psi_b - beta``.
+
+    Args:
+        ra (numpy.ndarray): RA offsets of beam pixels from beam centre [rad],
+            shape ``(H, W)``.
+        dec (numpy.ndarray): Dec offsets of beam pixels from beam centre [rad],
+            shape ``(H, W)``.
+        phi_batch (numpy.ndarray): Boresight longitude for each sample [rad],
+            shape ``(B,)``.
+        theta_batch (numpy.ndarray): Boresight colatitude for each sample [rad],
+            shape ``(B,)``.
+        center_idx (tuple[int, int]): 2-D index of the beam-centre pixel in the
+            ``ra``/``dec`` arrays. Must match ``BEAM_CENTER_IDX`` used in
+            :mod:`precompute_beam_cache`. Defaults to ``(100, 100)``.
+
+    Returns:
+        tuple:
+            - **rot_vector** (*numpy.ndarray*) – Rodrigues rotation vectors
+              (axis × angle), shape ``(B, 3)``.
+            - **beta** (*numpy.ndarray*) – Polarisation angle offset [rad],
+              shape ``(B,)``.  Always in ``[0, 2π)``.
     """
     def sph2vec(phi, theta):
         return np.stack([np.sin(theta)*np.cos(phi),
@@ -901,20 +1072,29 @@ def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
 
 
 def recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
-    """
-    Fused recenter + rotate via Rodrigues formula.
+    """Apply a fused recenter + polarisation-roll rotation to beam pixel vectors.
 
-    Parameters
-    ----------
-    vec_orig : (S, 3)  precomputed beam pixel unit vectors
-    rot_vecs : (B, 3)  rotation vectors (axis * angle)
-    phi_pix  : (B,)
-    theta_pix: (B,)
-    psis     : (B,)    combined rotation angle (-beta + psi)
+    Executes the double Rodrigues rotation via the
+    :func:`_rodrigues_jit` Numba kernel:
 
-    Returns
-    -------
-    out : (B, S, 3)  float32
+    1. **Recenter** (Rodrigues 1): rotate ``vec_orig`` from the beam-centre
+       direction to the boresight direction defined by ``rot_vecs``.
+    2. **Pol. roll** (Rodrigues 2): rotate by ``psis`` around the boresight
+       unit vector.
+
+    Args:
+        vec_orig (numpy.ndarray): Beam-pixel unit vectors in the beam frame,
+            shape ``(S, 3)``, dtype ``float32``.
+        rot_vecs (numpy.ndarray): Rodrigues rotation vectors (axis × angle)
+            from :func:`precompute_rotation_vector_batch`, shape ``(B, 3)``.
+        phi_pix (numpy.ndarray): Boresight longitude [rad], shape ``(B,)``.
+        theta_pix (numpy.ndarray): Boresight colatitude [rad], shape ``(B,)``.
+        psis (numpy.ndarray): Combined rotation angle ``psi_b - beta`` [rad],
+            shape ``(B,)``.
+
+    Returns:
+        numpy.ndarray: Rotated beam-pixel unit vectors in sky-frame coordinates,
+            shape ``(B, S, 3)``, dtype ``float32``.
     """
     B = rot_vecs.shape[0]
     S = vec_orig.shape[0]
@@ -928,52 +1108,66 @@ def recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
 
 def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                    interp_mode='bilinear', sigma_deg=None, radius_deg=None):
-    """
-    Accumulate the TOD contribution of one beam entry for a batch of B samples.
+    """Accumulate the TOD contribution of one beam entry for a batch of samples.
 
-    Tiles over the S beam pixels so that each (B × Sc × 3 × float32)
-    intermediate stays within _S_TILE_TARGET_BYTES.  Uses Numba JIT kernels
-    for both the rotation and the gather+accumulation steps.
+    Tiles over the ``S`` selected beam pixels so that the
+    ``(B × Sc × 3 × float32)`` intermediate vector buffer stays within the L2
+    cache target. Uses Numba JIT kernels for both the rotation and the
+    gather + accumulation steps.
 
-    Three execution paths, selected by what ``data`` contains:
+    Three execution paths are selected automatically based on the contents of
+    ``data``:
 
-    **Flat-sky** (fastest) — requires ``vec_rolled``, ``psi_grid``, ``dtheta``,
-    ``dphi``, and ``mp_stacked``.  Skips both Rodrigues rotations and vec2ang;
-    computes sky positions via precomputed angular offsets and feeds directly
-    into the HEALPix interpolation + accumulation kernel.
+    * **Flat-sky** *(fastest)* — requires ``vec_rolled``, ``psi_grid``,
+      ``dtheta``, ``dphi``, and ``mp_stacked`` in ``data``. Skips both
+      Rodrigues rotations and the ``vec2ang`` call; computes sky positions from
+      precomputed angular offsets and feeds directly into the HEALPix
+      interpolation kernel. Valid for narrow beams (≲ 5°).
 
-    **Single-Rodrigues** — requires ``vec_rolled``, ``psi_grid``, and
-    ``mp_stacked``.  The psi-roll is baked into the precomputed vectors; only
-    the recentering rotation (Rodrigues 1) is applied at runtime.
+    * **Single-Rodrigues** — requires ``vec_rolled``, ``psi_grid``, and
+      ``mp_stacked`` in ``data``. The psi-roll is baked into the precomputed
+      vectors; only the recentering rotation (Rodrigues 1) is applied at
+      runtime. Roughly half the rotation cost of the full path.
 
-    **Original** (fallback) — full double Rodrigues rotation at runtime.  Used
-    when no cache arrays are present.  If ``mp_stacked`` is also absent the
-    function further falls back to the numpy gather path (validation only).
+    * **Full double-Rodrigues** *(fallback)* — used when no cache arrays are
+      present. Applies both Rodrigues rotations per ``(B, S)`` element at
+      runtime.
 
-    Parameters
-    ----------
-    nside       : int
-    mp          : list of arrays — sky map components (fallback only)
-    data        : dict — beam_data entry
-    rot_vecs    : (B, 3)
-    phi_b       : (B,)
-    theta_b     : (B,)
-    psis_b      : (B,)
-    interp_mode : str, optional
-        ``'bilinear'`` (default) — fast 4-pixel bilinear HEALPix interpolation
-        via the Numba fused kernel.
-        ``'gaussian'`` — isotropic Gaussian kernel interpolation using
-        hp.query_disc; slower but avoids grid-aligned artefacts.
-    sigma_deg   : float or None
-        Gaussian width [degrees].  Defaults to one HEALPix pixel resolution.
-        Ignored when interp_mode='bilinear'.
-    radius_deg  : float or None
-        Neighbour search radius [degrees].  Defaults to 3 × sigma_deg.
-        Ignored when interp_mode='bilinear'.
+    Args:
+        nside (int): HEALPix ``nside`` of the sky map.
+        mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``. Each
+            element is a 1-D ``float32`` array of length ``12 * nside**2``.
+            Used only on the full double-Rodrigues fallback path.
+        data (dict): Beam data entry as returned by :func:`prepare_beam_data`.
+            Required keys: ``'vec_orig'``, ``'beam_vals'``, ``'comp_indices'``.
+            Optional keys for cached paths: ``'mp_stacked'``, ``'vec_rolled'``,
+            ``'psi_grid'``, ``'dtheta'``, ``'dphi'``.
+        rot_vecs (numpy.ndarray): Rodrigues rotation vectors from
+            :func:`precompute_rotation_vector_batch`, shape ``(B, 3)``.
+        phi_b (numpy.ndarray): Boresight longitude [rad], shape ``(B,)``.
+        theta_b (numpy.ndarray): Boresight colatitude [rad], shape ``(B,)``.
+        psis_b (numpy.ndarray): Combined rotation angle ``psi_b - beta`` [rad],
+            shape ``(B,)``.
+        interp_mode (str): Sky-map interpolation strategy. One of:
 
-    Returns
-    -------
-    tod : dict  comp_index -> (B,) float32 array
+            * ``'bilinear'`` *(default)* — 4-pixel bilinear HEALPix
+              interpolation via the fused Numba kernel.
+            * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
+              mixing.
+            * ``'gaussian'`` — isotropic Gaussian kernel over all pixels within
+              ``radius_deg``; slowest, avoids grid-aligned artefacts.
+
+        sigma_deg (float | None): Gaussian kernel width [degrees].
+            Defaults to one HEALPix pixel resolution.
+            Ignored when ``interp_mode != 'gaussian'``.
+        radius_deg (float | None): Neighbour search radius [degrees].
+            Defaults to ``3 × sigma_deg``.
+            Ignored when ``interp_mode != 'gaussian'``.
+
+    Returns:
+        dict[int, numpy.ndarray]: Mapping from Stokes component index to a
+            ``(B,)`` ``float32`` array containing the beam-weighted sky-map
+            accumulation for that component over the batch.
     """
     B            = phi_b.shape[0]
     vec_orig     = data['vec_orig']    # (S, 3)
@@ -992,6 +1186,7 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
     # Requires mp_stacked since it feeds directly into _gather_accum_flatsky_jit.
     use_flatsky  = use_cache and dtheta is not None and dphi is not None \
                    and mp_stacked is not None
+    use_nearest  = interp_mode == 'nearest'
     use_gaussian = interp_mode == 'gaussian'
 
     # Resolve Gaussian defaults once (avoids repeating hp.nside2resol per tile).
@@ -1030,10 +1225,10 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
         bv_chunk = beam_vals[s0:s1]   # (Sc,)
 
         if use_flatsky:
+            tod_arr = np.zeros((C, B), dtype=np.float64)
             if use_gaussian:
                 # Flat-sky + Gaussian: fused JIT kernel takes dtheta/dphi
                 # directly — no Python preprocessing loop, flat-sky dist².
-                tod_arr = np.zeros((C, B), dtype=np.float64)
                 _gaussian_accum_flatsky(
                     np.ascontiguousarray(dtheta[:, s0:s1]),
                     np.ascontiguousarray(dphi[:, s0:s1]),
@@ -1043,11 +1238,18 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                     B, s1 - s0, nside, mp_stacked, bv_chunk, tod_arr,
                     _sigma_deg, _radius_deg,
                 )
-                for i, comp in enumerate(comp_indices):
-                    tod[comp] += tod_arr[i].astype(np.float32)
+            elif use_nearest:
+                # Flat-sky nearest-pixel path.
+                _gather_accum_nearest_flatsky_jit(
+                    np.ascontiguousarray(dtheta[:, s0:s1]),
+                    np.ascontiguousarray(dphi[:, s0:s1]),
+                    k_b,
+                    np.asarray(theta_b, dtype=np.float32),
+                    np.asarray(phi_b,   dtype=np.float32),
+                    nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr,
+                )
             else:
-                # Flat-sky bilinear path (original).
-                tod_arr = np.zeros((C, B), dtype=np.float64)
+                # Flat-sky bilinear path (default).
                 _gather_accum_flatsky_jit(
                     np.ascontiguousarray(dtheta[:, s0:s1]),
                     np.ascontiguousarray(dphi[:, s0:s1]),
@@ -1056,8 +1258,8 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                     np.asarray(phi_b,   dtype=np.float32),
                     nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr,
                 )
-                for i, comp in enumerate(comp_indices):
-                    tod[comp] += tod_arr[i].astype(np.float32)
+            for i, comp in enumerate(comp_indices):
+                tod[comp] += tod_arr[i].astype(np.float32)
 
         elif use_cache:
             # Single-Rodrigues path: psi-roll baked in, only recentering needed.
@@ -1074,6 +1276,9 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                     _gaussian_interp_accum(theta_flat, phi_flat, B, s1 - s0,
                                            nside, mp_stacked, bv_chunk, tod_arr,
                                            _sigma_deg, _radius_deg)
+                elif use_nearest:
+                    _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, bv_chunk,
+                                              B, s1 - s0, tod_arr)
                 else:
                     _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
                                             B, s1 - s0, tod_arr)
@@ -1102,6 +1307,9 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                     _gaussian_interp_accum(theta_flat, phi_flat, B, s1 - s0,
                                            nside, mp_stacked, bv_chunk, tod_arr,
                                            _sigma_deg, _radius_deg)
+                elif use_nearest:
+                    _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, bv_chunk,
+                                              B, s1 - s0, tod_arr)
                 else:
                     _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
                                             B, s1 - s0, tod_arr)

@@ -27,9 +27,12 @@
   # beam_cache_n_psi must match the --n_psi value used when generating the cache
   beam_cache_dir: null
   beam_cache_n_psi: 720
-  # beam grid interpolation — set beam_interp_gaussian: true to use isotropic
-  # Gaussian kernel interpolation instead of the default bilinear HEALPix interp.
-  # sigma and radius default to 1× and 3× the HEALPix pixel resolution.
-  beam_interp_gaussian: false
+  # beam grid interpolation method — choose one of:
+  #   'nearest'  — single nearest-pixel lookup (fastest, no mixing between pixels)
+  #   'bilinear' — 4-pixel bilinear HEALPix interpolation (default, fast Numba kernel)
+  #   'gaussian' — isotropic Gaussian kernel (slowest, avoids grid-aligned artefacts)
+  # sigma and radius are only used for 'gaussian' and default to 1× and 3× the
+  # HEALPix pixel resolution respectively.
+  beam_interp_method: 'bilinear'
   beam_interp_sigma_deg: null
   beam_interp_radius_deg: null

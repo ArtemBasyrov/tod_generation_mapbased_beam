@@ -39,20 +39,18 @@ def _cpu_ceiling():
 
 
 def get_ncpus():
-    """
-    Return the CPU ceiling for this job.
+    """Return the CPU ceiling for this job.
 
     On a cluster (SLURM / PBS / LSF / SGE detected) this is the number of
-    cores allocated by the scheduler.  The actual number of worker processes
-    to launch is determined later by calibrate_n_processes(), which balances
-    CPU count against per-process memory to maximise total throughput.
+    cores allocated by the scheduler. On a local workstation the result is
+    capped at ``config.n_processes`` to keep the machine responsive.
 
-    Locally, the result is capped at config.n_processes so the workstation
-    stays usable.
+    The actual number of worker processes to launch is determined later by
+    :func:`~tod_calibrate.calibrate_n_processes`, which balances CPU count
+    against per-process memory to maximise total throughput.
 
-    Returns
-    -------
-    n_cpu : int
+    Returns:
+        int: Maximum number of CPUs available to this job.
     """
     cluster = _is_cluster()
     n_cpu   = _cpu_ceiling()
@@ -81,22 +79,24 @@ def _is_cluster():
 
 
 def get_memory_per_process(n_processes):
-    """
-    Determine the per-process memory budget in GB.
+    """Determine the per-process memory budget in GB.
 
-    On a cluster (SLURM / PBS / LSF / SGE detected) the full available RAM is
-    shared among the worker processes — the job owns the node.
-    Locally, only _LOCAL_RAM_FRACTION of available RAM is used so the rest of
-    the system stays responsive.
+    On a cluster (SLURM / PBS / LSF / SGE detected) the job owns the node and
+    the full available RAM is divided among the worker processes. Locally only
+    ``_LOCAL_RAM_FRACTION`` (75 %) of available RAM is used so the rest of the
+    system stays responsive.
 
-    Priority
-    --------
-    1. psutil available memory * fraction / n_processes (auto-detected)
-    2. config.max_memory_per_process (explicit fallback)
+    Detection priority:
 
-    Returns
-    -------
-    memory_gb : float
+    1. ``psutil`` available memory × fraction ÷ ``n_processes`` (auto-detected).
+    2. ``config.max_memory_per_process`` (explicit fallback when ``psutil`` is
+       unavailable).
+
+    Args:
+        n_processes (int): Number of worker processes to budget memory for.
+
+    Returns:
+        float: Per-process memory budget in GB.
     """
     try:
         import psutil
@@ -140,20 +140,21 @@ def should_print_batch(batch_idx, n_batches, max_prints=100):
 
 
 def compute_dB_threshold_from_power(beam_vals, power_cut):
-    """
-    Compute dB threshold from power percentage.
-    
-    Find threshold value where the sum of power for pixels above threshold 
-    equals the target power (total_power * power_cut).
-    
-    Parameters
-    ----------
-    beam_vals : ndarray — beam pixel values (linear)
-    power_cut : float   — fraction of total power for hard cut (e.g., 0.99)
-    
-    Returns
-    -------
-    dB_threshold : float — threshold in dB where sum of power above threshold ≈ target
+    """Compute the dB threshold that retains a given fraction of total beam power.
+
+    Finds the dB level such that the sum of all pixel amplitudes whose dB value
+    exceeds that level equals ``power_cut × total_power``. Used to select the
+    smallest set of beam pixels that accounts for the requested power fraction.
+
+    Args:
+        beam_vals (numpy.ndarray): Beam pixel amplitude values (linear, not dB).
+            Can be any shape; flattened internally.
+        power_cut (float): Fraction of total power to retain, e.g. ``0.99`` to
+            keep 99 % of the beam power.
+
+    Returns:
+        float: dB threshold. Pixels whose ``10 log10(|val|)`` exceeds this
+            value collectively contribute ``≈ power_cut × total_power``.
     """
     # Flatten and ensure array
     prof = np.asarray(beam_vals).flatten()
