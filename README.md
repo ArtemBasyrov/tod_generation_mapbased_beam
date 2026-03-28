@@ -192,9 +192,19 @@ All three fields must share the same HEALPix `nside`. Values are loaded as
 #### Beam files (`FOLDER_BEAM / beam_file_{I,Q,U}`)
 
 [pixell / enmap](https://pixell.readthedocs.io/en/latest/usage.html#usagepage) FITS format (2D map). The map must be centred on the beam axis;
-the pixel at index `(100, 100)` is taken as the beam centre. RA and Dec
-coordinates are read from the map's WCS header and converted to offsets
-relative to the beam centre. Values represent beam amplitude (linear, not dB).
+for a map of shape `(H, W)` the pixel at index `(H // 2, W // 2)` is taken as
+the beam centre. RA and Dec coordinates are read from the map's WCS header and
+converted to offsets relative to that centre pixel. Values represent beam
+amplitude (linear, not dB).
+
+Normalisation of the beam file is **not required**. The pipeline selects pixels
+that together carry a fraction `power_fraction_threshold` of the total beam
+power and re-normalises those weights to sum to one, so the absolute scale of
+the beam file does not affect the signal amplitude in the output TOD.
+
+See the [beam creation example](https://tod-generation-mapbased-beam.readthedocs.io/en/latest/beam_creation.html)
+in the documentation for a step-by-step guide to generating a synthetic beam
+file with pixell.
 
 #### Scan files (`FOLDER_SCAN`)
 

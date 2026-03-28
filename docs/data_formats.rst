@@ -32,6 +32,12 @@ Beam Files (``FOLDER_BEAM / beam_file_{I,Q,U}``)
 * Values represent beam amplitude in linear units (not dB).
 * The I, Q and U beams may share the same file (set all three ``beam_file_*``
   keys to the same filename).
+* Normalisation of the beam amplitude is **not required**. The pipeline
+  re-normalises beam weights internally based on the power threshold, so the
+  absolute scale of the beam file does not affect the TOD signal amplitude.
+
+For a worked example of how to generate a synthetic beam file see
+:doc:`beam_creation`.
 
 Scan Files (``FOLDER_SCAN``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
