@@ -2,8 +2,6 @@
 
 [![Documentation](https://img.shields.io/badge/docs-readthedocs-blue)](https://tod-generation-mapbased-beam.readthedocs.io/en/latest/index.html)
 
-> **Full documentation:** https://tod-generation-mapbased-beam.readthedocs.io/en/latest/index.html
-
 Sample-based Time-Ordered Data (TOD) generation for CMB experiments. Convolves
 polarised sky maps (I, Q, U) with pixelated beam patterns over a boresight
 scan trajectory, producing one TOD file per processing batch (days are used as
@@ -98,7 +96,7 @@ hour of data, etc.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `n_processes` | `int` | — | Maximum worker processes on a local machine. On a cluster the scheduler allocation takes precedence and this value is used only as a cap. |
+| `n_processes` | `int` | — | Maximum worker processes on a local machine. On a cluster the scheduler allocation takes precedence and this value is used only as a cap. Required on local machines. |
 | `max_memory_per_process` | `float` | — | Per-process memory budget in GB. Used as a fallback when `psutil` is unavailable. |
 
 ### Calibration cache
@@ -137,7 +135,7 @@ directory produced by `precompute_beam_cache.py`.
 | Value | Description | Speed |
 |---|---|---|
 | `'nearest'` | Single nearest-pixel lookup. No blending between pixels. | Fastest |
-| `'bilinear'` *(recommended)* | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy for most beams. **This is the recommended method.** | Fast |
+| `'bilinear'` | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy for most beams. **This is the recommended method.** | Fast |
 | `'gaussian'` | Isotropic Gaussian kernel over all pixels within `radius_deg`. Avoids grid-aligned interpolation artefacts; best for wide or asymmetric beams. | Slow |
 
 ### Example `config.yaml`
