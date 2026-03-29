@@ -1,7 +1,8 @@
 """
 Tests for the tod_calibrate module.
 
-Covers: _memory_cap, _candidate_batch_sizes, _calibrate_n_processes.
+Covers: _memory_cap, _candidate_batch_sizes, _calibrate_n_processes,
+        _run_clustering_probe, calibrate_beam_clustering.
 
 Can be run independently:
     pytest tests/test_tod_calibrate.py -v
@@ -12,6 +13,7 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -31,7 +33,13 @@ if "tod_io" not in sys.modules:
 # ---------------------------------------------------------------------------
 # Imports under test
 # ---------------------------------------------------------------------------
-from tod_calibrate import _memory_cap, _candidate_batch_sizes, _calibrate_n_processes
+from tod_calibrate import (
+    _memory_cap,
+    _candidate_batch_sizes,
+    _calibrate_n_processes,
+    _run_clustering_probe,
+    calibrate_beam_clustering,
+)
 
 
 # ===========================================================================
@@ -210,6 +218,452 @@ class TestCalibrateNProcesses:
         # Any n in [1,4] is valid; what matters is the result is sane.
         assert 1 <= n_opt <= 4
         assert bs_opt == 1
+
+
+# ===========================================================================
+# Helpers shared by clustering probe / calibration tests
+# ===========================================================================
+
+import healpy as hp  # noqa: E402  (healpy is transitively loaded by tod_calibrate)
+
+_C_NSIDE = 8
+_C_NPIX  = hp.nside2npix(_C_NSIDE)
+_C_S     = 60   # number of beam pixels in test beam_data
+
+
+def _fake_mp():
+    """Return [I, Q, U] maps at nside=8, all ones."""
+    return [np.ones(_C_NPIX, dtype=np.float32) for _ in range(3)]
+
+
+def _fake_beam_data(S=_C_S, seed=7):
+    """Minimal beam_data dict suitable for calibrate_beam_clustering tests.
+
+    Args:
+        S (int): Number of beam pixels.
+        seed (int): RNG seed for reproducibility.
+
+    Returns:
+        dict: Single-entry beam_data with "beam_I" key.
+    """
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(0.0, 0.05, S)
+    phi   = rng.uniform(0.0, 2 * np.pi, S)
+    vec_orig  = np.column_stack([
+        np.cos(theta),
+        np.sin(theta) * np.cos(phi),
+        np.sin(theta) * np.sin(phi),
+    ]).astype(np.float32)
+    beam_vals = np.ones(S, dtype=np.float64) / S
+    return {
+        "beam_I": {
+            "beam_vals":    beam_vals.copy(),
+            "vec_orig":     vec_orig.copy(),
+            "n_sel":        S,
+            "comp_indices": [0],
+            "ra":  0.0,
+            "dec": 0.0,
+        }
+    }
+
+
+def _fake_probe_entries(B=20):
+    """Return a list with one minimal beam-entry dict (mp_stacked already set).
+
+    Args:
+        B (int): Unused — kept for interface symmetry; entries do not depend on B.
+
+    Returns:
+        list[dict]: One-element list of beam-entry dicts.
+    """
+    S  = 10
+    mp = _fake_mp()
+    return [{
+        "beam_vals":   np.ones(S, dtype=np.float64) / S,
+        "vec_orig":    np.tile([1.0, 0.0, 0.0], (S, 1)).astype(np.float32),
+        "n_sel":       S,
+        "comp_indices": [0],
+        "mp_stacked":  np.stack([mp[0]]),
+        "ra":  0.0,
+        "dec": 0.0,
+    }]
+
+
+def _mock_btb_ones(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kwargs):
+    """beam_tod_batch stub: always returns all-ones for every component."""
+    B = len(phi_b)
+    return {c: np.ones(B, dtype=np.float64) for c in range(3)}
+
+
+def _mock_cluster_pixels(vec_orig, bvals, n_clusters, tail_fraction=None,
+                          max_iter=150, tol=1e-5, random_state=42, verbose=True):
+    """Deterministic cluster_beam_pixels stub (no k-means EM).
+
+    Returns the first K_out pixel vectors with uniform weights and
+    modulo-K_out labels.  Correctly mimics the hybrid-mode output shape.
+
+    Args:
+        vec_orig (np.ndarray): (S, 3) unit vectors.
+        bvals (np.ndarray): (S,) beam weights.
+        n_clusters (int): Requested cluster count.
+        tail_fraction (float | None): Fraction of power treated as tail.
+        max_iter, tol, random_state, verbose: Unused; accepted for signature compat.
+
+    Returns:
+        tuple: (vec_out, bvals_out, labels) with shapes (K_out, 3), (K_out,), (S,).
+    """
+    S = len(bvals)
+    if tail_fraction is not None:
+        w_sorted = np.sort(bvals)
+        total    = w_sorted.sum()
+        cumsum   = np.cumsum(w_sorted)
+        n_tail   = int(np.searchsorted(cumsum, tail_fraction * total)) + 1
+        n_tail   = min(max(n_tail, 0), S)
+        n_main   = S - n_tail
+        K_tail   = min(n_clusters, n_tail) if n_tail > 0 else 0
+        K_out    = n_main + max(K_tail, 1 if n_tail > 0 else 0)
+    else:
+        K_out = min(n_clusters, S)
+    K_out    = max(1, K_out)
+    out_vec  = vec_orig[:K_out].copy()
+    out_bvals = np.full(K_out, 1.0 / K_out, dtype=np.float64)
+    labels   = (np.arange(S) % K_out).astype(np.int32)
+    return out_vec, out_bvals, labels
+
+
+# ===========================================================================
+# TestRunClusteringProbe
+# ===========================================================================
+
+
+class TestRunClusteringProbe:
+    """Tests for tod_calibrate._run_clustering_probe."""
+
+    _B = 15
+
+    def _phi_theta_psi(self, B=None):
+        B = B or self._B
+        return (
+            np.zeros(B, dtype=np.float32),
+            np.zeros(B, dtype=np.float32),
+            np.zeros(B, dtype=np.float32),
+        )
+
+    def _rot_vecs(self, B=None):
+        B = B or self._B
+        return np.zeros((B, 3, 3), dtype=np.float32)
+
+    def test_returns_shape_3_B(self):
+        """Output shape is (3, B) for a single beam entry."""
+        phi_b, theta_b, psis_b = self._phi_theta_psi()
+        rot_vecs = self._rot_vecs()
+        mp       = _fake_mp()
+        with patch("tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones):
+            result = _run_clustering_probe(
+                _C_NSIDE, mp, _fake_probe_entries(), rot_vecs,
+                phi_b, theta_b, psis_b,
+                interp_mode="bilinear", sigma_deg=None, radius_deg=None,
+            )
+        assert result.shape == (3, self._B)
+
+    def test_dtype_float64(self):
+        """Accumulated TOD array has dtype float64."""
+        phi_b, theta_b, psis_b = self._phi_theta_psi()
+        rot_vecs = self._rot_vecs()
+        mp       = _fake_mp()
+        with patch("tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones):
+            result = _run_clustering_probe(
+                _C_NSIDE, mp, _fake_probe_entries(), rot_vecs,
+                phi_b, theta_b, psis_b,
+                interp_mode="bilinear", sigma_deg=None, radius_deg=None,
+            )
+        assert result.dtype == np.float64
+
+    def test_sums_multiple_entries(self):
+        """Contributions from N entries are accumulated (summed) component-wise."""
+        B         = 10
+        n_entries = 3
+        entries   = _fake_probe_entries() * n_entries  # 3 identical entries
+        phi_b, theta_b, psis_b = self._phi_theta_psi(B)
+        rot_vecs  = self._rot_vecs(B)
+        mp        = _fake_mp()
+        with patch("tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones):
+            result = _run_clustering_probe(
+                _C_NSIDE, mp, entries, rot_vecs,
+                phi_b, theta_b, psis_b,
+                interp_mode="bilinear", sigma_deg=None, radius_deg=None,
+            )
+        # Each entry returns ones → accumulated total = n_entries
+        np.testing.assert_allclose(result, np.full((3, B), float(n_entries)))
+
+    def test_empty_entries_returns_zeros(self):
+        """No beam entries → all-zero TOD of shape (3, B)."""
+        B = 8
+        phi_b, theta_b, psis_b = self._phi_theta_psi(B)
+        rot_vecs = self._rot_vecs(B)
+        mp       = _fake_mp()
+        result = _run_clustering_probe(
+            _C_NSIDE, mp, [], rot_vecs,
+            phi_b, theta_b, psis_b,
+            interp_mode="bilinear", sigma_deg=None, radius_deg=None,
+        )
+        assert result.shape == (3, B)
+        np.testing.assert_array_equal(result, 0)
+
+    def test_beam_tod_batch_called_once_per_entry(self):
+        """beam_tod_batch is called exactly once per beam entry."""
+        n_entries = 4
+        entries   = _fake_probe_entries() * n_entries
+        phi_b, theta_b, psis_b = self._phi_theta_psi()
+        rot_vecs  = self._rot_vecs()
+        mp        = _fake_mp()
+        with patch("tod_calibrate.beam_tod_batch",
+                   side_effect=_mock_btb_ones) as mock_btb:
+            _run_clustering_probe(
+                _C_NSIDE, mp, entries, rot_vecs,
+                phi_b, theta_b, psis_b,
+                interp_mode="bilinear", sigma_deg=None, radius_deg=None,
+            )
+        assert mock_btb.call_count == n_entries
+
+    def test_interp_kwargs_forwarded(self):
+        """interp_mode, sigma_deg, radius_deg are forwarded as kwargs to beam_tod_batch."""
+        phi_b, theta_b, psis_b = self._phi_theta_psi()
+        rot_vecs = self._rot_vecs()
+        mp       = _fake_mp()
+        with patch("tod_calibrate.beam_tod_batch",
+                   side_effect=_mock_btb_ones) as mock_btb:
+            _run_clustering_probe(
+                _C_NSIDE, mp, _fake_probe_entries(), rot_vecs,
+                phi_b, theta_b, psis_b,
+                interp_mode="nearest", sigma_deg=0.5, radius_deg=1.5,
+            )
+        kw = mock_btb.call_args[1]
+        assert kw.get("interp_mode") == "nearest"
+        assert kw.get("sigma_deg")   == 0.5
+        assert kw.get("radius_deg")  == 1.5
+
+
+# ===========================================================================
+# TestCalibrateBeamClustering
+# ===========================================================================
+
+
+class TestCalibrateBeamClustering:
+    """Tests for tod_calibrate.calibrate_beam_clustering.
+
+    All external I/O (open_scan_day), Numba kernels
+    (precompute_rotation_vector_batch, beam_tod_batch), and the k-means
+    implementation (beam_cluster.cluster_beam_pixels) are replaced with
+    lightweight stubs so the tests run without real scan data, beam FITS
+    files, or GPU/JIT warm-up overhead.
+    """
+
+    _N_DAY = 5000   # length of fake memory-mapped scan day
+
+    # Hard-coded grid values copied from calibrate_beam_clustering source.
+    _TAIL_FRACTIONS  = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
+    _N_CLUSTERS_LIST = (10, 20, 50, 100, 200, 500, 1000, 2000)
+
+    # ── stub helpers ──────────────────────────────────────────────────────
+
+    def _open_scan_day_stub(self, folder_scan, probe_day):
+        """Return three uniform random arrays of length _N_DAY."""
+        rng = np.random.default_rng(42)
+        t = rng.uniform(0.0,       np.pi, self._N_DAY).astype(np.float32)
+        p = rng.uniform(0.0, 2 * np.pi,   self._N_DAY).astype(np.float32)
+        s = rng.uniform(0.0, 2 * np.pi,   self._N_DAY).astype(np.float32)
+        return t, p, s
+
+    def _precompute_stub(self, ra0, dec0, phi_b, theta_b):
+        """Return identity rotation matrices and zero betas."""
+        B = len(phi_b)
+        return np.zeros((B, 3, 3), dtype=np.float32), np.zeros(B, dtype=np.float32)
+
+    def _patched(self, btb_side_effect=None):
+        """Context-manager stack with all four standard patches applied.
+
+        Usage::
+
+            with self._patched() as (mock_osd, mock_prv, mock_btb):
+                result = calibrate_beam_clustering(...)
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _ctx(btb_se):
+            with patch("tod_calibrate.open_scan_day",
+                       side_effect=self._open_scan_day_stub) as m_osd, \
+                 patch("tod_calibrate.precompute_rotation_vector_batch",
+                       side_effect=self._precompute_stub) as m_prv, \
+                 patch("tod_calibrate.beam_tod_batch",
+                       side_effect=btb_se or _mock_btb_ones) as m_btb, \
+                 patch("beam_cluster.cluster_beam_pixels",
+                       side_effect=_mock_cluster_pixels):
+                yield m_osd, m_prv, m_btb
+
+        return _ctx(btb_side_effect)
+
+    # ── basic return-value tests ──────────────────────────────────────────
+
+    def test_returns_tuple_float_int(self):
+        """Return value is a (float, int) 2-tuple."""
+        with self._patched():
+            tf, K = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+        assert isinstance(tf, float)
+        assert isinstance(K, int)
+
+    def test_tail_fraction_in_search_grid(self):
+        """Returned tail_fraction is one of the internally defined grid values."""
+        with self._patched():
+            tf, _ = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+        assert tf in self._TAIL_FRACTIONS
+
+    def test_n_clusters_in_search_grid(self):
+        """Returned n_clusters is one of the internally defined grid values."""
+        with self._patched():
+            _, K = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+        assert K in self._N_CLUSTERS_LIST
+
+    # ── side-effect freedom ───────────────────────────────────────────────
+
+    def test_beam_data_not_modified(self):
+        """calibrate_beam_clustering must not mutate the caller's beam_data dict."""
+        beam_data = _fake_beam_data()
+        bv_before = beam_data["beam_I"]["beam_vals"].copy()
+        vo_before = beam_data["beam_I"]["vec_orig"].copy()
+        ns_before = beam_data["beam_I"]["n_sel"]
+        with self._patched():
+            calibrate_beam_clustering(beam_data, ".", 0, _fake_mp())
+        np.testing.assert_array_equal(beam_data["beam_I"]["beam_vals"], bv_before)
+        np.testing.assert_array_equal(beam_data["beam_I"]["vec_orig"], vo_before)
+        assert beam_data["beam_I"]["n_sel"] == ns_before
+
+    # ── probe sampling tests ──────────────────────────────────────────────
+
+    def test_open_scan_day_called_once(self):
+        """open_scan_day is called exactly once regardless of grid size."""
+        with self._patched() as (mock_osd, _, _):
+            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+        assert mock_osd.call_count == 1
+
+    def test_probe_size_bounded_by_n_probe_samples(self):
+        """The probe sent to beam_tod_batch has at most 1000 samples (n_probe_samples)."""
+        n_probe_samples = 1000
+        probe_sizes = []
+
+        def _btb_recording(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
+            probe_sizes.append(len(phi_b))
+            return {c: np.ones(len(phi_b), dtype=np.float64) for c in range(3)}
+
+        with self._patched(btb_side_effect=_btb_recording):
+            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+
+        assert all(s <= n_probe_samples for s in probe_sizes), \
+            f"Some probes exceeded {n_probe_samples} samples: {set(probe_sizes)}"
+
+    def test_probe_size_consistent_across_all_calls(self):
+        """Every call to beam_tod_batch uses the same strided probe length B."""
+        probe_sizes = []
+
+        def _btb_recording(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
+            probe_sizes.append(len(phi_b))
+            return {c: np.ones(len(phi_b), dtype=np.float64) for c in range(3)}
+
+        with self._patched(btb_side_effect=_btb_recording):
+            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+
+        assert len(set(probe_sizes)) == 1, \
+            f"Inconsistent probe sizes across calls: {set(probe_sizes)}"
+
+    def test_precompute_called_once(self):
+        """precompute_rotation_vector_batch is called exactly once (not once per grid point)."""
+        with self._patched() as (_, mock_prv, _):
+            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+        assert mock_prv.call_count == 1
+
+    # ── selection-logic tests ─────────────────────────────────────────────
+
+    def test_selects_max_speedup_when_all_pass(self):
+        """
+        When exact TOD == clustered TOD (rel_rms=0 everywhere), the pair with
+        the highest speedup is chosen.
+
+        With _mock_btb_ones, exact == clustered for every (tf, K) pair, so all
+        rel_rms values are 0 and every pair qualifies.  The function must then
+        return the pair that maximises average speedup = S / K_out.
+        """
+        with self._patched():
+            tf, K = calibrate_beam_clustering(
+                _fake_beam_data(), ".", 0, _fake_mp(),
+                error_threshold=1.0,   # accept everything
+            )
+        # Result must be a valid grid element.
+        assert tf in self._TAIL_FRACTIONS
+        assert K  in self._N_CLUSTERS_LIST
+
+    def test_fallback_on_all_fail_returns_min_error(self, capsys):
+        """
+        When every (tf, K) pair exceeds error_threshold, the pair with the
+        minimum rel_rms is returned and a WARNING line is printed.
+
+        The stub returns 100 for the exact phase (warmup + reference) and 0 for
+        all grid evaluations → rel_rms = 1.0 for every pair.
+        """
+        call_count = [0]
+
+        def _btb_fail(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
+            call_count[0] += 1
+            B = len(phi_b)
+            # First 2 calls: warmup + exact reference (one beam file → 1 call each)
+            if call_count[0] <= 2:
+                return {c: np.full(B, 100.0, dtype=np.float64) for c in range(3)}
+            # All remaining calls are grid evaluations → return zeros
+            return {c: np.zeros(B, dtype=np.float64) for c in range(3)}
+
+        with self._patched(btb_side_effect=_btb_fail):
+            tf, K = calibrate_beam_clustering(
+                _fake_beam_data(), ".", 0, _fake_mp(),
+                error_threshold=1e-10,   # nothing can pass
+            )
+
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.out, "Expected WARNING in stdout for all-fail case"
+        assert isinstance(tf, float) and isinstance(K, int)
+        assert tf in self._TAIL_FRACTIONS
+        assert K  in self._N_CLUSTERS_LIST
+
+    def test_strict_threshold_triggers_fallback(self, capsys):
+        """error_threshold=0 forces fallback whenever rel_rms > 0."""
+        call_count = [0]
+
+        def _btb_nonzero_error(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
+            call_count[0] += 1
+            B = len(phi_b)
+            if call_count[0] <= 2:
+                return {c: np.ones(B, dtype=np.float64) for c in range(3)}
+            # Slightly different value → rel_rms ≈ 0.5 > 0.0 threshold
+            return {c: np.full(B, 0.5, dtype=np.float64) for c in range(3)}
+
+        with self._patched(btb_side_effect=_btb_nonzero_error):
+            tf, K = calibrate_beam_clustering(
+                _fake_beam_data(), ".", 0, _fake_mp(),
+                error_threshold=0.0,
+            )
+
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.out
+        assert isinstance(tf, float) and isinstance(K, int)
+
+    def test_permissive_threshold_no_warning(self, capsys):
+        """A threshold of 1.0 (all pass) must not print a WARNING."""
+        with self._patched():
+            calibrate_beam_clustering(
+                _fake_beam_data(), ".", 0, _fake_mp(),
+                error_threshold=1.0,
+            )
+        captured = capsys.readouterr()
+        assert "WARNING" not in captured.out
 
 
 # ---------------------------------------------------------------------------

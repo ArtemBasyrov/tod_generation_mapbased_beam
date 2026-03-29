@@ -10,9 +10,10 @@ import healpy as hp
 import tod_config as config
 from tod_io              import load_beam, load_scan_information, open_scan_day
 from tod_core            import precompute_rotation_vector_batch, beam_tod_batch
-from tod_calibrate       import _calibrate_n_processes
+from tod_calibrate       import _calibrate_n_processes, calibrate_beam_clustering
 from tod_utils           import _get_ncpus, _fmt_time, _should_print_batch, _compute_dB_threshold_from_power
 from precompute_beam_cache import _cache_filename, _load_cache
+from beam_cluster        import cluster_beam_pixels, cluster_cached_arrays
 
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -188,6 +189,46 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
     return beam_data
 
 
+def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
+    """Apply weighted spherical k-means clustering to beam_data in-place.
+
+    Called after prepare_beam_data() and, if used, after calibrate_beam_clustering().
+    The pre-clustering beam_vals serve as pixel weights for both the k-means
+    and the subsequent cache-array reduction.
+
+    Args:
+        beam_data (dict): Beam data from prepare_beam_data (exact, unclustered).
+            Modified in-place. Cache arrays (vec_rolled, dtheta, dphi) are
+            reduced from (N_psi, S, *) to (N_psi, K_out, *) if present.
+        n_clusters (int): Max clusters for the tail (or all pixels in full mode).
+        tail_fraction (float | None): Fraction of power to treat as tail.
+            None → full mode (cluster all pixels).
+    """
+    _CACHE_KEYS = ('vec_rolled', 'dtheta', 'dphi')
+    for bf, data in beam_data.items():
+        bv_pre = data['beam_vals']   # (S,) — needed as weights before overwrite
+        vo_pre = data['vec_orig']    # (S, 3)
+        S = data['n_sel']
+
+        vec_out, bv_out, labels = cluster_beam_pixels(
+            vo_pre, bv_pre, n_clusters=n_clusters, tail_fraction=tail_fraction,
+        )
+        K = len(bv_out)
+
+        # Cluster cache arrays with pre-clustering weights before overwriting beam_vals
+        cache_sub = {k: data[k] for k in _CACHE_KEYS if k in data}
+        if cache_sub:
+            print(f"    [{bf}] Clustering cache arrays …")
+            clustered = cluster_cached_arrays(cache_sub, labels, bv_pre, K)
+            for k, arr in clustered.items():
+                data[k] = arr
+
+        data['beam_vals'] = bv_out
+        data['vec_orig']  = vec_out
+        data['n_sel']     = K
+        print(f"  [{bf}] Beam clustered: {S} → {K} pixels")
+
+
 # ── TOD generation ────────────────────────────────────────────────────────────
 
 def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=None):
@@ -298,12 +339,27 @@ def _save_calibration(n_processes, batch_size):
         raw = yaml.safe_load(f)
     raw['calibration_n_processes'] = int(n_processes)
     raw['calibration_batch_size']  = int(batch_size)
-    raw['calibration_skip']        = True
+    raw['calibration_enabled']     = False
     with open(config.CONFIG_FILE, 'w') as f:
         yaml.dump(raw, f, default_flow_style=False, allow_unicode=True,
                   explicit_start=True, sort_keys=False)
     print(f"Calibration saved to {config.CONFIG_FILE} "
           f"(n_processes={n_processes}, batch_size={batch_size})")
+
+
+def _save_clustering_calibration(tail_fraction, n_clusters):
+    """Write clustering calibration results to the active config YAML file."""
+    import yaml
+    with open(config.CONFIG_FILE) as f:
+        raw = yaml.safe_load(f)
+    raw['n_beam_clusters']             = int(n_clusters)
+    raw['beam_cluster_tail_fraction']  = float(tail_fraction)
+    raw['clustering_calibration_enabled'] = False   # disable after save
+    with open(config.CONFIG_FILE, 'w') as f:
+        yaml.dump(raw, f, default_flow_style=False, allow_unicode=True,
+                  explicit_start=True, sort_keys=False)
+    print(f"Clustering calibration saved: tail_fraction={tail_fraction:.4f}, "
+          f"n_clusters={n_clusters}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -324,13 +380,44 @@ def main(n_cpu_ceiling):
     print("Loading sky map...")
     MP = [m.astype(np.float32) for m in hp.read_map(config.path_to_map, field=(0, 1, 2))]
 
-    # Load beams and calibrate once — result is shared by all days and workers.
+    # ── Load exact beam data (clustering applied separately below) ─────────────
     print("Loading beam data...")
     beam_data = prepare_beam_data(
         beam_files,
-        cache_dir  = config.beam_cache_dir,
-        cache_n_psi = config.beam_cache_n_psi,
+        cache_dir    = config.beam_cache_dir,
+        cache_n_psi  = config.beam_cache_n_psi,
     )
+
+    # ── Beam pixel clustering ──────────────────────────────────────────────────
+    # Calibration: sweep (tail_fraction, K) grid on a probe batch to find the
+    # best setting within the configured error tolerance.  Runs only when
+    # clustering_calibration_enabled=True; disabled automatically after first run.
+    if config.clustering_calibration_enabled:
+        print("Running beam clustering calibration …")
+        best_tf, best_K = calibrate_beam_clustering(
+            beam_data,
+            folder_scan      = folder_scan,
+            probe_day        = start,
+            mp               = MP,
+            error_threshold  = config.clustering_error_threshold,
+            interp_mode      = interp_mode,
+            interp_sigma_deg = interp_sigma_deg,
+            interp_radius_deg= interp_radius_deg,
+        )
+        _save_clustering_calibration(best_tf, best_K)
+        # Update in-memory config so clustering is applied this run too
+        config.n_beam_clusters            = best_K
+        config.beam_cluster_tail_fraction = best_tf
+
+    if config.n_beam_clusters is not None:
+        print(f"Applying beam clustering "
+              f"(tail_fraction={config.beam_cluster_tail_fraction}, "
+              f"n_clusters={config.n_beam_clusters}) …")
+        apply_beam_clustering(
+            beam_data,
+            n_clusters    = config.n_beam_clusters,
+            tail_fraction = config.beam_cluster_tail_fraction,
+        )
 
     # Stack sky-map components per beam entry into a contiguous (C, N) float32
     # array.  The Numba gather kernel requires this layout.
@@ -340,7 +427,7 @@ def main(n_cpu_ceiling):
         )
 
     use_cached = (
-        config.calibration_skip
+        not config.calibration_enabled
         or (config.calibration_n_processes is not None
             and config.calibration_batch_size is not None)
     )

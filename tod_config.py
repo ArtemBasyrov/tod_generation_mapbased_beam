@@ -28,7 +28,7 @@ n_processes           = _cfg["n_processes"]
 max_memory_per_process = _cfg["max_memory_per_process"]
 
 # Optional calibration cache
-calibration_skip        = _cfg.get("calibration_skip", False)
+calibration_enabled     = _cfg.get("calibration_enabled", True)
 calibration_n_processes = _cfg.get("calibration_n_processes", None)
 calibration_batch_size  = _cfg.get("calibration_batch_size", None)
 
@@ -54,3 +54,29 @@ if _interp_method_raw not in _VALID_INTERP:
 beam_interp_method     = _interp_method_raw
 beam_interp_sigma_deg  = _cfg.get("beam_interp_sigma_deg",  None)   # None → pixel resolution
 beam_interp_radius_deg = _cfg.get("beam_interp_radius_deg", None)   # None → 3 × sigma
+
+# Beam pixel clustering (k-means on the unit sphere before TOD generation).
+#
+# n_beam_clusters    : int | None — max clusters for the tail (or all pixels
+#                      when tail mode is disabled).  None disables clustering.
+# beam_cluster_tail_fraction : float | None — fraction of total beam power
+#                      that is treated as the "tail" to be clustered; the
+#                      remaining (1 - fraction) of power pixels are kept
+#                      exactly as-is.  None → cluster all selected pixels
+#                      (full mode, higher error).
+#
+# Recommended: set both together, e.g.
+#   n_beam_clusters: 100
+#   beam_cluster_tail_fraction: 0.03   # cluster only the faint 3% fringe
+n_beam_clusters          = _cfg.get("n_beam_clusters", None)
+beam_cluster_tail_fraction = _cfg.get("beam_cluster_tail_fraction", None)
+
+# Clustering calibration
+# enable_clustering_calibration : set True to trigger a calibration sweep on
+#   the next run; automatically reset to False after calibration completes.
+# clustering_error_threshold     : maximum tolerated relative RMS TOD error.
+# clustering_tail_fractions      : list of tail fractions to sweep.
+# clustering_n_clusters_list     : list of K values to sweep.
+# clustering_n_probe_samples     : number of scan samples used for the probe.
+clustering_calibration_enabled = _cfg.get("clustering_calibration_enabled", False)
+clustering_error_threshold    = _cfg.get("clustering_error_threshold", 1e-3)

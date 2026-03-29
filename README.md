@@ -102,12 +102,13 @@ hour of data, etc.
 ### Calibration cache
 
 The first run measures sustained throughput at several batch sizes and process
-counts, then writes the optimal values back into the active config file. Set
-`calibration_skip: true` to reuse those values without re-measuring.
+counts, then writes the optimal values back into the active config file.
+`calibration_enabled` is automatically reset to `false` after calibration
+completes so subsequent runs reuse the cached values without re-measuring.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `calibration_skip` | `bool` | `false` | Skip calibration and use cached values below. |
+| `calibration_enabled` | `bool` | `true` | Run calibration on this invocation. Automatically set to `false` after calibration completes. |
 | `calibration_n_processes` | `int \| null` | `null` | Cached optimal process count (written automatically). |
 | `calibration_batch_size` | `int \| null` | `null` | Cached optimal batch size (written automatically). |
 
@@ -138,6 +139,35 @@ directory produced by `precompute_beam_cache.py`.
 | `'bilinear'` | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy for most beams. **This is the recommended method.** | Fast |
 | `'gaussian'` | Isotropic Gaussian kernel over all pixels within `radius_deg`. Avoids grid-aligned interpolation artefacts; best for wide or asymmetric beams. | Slow |
 
+### Beam pixel clustering
+
+Spatial k-means clustering on the unit sphere reduces the number of effective
+beam pixels at runtime. Only the low-power *tail* of the beam is clustered;
+the bright main-lobe pixels are kept pixel-exact. For a typical 30′ Gaussian
+beam with 3 % tail power this gives a 3–5× speed-up in TOD generation with
+relative RMS error well below 10⁻³.
+
+**Quickstart:**
+
+1. Set `clustering_calibration_enabled: true` and run the pipeline once. The
+   calibration sweeps a fixed `(tail_fraction × n_clusters)` grid, measures
+   relative RMS TOD error against an exact reference on a uniformly-strided
+   probe day, and writes the optimal pair back to the config.
+2. On all subsequent runs the saved values are used directly
+   (`clustering_calibration_enabled` is reset to `false` automatically).
+
+**Manual override:** set `clustering_calibration_enabled: false` and fill in
+`n_beam_clusters` and `beam_cluster_tail_fraction` by hand.
+
+**Disable entirely:** set `n_beam_clusters: null`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `n_beam_clusters` | `int \| null` | `null` | Maximum clusters for the tail. `null` disables clustering entirely. Written automatically by calibration. |
+| `beam_cluster_tail_fraction` | `float \| null` | `null` | Fraction of total beam power treated as the "tail" to be clustered. The remaining `(1 − fraction)` of power pixels are kept pixel-exact. Written automatically by calibration. |
+| `clustering_calibration_enabled` | `bool` | `false` | Run the clustering calibration sweep on this invocation. Automatically reset to `false` after completion. |
+| `clustering_error_threshold` | `float` | `1.0e-3` | Maximum tolerated relative RMS TOD error during calibration. The calibration selects the pair that maximises speedup subject to this constraint. |
+
 ### Example `config.yaml`
 
 ```yaml
@@ -160,7 +190,7 @@ directory produced by `precompute_beam_cache.py`.
   n_processes: 8
   max_memory_per_process: 2.0   # GB
 
-  calibration_skip: false
+  calibration_enabled: true
   calibration_n_processes: null
   calibration_batch_size: null
 
@@ -170,6 +200,11 @@ directory produced by `precompute_beam_cache.py`.
   beam_interp_method: 'bilinear'
   beam_interp_sigma_deg: null
   beam_interp_radius_deg: null
+
+  n_beam_clusters: null
+  beam_cluster_tail_fraction: null
+  clustering_calibration_enabled: false
+  clustering_error_threshold: 1.0e-3
 ```
 
 ---
@@ -314,9 +349,10 @@ memory-constrained nodes is often fewer than the total allocated CPUs.
 ├── tod_core.py                             # Core Numba JIT kernels
 ├── tod_io.py                               # File I/O (beam, scan, output)
 ├── tod_config.py                           # Config loader
-├── tod_calibrate.py                        # Batch-size / process-count calibration
+├── tod_calibrate.py                        # Batch-size / process-count / clustering calibration
 ├── tod_utils.py                            # CPU/memory detection and utilities
 ├── numba_healpy.py                         # Numba re-implementation of HEALPix helpers
+├── beam_cluster.py                         # Spherical k-means beam-pixel clustering
 ├── precompute_beam_cache.py                # One-time beam cache generation
 ├── config.yaml                             # Default configuration template
 └── tests/                                  # pytest test suite
@@ -325,6 +361,7 @@ memory-constrained nodes is often fewer than the total allocated CPUs.
     ├── test_gaussian_interp.py
     ├── test_precompute_beam_cache.py
     ├── test_tod_calibrate.py
+    ├── test_beam_cluster.py
     ├── test_tod_utils.py
     └── run_all_tests.py
 ```

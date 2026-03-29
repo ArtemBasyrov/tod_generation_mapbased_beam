@@ -119,7 +119,8 @@ Calibration Cache
 
 The first run measures sustained throughput at several batch sizes and
 process counts, writes the optimal values back to the active config, and
-sets ``calibration_skip: true`` for future runs.
+sets ``calibration_enabled: false`` for future runs so calibration is
+skipped automatically.
 
 .. list-table::
    :header-rows: 1
@@ -129,10 +130,11 @@ sets ``calibration_skip: true`` for future runs.
      - Type
      - Default
      - Description
-   * - ``calibration_skip``
+   * - ``calibration_enabled``
      - ``bool``
-     - ``false``
-     - Skip calibration and use the cached values below.
+     - ``true``
+     - Run calibration on this invocation. Automatically reset to ``false``
+       after calibration completes so subsequent runs reuse cached values.
    * - ``calibration_n_processes``
      - ``int | null``
      - ``null``
@@ -224,6 +226,64 @@ Beam Interpolation
        are active only for this method.
      - Slow
 
+.. _configuration:Beam Pixel Clustering:
+
+Beam Pixel Clustering
+---------------------
+
+Spatial k-means clustering on the unit sphere can reduce the number of
+effective beam pixels during TOD generation.  Only the low-power *tail*
+of the beam is clustered; the high-power main-lobe pixels are kept
+pixel-exact.  This trades a small, controllable accuracy loss for a
+proportional reduction in computation.
+
+**Workflow**
+
+1. Set ``clustering_calibration_enabled: true`` and run the pipeline once.
+   The calibration sweeps a fixed ``(tail_fraction × n_clusters)`` grid,
+   measures relative RMS TOD error on a uniformly-strided probe day, and
+   writes the best pair back to the config.
+2. On all subsequent runs the saved values are used directly and clustering
+   calibration is skipped (``clustering_calibration_enabled`` is reset to
+   ``false`` automatically).
+
+**Manual override:** set ``clustering_calibration_enabled: false`` and
+fill in ``n_beam_clusters`` and ``beam_cluster_tail_fraction`` by hand.
+
+**Disable entirely:** set ``n_beam_clusters: null``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 10 10 42
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``n_beam_clusters``
+     - ``int | null``
+     - ``null``
+     - Maximum number of clusters for the tail.  ``null`` disables
+       clustering entirely.  Set automatically by calibration.
+   * - ``beam_cluster_tail_fraction``
+     - ``float | null``
+     - ``null``
+     - Fraction of total beam power treated as the "tail" to be clustered.
+       The remaining ``(1 − fraction)`` of power pixels are kept pixel-exact.
+       Set automatically by calibration.
+   * - ``clustering_calibration_enabled``
+     - ``bool``
+     - ``false``
+     - Run the clustering calibration sweep on this invocation.
+       Automatically reset to ``false`` after calibration completes.
+   * - ``clustering_error_threshold``
+     - ``float``
+     - ``1.0e-3``
+     - Maximum tolerated relative RMS TOD error during calibration.
+       The calibration selects the pair that maximises speedup subject
+       to this constraint.  See :doc:`beam_interpolation_accuracy` for
+       measured interpolation floors and tier-based recommendations.
+
 Full Example
 ------------
 
@@ -248,7 +308,7 @@ Full Example
      n_processes: 8
      max_memory_per_process: 2.0
 
-     calibration_skip: false
+     calibration_enabled: true
      calibration_n_processes: null
      calibration_batch_size: null
 
@@ -258,3 +318,8 @@ Full Example
      beam_interp_method: 'bilinear'
      beam_interp_sigma_deg: null
      beam_interp_radius_deg: null
+
+     n_beam_clusters: null
+     beam_cluster_tail_fraction: null
+     clustering_calibration_enabled: false
+     clustering_error_threshold: 1.0e-3
