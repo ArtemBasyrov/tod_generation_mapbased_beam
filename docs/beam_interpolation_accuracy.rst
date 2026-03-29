@@ -331,8 +331,7 @@ Practical notes:
   different orientations.
 * **For polarisation fields (Q, U, E/B modes)** the rotational stability test
   is the primary benchmark.  Setting the threshold using the accuracy table
-  alone is insufficient; ensure BI is selected and ``nside`` ≥ 2048 for
-  science-grade polarisation work.
+  alone is insufficient; rotational stability should be considered as well.
 * The threshold is compared against :math:`\varepsilon` for the active
   interpolation method and ``nside``.  Setting it below the interpolation floor
   of the chosen method will not improve accuracy; it will only restrict the
@@ -345,5 +344,4 @@ Practical notes:
   The tables were measured with a 30 arcmin FWHM beam; for significantly
   narrower beams — where FWHM / pixel_size drops below ~4–5 — the sky map
   has more sub-pixel structure and the relative errors will be larger than
-  listed here.  Re-evaluate before tightening the threshold if your beam FWHM
-  is much smaller than 30 arcmin at the chosen ``nside``.
+  listed here.
