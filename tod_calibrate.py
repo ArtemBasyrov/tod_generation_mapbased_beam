@@ -23,7 +23,7 @@ import healpy as hp
 
 from tod_io   import _load_scan_data_batch, open_scan_day
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
-from tod_utils import _fmt_time, _get_memory_per_process
+from tod_utils import _fmt_time, _get_memory_per_process, compute_bell
 
 _BYTES_PER_SAMPLE_PER_BEAM = 100   # memory model ceiling constant
 _MEMORY_SAFETY_FACTOR       = 1.5
@@ -225,121 +225,96 @@ def _run_clustering_probe(nside, mp, beam_entries, rot_vecs, phi_b, theta_b, psi
 
 def calibrate_beam_clustering(
         beam_data,
-        folder_scan,
-        probe_day,
-        mp,
-        error_threshold      = 1e-3,
-        interp_mode          = 'bilinear',
-        interp_sigma_deg     = None,
-        interp_radius_deg    = None,
+        folder_scan      = None,
+        probe_day        = None,
+        mp               = None,
+        error_threshold  = 1e-3,
+        bell_lmax        = None,
+        interp_mode      = 'bilinear',
+        interp_sigma_deg = None,
+        interp_radius_deg= None,
 ):
     """Find the (tail_fraction, n_clusters) pair that maximises speedup while
-    keeping the relative RMS TOD error below ``error_threshold``.
+    keeping the B_ell divergence from the analytical beam below
+    ``error_threshold``.
 
-    Loads a short probe batch, computes an exact reference TOD, then sweeps
-    a fixed (tail_fraction × n_clusters) grid.  For each pair, beam pixels are
-    clustered on a copy of beam_data (original is not modified), a clustered
-    TOD is computed, and the relative RMS error vs. the exact reference is
-    measured.  The pair that maximises the average per-beam speedup subject to
-    rel_rms <= error_threshold is returned.  If no pair qualifies, the
-    minimum-error pair is returned with a warning.
+    Computes the reference B_ell (power_cut=1.0) from the unclustered beam
+    geometry, then sweeps a fixed (tail_fraction × n_clusters) grid.  For
+    each pair, beam pixels are clustered on a copy of beam_data (original is
+    not modified), B_ell is recomputed and compared to the reference.  The
+    pair that maximises speedup subject to relative-RMS B_ell divergence <=
+    ``error_threshold`` is returned.  If no pair qualifies, the minimum-
+    divergence pair is returned with a warning.
 
-    The probe uses the double-Rodrigues path (no vec_rolled / dtheta / dphi)
-    so that only clustering error — not cache approximation error — is measured.
+    This approach is significantly faster than TOD-based calibration because
+    it requires only beam geometry—no scan data loading and no Numba kernel
+    calls per grid point.  The B_ell divergence is also a more direct quality
+    metric: clustering that faithfully reproduces B_ell at full power will
+    also reproduce the TOD accurately.
 
     Args:
         beam_data (dict): Exact (unclustered) beam data from prepare_beam_data.
             Not modified.
-        folder_scan (str): Path to the scan data directory.
-        probe_day (int): Day index used to load the probe scan samples.
-        mp (list[numpy.ndarray]): Sky map components [I, Q, U].
-        error_threshold (float): Maximum tolerated relative RMS TOD error.
-        interp_mode (str): Beam interpolation mode passed to beam_tod_batch.
-        interp_sigma_deg (float | None): Gaussian sigma; None → pixel size.
-        interp_radius_deg (float | None): Gaussian radius; None → 3 × sigma.
+        folder_scan (str | None): Unused. Kept for backward compatibility.
+        probe_day (int | None): Unused. Kept for backward compatibility.
+        mp (list | None): Unused. Kept for backward compatibility.
+        error_threshold (float): Maximum tolerated relative RMS B_ell
+            divergence between clustered and reference beam.
+        bell_lmax (int | None): Maximum multipole for B_ell comparison.
+            When ``None`` (default) it is set automatically to
+            ``2 × nside`` of the sky map ``mp``.  If ``mp`` is also
+            ``None``, falls back to 500.
+        interp_mode (str): Unused. Kept for backward compatibility.
+        interp_sigma_deg (float | None): Unused. Kept for backward compatibility.
+        interp_radius_deg (float | None): Unused. Kept for backward compatibility.
 
     Returns:
         tuple[float, int]: (best_tail_fraction, best_n_clusters)
     """
-    # Search grid — fixed internally, same philosophy as batch-size calibration.
-    # Tail fractions: fine steps at the low end where accuracy matters most,
-    # coarser at higher fractions where the beam fringe is already well-sampled.
+    # Search grid — same as before.
     tail_fractions  = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
-    # Cluster counts: covers from very aggressive (10) to nearly-exact (2000).
     n_clusters_list = (10, 20, 50, 100, 200, 500, 1000, 2000)
-    # Probe length: enough samples to average over varied scan angles.
-    n_probe_samples = 1000
+
     from beam_cluster import cluster_beam_pixels
 
-    nside   = hp.get_nside(mp[0])
-    first_bf = next(iter(beam_data))
-    ra0, dec0 = beam_data[first_bf]['ra'], beam_data[first_bf]['dec']
+    # ── Auto-determine bell_lmax from map nside ───────────────────────────────
+    if bell_lmax is None:
+        if mp is not None:
+            bell_lmax = 2 * hp.get_nside(mp[0])
+        else:
+            bell_lmax = 500
 
-    # ── Load probe batch — strided across the full day ────────────────────────
-    # Taking the first N consecutive samples would bias the error estimate
-    # toward one sky patch and one scan angle.  Instead, open the memory-mapped
-    # scan files and stride uniformly across the entire day so the probe covers
-    # the full range of boresight directions and polarisation angles.
-    theta_mmap, phi_mmap, psi_mmap = open_scan_day(folder_scan, probe_day)
-    N_day  = len(phi_mmap)
-    stride = max(1, N_day // n_probe_samples)
-    idx    = slice(0, N_day, stride)
-    phi_b   = np.array(phi_mmap[idx],   dtype=np.float32)[:n_probe_samples]
-    theta_b = np.array(theta_mmap[idx], dtype=np.float32)[:n_probe_samples]
-    psi_b   = np.array(psi_mmap[idx],   dtype=np.float32)[:n_probe_samples]
-    B = len(phi_b)
-    print(f"[clust_calib] Probe: {B} samples strided across {N_day} "
-          f"(stride={stride}, day={probe_day})")
+    # ── Helper: B_ell from vec_orig + beam_vals (power_cut=1.0) ──────────────
+    def _bell_from_vecs(vec, bvals):
+        theta_pix, phi_pix = hp.vec2ang(vec)
+        dec_offset = np.pi / 2.0 - theta_pix
+        _, bell = compute_bell(
+            phi_pix, dec_offset, bvals.astype(np.float64),
+            lmax=bell_lmax, power_cut=1.0, verbose=False,
+        )
+        return bell
 
-    rot_vecs, betas = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
-    psis_b = -betas + psi_b
+    # ── Reference B_ell from unclustered beam ────────────────────────────────
+    print("[clust_calib] Computing reference B_ell (power_cut=1.0, lmax="
+          f"{bell_lmax}) …")
+    ref_bells = {}
+    for bf, data in beam_data.items():
+        ref_bells[bf] = _bell_from_vecs(data['vec_orig'], data['beam_vals'])
 
-    # ── Build stripped beam entries (exact, double-Rodrigues path) ────────────
-    # Only beam_vals, vec_orig, n_sel, comp_indices, mp_stacked — no cache keys.
-    def _make_entry(data):
-        entry = {
-            'beam_vals':   data['beam_vals'],
-            'vec_orig':    data['vec_orig'],
-            'n_sel':       data['n_sel'],
-            'comp_indices': data['comp_indices'],
-            'mp_stacked':  np.ascontiguousarray(
-                               np.stack([mp[c] for c in data['comp_indices']])),
-            'ra':          data['ra'],
-            'dec':         data['dec'],
-        }
-        return entry
-
-    exact_entries = [_make_entry(data) for data in beam_data.values()]
-
-    # ── Warm-up: compile Numba JIT kernels ────────────────────────────────────
-    print("[clust_calib] Warming up Numba kernels …")
-    _run_clustering_probe(nside, mp, exact_entries, rot_vecs, phi_b, theta_b, psis_b,
-                          interp_mode, interp_sigma_deg, interp_radius_deg)
-
-    # ── Exact reference TOD ───────────────────────────────────────────────────
-    print("[clust_calib] Computing exact reference TOD …")
-    tod_exact = _run_clustering_probe(nside, mp, exact_entries, rot_vecs,
-                                       phi_b, theta_b, psis_b,
-                                       interp_mode, interp_sigma_deg, interp_radius_deg)
-    exact_rms = float(np.sqrt(np.mean(tod_exact ** 2)))
-    if exact_rms == 0.0:
-        exact_rms = 1.0   # guard against all-zero map
-
-    # Pre-compute S_bf (unclustered pixel counts) for speedup calculation
     S_bf = {bf: data['n_sel'] for bf, data in beam_data.items()}
 
-    # ── Grid sweep ────────────────────────────────────────────────────────────
+    # ── Grid sweep using B_ell divergence ────────────────────────────────────
     print("[clust_calib] Sweeping clustering parameters …")
-    results = []   # (tf, K_req, K_out, speedup, rel_rms)
+    results = []   # (tf, K_req, K_out_repr, speedup, bell_div)
 
     for tf in tail_fractions:
         for K_req in n_clusters_list:
-            # Build clustered entries using copies of beam_vals / vec_orig
-            clust_entries = []
-            K_out_per_bf  = {}
+            K_out_per_bf = {}
+            bell_divs    = []
+
             for bf, data in beam_data.items():
-                bv_copy  = data['beam_vals'].copy()
-                vo_copy  = data['vec_orig'].copy()
+                bv_copy = data['beam_vals'].copy()
+                vo_copy = data['vec_orig'].copy()
                 vec_c, bv_c, _ = cluster_beam_pixels(
                     vo_copy, bv_copy,
                     n_clusters=K_req,
@@ -349,67 +324,53 @@ def calibrate_beam_clustering(
                 K_out = len(bv_c)
                 K_out_per_bf[bf] = K_out
 
-                entry = {
-                    'beam_vals':   bv_c,
-                    'vec_orig':    vec_c,
-                    'n_sel':       K_out,
-                    'comp_indices': data['comp_indices'],
-                    'mp_stacked':  np.ascontiguousarray(
-                                       np.stack([mp[c] for c in data['comp_indices']])),
-                    'ra':          data['ra'],
-                    'dec':         data['dec'],
-                }
-                clust_entries.append(entry)
+                bell_clust = _bell_from_vecs(vec_c, bv_c)
+                bell_ref   = ref_bells[bf]
+                ref_rms    = float(np.sqrt(np.mean(bell_ref ** 2)))
+                bell_div   = (float(np.sqrt(np.mean((bell_clust - bell_ref) ** 2)))
+                              / (ref_rms + 1e-30))
+                bell_divs.append(bell_div)
 
-            tod_clust = _run_clustering_probe(
-                nside, mp, clust_entries, rot_vecs, phi_b, theta_b, psis_b,
-                interp_mode, interp_sigma_deg, interp_radius_deg,
-            )
-
-            diff    = tod_exact - tod_clust
-            rel_rms = float(np.sqrt(np.mean(diff ** 2))) / exact_rms
-
-            # Average speedup over all beams
-            speedup = float(np.mean([S_bf[bf] / K_out_per_bf[bf]
-                                     for bf in beam_data]))
-            K_out_repr = int(np.mean(list(K_out_per_bf.values())))
-
-            results.append((tf, K_req, K_out_repr, speedup, rel_rms))
+            mean_bell_div = float(np.mean(bell_divs))
+            speedup       = float(np.mean([S_bf[bf] / K_out_per_bf[bf]
+                                           for bf in beam_data]))
+            K_out_repr    = int(np.mean(list(K_out_per_bf.values())))
+            results.append((tf, K_req, K_out_repr, speedup, mean_bell_div))
 
     # ── Print ASCII table ─────────────────────────────────────────────────────
     print()
     print(f"[clust_calib] error_threshold={error_threshold:.1e}")
-    print(f"{'tail%':>6s}  {'K':>5s}  {'K_out':>6s}  {'speedup':>8s}  {'rel.RMS':>9s}  {'status'}")
-    print("-" * 52)
+    print(f"{'tail%':>6s}  {'K':>5s}  {'K_out':>6s}  {'speedup':>8s}  "
+          f"{'B_ell div':>10s}  {'status'}")
+    print("-" * 56)
     prev_tf = None
-    for tf, K_req, K_out, speedup, rel_rms in results:
+    for tf, K_req, K_out, speedup, bell_div in results:
         if prev_tf is not None and tf != prev_tf:
-            print("-" * 52)
-        status = "✓" if rel_rms <= error_threshold else "✗"
+            print("-" * 56)
+        status = "✓" if bell_div <= error_threshold else "✗"
         print(f"{tf*100:>5.1f}%  {K_req:>5d}  {K_out:>6d}  {speedup:>8.2f}x  "
-              f"{rel_rms:>9.2e}  {status}")
+              f"{bell_div:>10.2e}  {status}")
         prev_tf = tf
-    print("-" * 52)
+    print("-" * 56)
 
     # ── Select best ───────────────────────────────────────────────────────────
-    passing = [(tf, K_req, K_out, speedup, rel_rms)
-               for tf, K_req, K_out, speedup, rel_rms in results
-               if rel_rms <= error_threshold]
+    passing = [(tf, K_req, K_out, speedup, bell_div)
+               for tf, K_req, K_out, speedup, bell_div in results
+               if bell_div <= error_threshold]
 
     if passing:
         best = max(passing, key=lambda x: x[3])   # max speedup
         best_tf, best_K_req = best[0], best[1]
         print(f"\n[clust_calib] Recommendation: tail_fraction={best_tf}, "
               f"n_clusters={best_K_req}  "
-              f"(speedup={best[3]:.2f}x, rel_rms={best[4]:.2e})")
+              f"(speedup={best[3]:.2f}x, B_ell div={best[4]:.2e})")
     else:
-        # Nothing qualifies — return minimum-error pair
-        best = min(results, key=lambda x: x[4])
+        best = min(results, key=lambda x: x[4])   # min B_ell divergence
         best_tf, best_K_req = best[0], best[1]
-        print(f"\n[clust_calib] WARNING: no (tf, K) pair achieved rel_rms <= "
+        print(f"\n[clust_calib] WARNING: no (tf, K) pair achieved B_ell div <= "
               f"{error_threshold:.1e}.")
-        print(f"[clust_calib] Returning minimum-error pair: "
+        print(f"[clust_calib] Returning minimum-divergence pair: "
               f"tail_fraction={best_tf}, n_clusters={best_K_req}  "
-              f"(rel_rms={best[4]:.2e})")
+              f"(B_ell div={best[4]:.2e})")
 
-    return best_tf, best_K_req
+    return float(best_tf), int(best_K_req)

@@ -41,15 +41,20 @@
   # lobe is kept pixel-exact.
   #
   # Quickstart:
-  #   1. Set enable_clustering_calibration: true and run once.
-  #      The calibration sweeps the grid below, saves the best
-  #      (tail_fraction, n_clusters) to this file, and resets the flag.
+  #   1. Set clustering_calibration_enabled: true and run once.
+  #      The calibration sweeps a (tail_fraction × n_clusters) grid, selects
+  #      the pair that maximises speedup while keeping B_ell divergence below
+  #      clustering_error_threshold, saves the result, and resets the flag.
   #   2. On all subsequent runs the saved values are used directly.
   #
-  # Manual override: set enable_clustering_calibration: false and fill in
+  # Manual override: set clustering_calibration_enabled: false and fill in
   #   n_beam_clusters and beam_cluster_tail_fraction by hand.
   # Disable entirely: set n_beam_clusters: null.
   n_beam_clusters: null               # int → enable; null → no clustering
   beam_cluster_tail_fraction: null    # fraction of beam power treated as tail
   clustering_calibration_enabled: false
-  clustering_error_threshold: 1.0e-3  # max tolerated relative RMS TOD error
+  # Maximum tolerated relative RMS divergence in the beam transfer function
+  # B_ell between the clustered and reference (unclustered) beam.  The
+  # calibration picks the fastest (tail_fraction, n_clusters) pair whose
+  # B_ell divergence does not exceed this value.
+  clustering_error_threshold: 1.0e-5

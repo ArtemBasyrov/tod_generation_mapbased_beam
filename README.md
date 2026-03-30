@@ -144,17 +144,22 @@ directory produced by `precompute_beam_cache.py`.
 Spatial k-means clustering on the unit sphere reduces the number of effective
 beam pixels at runtime. Only the low-power *tail* of the beam is clustered;
 the bright main-lobe pixels are kept pixel-exact. For a typical 30′ Gaussian
-beam with 3 % tail power this gives a 3–5× speed-up in TOD generation with
-relative RMS error well below 10⁻³.
+beam with 3 % tail power this gives a 3–5× speed-up in TOD generation.
+
+#### Cluster calibration
+
+The calibration sweeps a `(tail_fraction × n_clusters)` grid and, for each
+pair, clusters the beam pixels and recomputes the beam transfer function B_ℓ
+from the clustered geometry. It selects the pair that maximises the pixel-count
+speedup while keeping the B_ℓ divergence from the reference beam below
+`clustering_error_threshold`. No scan data or TOD generation is required.
 
 **Quickstart:**
 
 1. Set `clustering_calibration_enabled: true` and run the pipeline once. The
-   calibration sweeps a fixed `(tail_fraction × n_clusters)` grid, measures
-   relative RMS TOD error against an exact reference on a uniformly-strided
-   probe day, and writes the optimal pair back to the config.
-2. On all subsequent runs the saved values are used directly
-   (`clustering_calibration_enabled` is reset to `false` automatically).
+   calibration writes the optimal `(tail_fraction, n_clusters)` pair back to
+   the config and resets the flag automatically.
+2. On all subsequent runs the saved values are used directly.
 
 **Manual override:** set `clustering_calibration_enabled: false` and fill in
 `n_beam_clusters` and `beam_cluster_tail_fraction` by hand.
@@ -166,7 +171,35 @@ relative RMS error well below 10⁻³.
 | `n_beam_clusters` | `int \| null` | `null` | Maximum clusters for the tail. `null` disables clustering entirely. Written automatically by calibration. |
 | `beam_cluster_tail_fraction` | `float \| null` | `null` | Fraction of total beam power treated as the "tail" to be clustered. The remaining `(1 − fraction)` of power pixels are kept pixel-exact. Written automatically by calibration. |
 | `clustering_calibration_enabled` | `bool` | `false` | Run the clustering calibration sweep on this invocation. Automatically reset to `false` after completion. |
-| `clustering_error_threshold` | `float` | `1.0e-3` | Maximum tolerated relative RMS TOD error during calibration. The calibration selects the pair that maximises speedup subject to this constraint. |
+| `clustering_error_threshold` | `float` | `1.0e-5` | Maximum tolerated B_ℓ divergence (see below). The calibration selects the fastest pair that stays within this bound. |
+
+#### Clustering error metric: B_ℓ divergence
+
+The quality of a given `(tail_fraction, n_clusters)` pair is measured by the
+**relative RMS divergence in the beam transfer function B_ℓ**:
+
+```
+ε = RMS( B_ℓ^{clustered} − B_ℓ^{ref} ) / RMS( B_ℓ^{ref} )
+```
+
+where B_ℓ^{ref} is computed from the full unclustered beam pixel set
+(power_cut = 1.0) and B_ℓ^{clustered} is computed from the centroid pixels
+produced by that pair. Both curves are evaluated at multipoles up to
+`bell_lmax` (default: `2 × nside` of the sky map).
+
+Using B_ℓ divergence as the threshold metric has two advantages over TOD-based
+error measurement:
+
+- **No scan data needed.** The metric is computed purely from beam geometry,
+  so the calibration sweep is fast.
+- **Direct beam fidelity.** A clustering that reproduces B_ℓ faithfully will
+  also reproduce the TOD accurately, because B_ℓ controls how the beam couples
+  to each angular scale of the sky.
+
+> **Note:** Clustering is applied only to the TOD-generation path. B_ℓ
+> computation itself must always use the full unclustered beam pixel set, since
+> the Legendre polynomial oscillations that define B_ℓ are destroyed by pixel
+> merging.
 
 ### Example `config.yaml`
 
@@ -204,7 +237,7 @@ relative RMS error well below 10⁻³.
   n_beam_clusters: null
   beam_cluster_tail_fraction: null
   clustering_calibration_enabled: false
-  clustering_error_threshold: 1.0e-3
+  clustering_error_threshold: 1.0e-5
 ```
 
 ---

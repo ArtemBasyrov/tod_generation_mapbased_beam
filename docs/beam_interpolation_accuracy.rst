@@ -2,8 +2,9 @@ Beam Interpolation Accuracy
 ===========================
 
 This page documents the interpolation accuracy of the three methods available
-via ``beam_interp_method`` and explains how the measurements relate to the
-``clustering_error_threshold`` parameter.
+via ``beam_interp_method``.  The measurements set the effective noise floor of
+the sky-map lookup step; they are independent of beam pixel clustering (see
+:doc:`beam_cluster_calibration` for clustering quality metrics).
 
 .. note::
 
@@ -20,8 +21,7 @@ via ``beam_interp_method`` and explains how the measurements relate to the
 
    The relative RMS metric is largely independent of beam shape; the main
    external factor is the ratio of beam FWHM to HEALPix pixel size
-   (see :ref:`Choosing clustering_error_threshold
-   <clustering_error_threshold_guidance>`).
+   (see :ref:`Interpolation accuracy floors <interp_accuracy_floors>`).
 
 
 Methods
@@ -278,28 +278,23 @@ boundary-jump amplitude is not reduced by finer pixelisation alone), while BI
 and GK continue to improve.
 
 
-.. _clustering_error_threshold_guidance:
+.. _interp_accuracy_floors:
 
-Choosing ``clustering_error_threshold``
-----------------------------------------
+Interpolation Accuracy as a Pipeline Error Floor
+-------------------------------------------------
 
-The ``clustering_error_threshold`` parameter caps the maximum relative RMS
-TOD error that the clustering calibration sweep is allowed to accept (see
-:ref:`Beam Pixel Clustering <configuration:Beam Pixel Clustering>`).  The
-interpolation errors measured above set a natural lower bound on any
-meaningful threshold value: there is no benefit in tightening the threshold
-below the interpolation floor of the chosen method and ``nside``.
-
-The table below maps common precision tiers to recommended threshold values
-and the minimum ``nside`` required for BI interpolation to stay within that
-tier across all beam pixel resolutions tested here.
+The interpolation errors measured above set the *noise floor* of the sky-map
+lookup step.  No pipeline configuration — including beam pixel clustering —
+can reduce the total error below this floor.  The table below shows the
+minimum ``nside`` required for bilinear interpolation to stay within common
+precision tiers across all beam pixel resolutions tested here.
 
 .. list-table::
    :header-rows: 1
-   :widths: 38 20 22 20
+   :widths: 38 22 20 20
 
-   * - Precision tier
-     - ``clustering_error_threshold``
+   * - Precision tier (relative RMS)
+     - Bilinear threshold
      - Min. ``nside`` (5 arcmin beam)
      - Min. ``nside`` (0.5 arcmin beam)
    * - Loose / exploratory (< 5 %)
@@ -311,7 +306,7 @@ tier across all beam pixel resolutions tested here.
      - 1024
      - 512
    * - Tight (< 0.1 %)
-     - ``1.0e-3`` *(default)*
+     - ``1.0e-3``
      - 2048
      - 2048
    * - Very tight (< 0.05 %)
@@ -323,19 +318,15 @@ Practical notes:
 
 * **Use** ``'bilinear'`` **interpolation** (``beam_interp_method: bilinear``).
   It is accurate below 0.1 % at nside = 2048 and rotationally stable.  The
-  threshold table above is calibrated for BI.
+  table above is calibrated for BI.
 * ``'nearest'`` interpolation may look better in the accuracy test at fine beam
   pixel resolution (≤ 1 arcmin), but its rotational instability (15–100×
   larger :math:`\sigma_{\mathrm{rot}}` than BI) makes it unsuitable for
   polarisation analysis and any pipeline that compares observations taken at
   different orientations.
 * **For polarisation fields (Q, U, E/B modes)** the rotational stability test
-  is the primary benchmark.  Setting the threshold using the accuracy table
-  alone is insufficient; rotational stability should be considered as well.
-* The threshold is compared against :math:`\varepsilon` for the active
-  interpolation method and ``nside``.  Setting it below the interpolation floor
-  of the chosen method will not improve accuracy; it will only restrict the
-  clustering calibration unnecessarily.
+  is the primary benchmark.  The accuracy table alone is insufficient;
+  rotational stability should be considered as well.
 * The relative RMS metric is largely **independent of beam shape**: the
   interpolation operates on the HEALPix sky map, and the sub-pixel displacement
   distribution is determined by the HEALPix geometry, not by beam morphology.
@@ -345,3 +336,10 @@ Practical notes:
   narrower beams — where FWHM / pixel_size drops below ~4–5 — the sky map
   has more sub-pixel structure and the relative errors will be larger than
   listed here.
+
+.. note::
+
+   The ``clustering_error_threshold`` config key governs a *different* metric:
+   the relative RMS divergence of the beam transfer function B_ℓ between the
+   clustered and unclustered beam.  That metric is defined and discussed
+   separately on :doc:`beam_cluster_calibration`.

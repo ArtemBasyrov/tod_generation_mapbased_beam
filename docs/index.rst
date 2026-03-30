@@ -14,6 +14,7 @@ boresight scan trajectory, producing one TOD file per observation day.
    data_formats
    beam_creation
    beam_interpolation_accuracy
+   beam_cluster_calibration
 
 .. toctree::
    :maxdepth: 2

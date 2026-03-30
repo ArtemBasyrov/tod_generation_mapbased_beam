@@ -240,12 +240,20 @@ proportional reduction in computation.
 **Workflow**
 
 1. Set ``clustering_calibration_enabled: true`` and run the pipeline once.
-   The calibration sweeps a fixed ``(tail_fraction × n_clusters)`` grid,
-   measures relative RMS TOD error on a uniformly-strided probe day, and
-   writes the best pair back to the config.
+   The calibration sweeps a ``(tail_fraction × n_clusters)`` grid.  For
+   each pair it clusters the beam pixels and computes the beam transfer
+   function B_ℓ from the clustered geometry, comparing it against the
+   reference B_ℓ of the unclustered beam.  The pair that maximises the
+   pixel-count speedup while keeping B_ℓ divergence below
+   ``clustering_error_threshold`` is written back to the config.
 2. On all subsequent runs the saved values are used directly and clustering
    calibration is skipped (``clustering_calibration_enabled`` is reset to
    ``false`` automatically).
+
+No scan data or TOD generation is needed during calibration — the metric
+is computed purely from beam geometry.  See :doc:`beam_cluster_calibration`
+for a detailed description of the B_ℓ divergence metric and guidance on
+choosing the threshold.
 
 **Manual override:** set ``clustering_calibration_enabled: false`` and
 fill in ``n_beam_clusters`` and ``beam_cluster_tail_fraction`` by hand.
@@ -278,11 +286,12 @@ fill in ``n_beam_clusters`` and ``beam_cluster_tail_fraction`` by hand.
        Automatically reset to ``false`` after calibration completes.
    * - ``clustering_error_threshold``
      - ``float``
-     - ``1.0e-3``
-     - Maximum tolerated relative RMS TOD error during calibration.
-       The calibration selects the pair that maximises speedup subject
-       to this constraint.  See :doc:`beam_interpolation_accuracy` for
-       measured interpolation floors and tier-based recommendations.
+     - ``1.0e-5``
+     - Maximum tolerated relative RMS B_ℓ divergence between the clustered
+       and reference beam transfer function.  The calibration selects the
+       pair that maximises speedup subject to this constraint.  See
+       :doc:`beam_cluster_calibration` for metric definition and
+       tier-based recommendations.
 
 Full Example
 ------------
@@ -322,4 +331,4 @@ Full Example
      n_beam_clusters: null
      beam_cluster_tail_fraction: null
      clustering_calibration_enabled: false
-     clustering_error_threshold: 1.0e-3
+     clustering_error_threshold: 1.0e-5

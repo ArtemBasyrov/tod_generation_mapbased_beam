@@ -89,16 +89,16 @@ def _kmeans_plus_plus_init(vec: np.ndarray,
     centroids = np.empty((K, 3), dtype=np.float64)
 
     centroids[0] = vec[rng.choice(S, p=prob)]
+    nearest_cos = vec @ centroids[0]                             # (S,) — running max similarity
 
     for k in range(1, K):
-        sim = vec @ centroids[:k].T                              # (S, k)
-        nearest_cos = sim.max(axis=1)                            # (S,)
         cos_dist_sq = np.maximum(1.0 - nearest_cos, 0.0) ** 2   # (S,)
 
         p = weights * cos_dist_sq
         total = p.sum()
         p = prob if total == 0.0 else p / total
         centroids[k] = vec[rng.choice(S, p=p)]
+        nearest_cos = np.maximum(nearest_cos, vec @ centroids[k])  # incremental update
 
     return centroids
 
@@ -131,16 +131,17 @@ def _kmeans_sphere(vec: np.ndarray,
     S = len(bvals)
     centroids = _kmeans_plus_plus_init(vec, bvals, K, rng)
     labels = np.empty(S, dtype=np.int32)
-    max_disp = np.inf
+    cos_disp = np.full(K, -1.0)   # sentinel: triggers arccos only when needed
 
     for iteration in range(max_iter):
         sim    = vec @ centroids.T                          # (S, K)
         labels = sim.argmax(axis=1).astype(np.int32)
 
-        new_centroids = np.zeros((K, 3), dtype=np.float64)
-        new_weights   = np.zeros(K,      dtype=np.float64)
-        np.add.at(new_centroids, labels, bvals[:, None] * vec)
-        np.add.at(new_weights,   labels, bvals)
+        new_weights = np.bincount(labels, weights=bvals, minlength=K)
+        new_centroids = np.column_stack([
+            np.bincount(labels, weights=bvals * vec[:, i], minlength=K)
+            for i in range(3)
+        ])
 
         # Reinitialise empty clusters from the pixel farthest from its centroid
         empty_mask = (new_weights == 0)
@@ -156,16 +157,17 @@ def _kmeans_sphere(vec: np.ndarray,
         new_centroids /= norms
 
         cos_disp = np.clip((centroids * new_centroids).sum(axis=1), -1.0, 1.0)
-        max_disp = float(np.arccos(cos_disp).max())
         centroids = new_centroids
 
-        if max_disp < tol:
+        if cos_disp.min() > np.cos(tol):
             if verbose:
+                max_disp = float(np.arccos(cos_disp).max())
                 print(f"    [cluster{label}] Converged at iter {iteration+1}  "
                       f"(max_disp={np.degrees(max_disp)*60:.3f}')")
             break
     else:
         if verbose:
+            max_disp = float(np.arccos(cos_disp).max())
             print(f"    [cluster{label}] max_iter={max_iter} reached  "
                   f"(max_disp={np.degrees(max_disp)*60:.3f}')")
 

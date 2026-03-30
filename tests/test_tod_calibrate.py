@@ -452,14 +452,10 @@ class TestRunClusteringProbe:
 class TestCalibrateBeamClustering:
     """Tests for tod_calibrate.calibrate_beam_clustering.
 
-    All external I/O (open_scan_day), Numba kernels
-    (precompute_rotation_vector_batch, beam_tod_batch), and the k-means
-    implementation (beam_cluster.cluster_beam_pixels) are replaced with
-    lightweight stubs so the tests run without real scan data, beam FITS
-    files, or GPU/JIT warm-up overhead.
+    Both k-means (beam_cluster.cluster_beam_pixels) and B_ell computation
+    (beam_bell_power.compute_bell) are replaced with lightweight stubs so
+    the tests run without real beam FITS files or scan data.
     """
-
-    _N_DAY = 5000   # length of fake memory-mapped scan day
 
     # Hard-coded grid values copied from calibrate_beam_clustering source.
     _TAIL_FRACTIONS  = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
@@ -467,42 +463,49 @@ class TestCalibrateBeamClustering:
 
     # ── stub helpers ──────────────────────────────────────────────────────
 
-    def _open_scan_day_stub(self, folder_scan, probe_day):
-        """Return three uniform random arrays of length _N_DAY."""
-        rng = np.random.default_rng(42)
-        t = rng.uniform(0.0,       np.pi, self._N_DAY).astype(np.float32)
-        p = rng.uniform(0.0, 2 * np.pi,   self._N_DAY).astype(np.float32)
-        s = rng.uniform(0.0, 2 * np.pi,   self._N_DAY).astype(np.float32)
-        return t, p, s
+    def _mock_compute_bell_zero_div(self, ra, dec, pixel_map, lmax=500,
+                                    power_cut=1.0, verbose=True, **kw):
+        """Return identical B_ell for every call → divergence = 0."""
+        ell  = np.arange(lmax + 1, dtype=np.int64)
+        bell = np.ones(lmax + 1, dtype=np.float64)
+        return ell, bell
 
-    def _precompute_stub(self, ra0, dec0, phi_b, theta_b):
-        """Return identity rotation matrices and zero betas."""
-        B = len(phi_b)
-        return np.zeros((B, 3, 3), dtype=np.float32), np.zeros(B, dtype=np.float32)
+    def _mock_compute_bell_nonzero_div(self, ra, dec, pixel_map, lmax=500,
+                                       power_cut=1.0, verbose=True, **kw):
+        """Return different B_ell for clustered calls → nonzero divergence.
 
-    def _patched(self, btb_side_effect=None):
-        """Context-manager stack with all four standard patches applied.
+        The first call per beam file is the reference (identical pixels passed).
+        Subsequent calls use a recognisably different bell array so divergence > 0.
+        """
+        ell  = np.arange(lmax + 1, dtype=np.int64)
+        # Clustered calls receive bv_c which is uniform (from _mock_cluster_pixels);
+        # reference calls receive the original beam_vals which also sum to 1 but
+        # differ in distribution.  We mimic large divergence by checking the sum.
+        if np.allclose(pixel_map, pixel_map[0]):   # uniform → clustered
+            bell = np.full(lmax + 1, 0.5, dtype=np.float64)
+        else:
+            bell = np.ones(lmax + 1, dtype=np.float64)
+        return ell, bell
+
+    def _patched(self, bell_side_effect=None):
+        """Context-manager that patches cluster_beam_pixels and compute_bell.
 
         Usage::
 
-            with self._patched() as (mock_osd, mock_prv, mock_btb):
+            with self._patched() as (mock_cluster, mock_bell):
                 result = calibrate_beam_clustering(...)
         """
         import contextlib
 
         @contextlib.contextmanager
-        def _ctx(btb_se):
-            with patch("tod_calibrate.open_scan_day",
-                       side_effect=self._open_scan_day_stub) as m_osd, \
-                 patch("tod_calibrate.precompute_rotation_vector_batch",
-                       side_effect=self._precompute_stub) as m_prv, \
-                 patch("tod_calibrate.beam_tod_batch",
-                       side_effect=btb_se or _mock_btb_ones) as m_btb, \
-                 patch("beam_cluster.cluster_beam_pixels",
-                       side_effect=_mock_cluster_pixels):
-                yield m_osd, m_prv, m_btb
+        def _ctx(bell_se):
+            with patch("beam_cluster.cluster_beam_pixels",
+                       side_effect=_mock_cluster_pixels) as m_cl, \
+                 patch("tod_calibrate.compute_bell",
+                       side_effect=bell_se or self._mock_compute_bell_zero_div) as m_bell:
+                yield m_cl, m_bell
 
-        return _ctx(btb_side_effect)
+        return _ctx(bell_side_effect)
 
     # ── basic return-value tests ──────────────────────────────────────────
 
@@ -539,89 +542,38 @@ class TestCalibrateBeamClustering:
         np.testing.assert_array_equal(beam_data["beam_I"]["vec_orig"], vo_before)
         assert beam_data["beam_I"]["n_sel"] == ns_before
 
-    # ── probe sampling tests ──────────────────────────────────────────────
-
-    def test_open_scan_day_called_once(self):
-        """open_scan_day is called exactly once regardless of grid size."""
-        with self._patched() as (mock_osd, _, _):
-            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
-        assert mock_osd.call_count == 1
-
-    def test_probe_size_bounded_by_n_probe_samples(self):
-        """The probe sent to beam_tod_batch has at most 1000 samples (n_probe_samples)."""
-        n_probe_samples = 1000
-        probe_sizes = []
-
-        def _btb_recording(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
-            probe_sizes.append(len(phi_b))
-            return {c: np.ones(len(phi_b), dtype=np.float64) for c in range(3)}
-
-        with self._patched(btb_side_effect=_btb_recording):
-            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
-
-        assert all(s <= n_probe_samples for s in probe_sizes), \
-            f"Some probes exceeded {n_probe_samples} samples: {set(probe_sizes)}"
-
-    def test_probe_size_consistent_across_all_calls(self):
-        """Every call to beam_tod_batch uses the same strided probe length B."""
-        probe_sizes = []
-
-        def _btb_recording(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
-            probe_sizes.append(len(phi_b))
-            return {c: np.ones(len(phi_b), dtype=np.float64) for c in range(3)}
-
-        with self._patched(btb_side_effect=_btb_recording):
-            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
-
-        assert len(set(probe_sizes)) == 1, \
-            f"Inconsistent probe sizes across calls: {set(probe_sizes)}"
-
-    def test_precompute_called_once(self):
-        """precompute_rotation_vector_batch is called exactly once (not once per grid point)."""
-        with self._patched() as (_, mock_prv, _):
-            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
-        assert mock_prv.call_count == 1
-
     # ── selection-logic tests ─────────────────────────────────────────────
 
     def test_selects_max_speedup_when_all_pass(self):
-        """
-        When exact TOD == clustered TOD (rel_rms=0 everywhere), the pair with
-        the highest speedup is chosen.
-
-        With _mock_btb_ones, exact == clustered for every (tf, K) pair, so all
-        rel_rms values are 0 and every pair qualifies.  The function must then
-        return the pair that maximises average speedup = S / K_out.
-        """
+        """When B_ell divergence=0 everywhere, the pair with the highest speedup
+        is chosen (every pair qualifies with a permissive threshold)."""
         with self._patched():
             tf, K = calibrate_beam_clustering(
                 _fake_beam_data(), ".", 0, _fake_mp(),
                 error_threshold=1.0,   # accept everything
             )
-        # Result must be a valid grid element.
         assert tf in self._TAIL_FRACTIONS
         assert K  in self._N_CLUSTERS_LIST
 
     def test_fallback_on_all_fail_returns_min_error(self, capsys):
-        """
-        When every (tf, K) pair exceeds error_threshold, the pair with the
-        minimum rel_rms is returned and a WARNING line is printed.
+        """When every (tf, K) pair exceeds error_threshold, the pair with the
+        minimum B_ell divergence is returned and a WARNING line is printed.
 
-        The stub returns 100 for the exact phase (warmup + reference) and 0 for
-        all grid evaluations → rel_rms = 1.0 for every pair.
+        The first compute_bell call (reference) returns bell=1; all subsequent
+        calls (clustered) return bell=0.5, giving a non-zero divergence.
         """
         call_count = [0]
 
-        def _btb_fail(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
+        def _bell_nonzero(ra, dec, pixel_map, lmax=500, power_cut=1.0,
+                          verbose=True, **kw):
             call_count[0] += 1
-            B = len(phi_b)
-            # First 2 calls: warmup + exact reference (one beam file → 1 call each)
-            if call_count[0] <= 2:
-                return {c: np.full(B, 100.0, dtype=np.float64) for c in range(3)}
-            # All remaining calls are grid evaluations → return zeros
-            return {c: np.zeros(B, dtype=np.float64) for c in range(3)}
+            ell  = np.arange(lmax + 1, dtype=np.int64)
+            bell = (np.ones(lmax + 1, dtype=np.float64)
+                    if call_count[0] == 1
+                    else np.full(lmax + 1, 0.5, dtype=np.float64))
+            return ell, bell
 
-        with self._patched(btb_side_effect=_btb_fail):
+        with self._patched(bell_side_effect=_bell_nonzero):
             tf, K = calibrate_beam_clustering(
                 _fake_beam_data(), ".", 0, _fake_mp(),
                 error_threshold=1e-10,   # nothing can pass
@@ -634,18 +586,19 @@ class TestCalibrateBeamClustering:
         assert K  in self._N_CLUSTERS_LIST
 
     def test_strict_threshold_triggers_fallback(self, capsys):
-        """error_threshold=0 forces fallback whenever rel_rms > 0."""
+        """error_threshold=0 forces fallback whenever bell_div > 0."""
         call_count = [0]
 
-        def _btb_nonzero_error(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, **kw):
+        def _bell_nonzero(ra, dec, pixel_map, lmax=500, power_cut=1.0,
+                          verbose=True, **kw):
             call_count[0] += 1
-            B = len(phi_b)
-            if call_count[0] <= 2:
-                return {c: np.ones(B, dtype=np.float64) for c in range(3)}
-            # Slightly different value → rel_rms ≈ 0.5 > 0.0 threshold
-            return {c: np.full(B, 0.5, dtype=np.float64) for c in range(3)}
+            ell  = np.arange(lmax + 1, dtype=np.int64)
+            bell = (np.ones(lmax + 1, dtype=np.float64)
+                    if call_count[0] == 1
+                    else np.full(lmax + 1, 0.5, dtype=np.float64))
+            return ell, bell
 
-        with self._patched(btb_side_effect=_btb_nonzero_error):
+        with self._patched(bell_side_effect=_bell_nonzero):
             tf, K = calibrate_beam_clustering(
                 _fake_beam_data(), ".", 0, _fake_mp(),
                 error_threshold=0.0,
@@ -664,6 +617,12 @@ class TestCalibrateBeamClustering:
             )
         captured = capsys.readouterr()
         assert "WARNING" not in captured.out
+
+    def test_backward_compat_optional_args(self):
+        """folder_scan / probe_day / mp are now optional; call without them."""
+        with self._patched():
+            tf, K = calibrate_beam_clustering(_fake_beam_data())
+        assert isinstance(tf, float) and isinstance(K, int)
 
 
 # ---------------------------------------------------------------------------
