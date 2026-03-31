@@ -440,6 +440,7 @@ def main(n_cpu_ceiling):
         ncpus, batch_size = _calibrate_n_processes(
             beam_data, folder_scan, probe_day=start,
             mp=MP, n_cpu_ceiling=n_cpu_ceiling,
+            interp_mode=interp_mode,
         )
         _save_calibration(ncpus, batch_size)
     print(f"Processing days {start}–{end-1}  ({len(days)} days,  {ncpus} workers)")

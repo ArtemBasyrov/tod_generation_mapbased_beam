@@ -44,7 +44,7 @@ def _candidate_batch_sizes(mem_cap):
 
 
 def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
-                         n_repeats=3, prefix=""):
+                         n_repeats=3, prefix="", interp_mode='bilinear'):
     """Find the batch size that maximises sustained throughput on this hardware.
 
     Runs once before the day loop. Generates candidate batch sizes from a power-
@@ -97,7 +97,7 @@ def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
             rot_vecs, betas = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
             psis_b = -betas + psi_b
             for data in beam_data.values():
-                beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b)
+                beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, interp_mode=interp_mode)
         return time.perf_counter() - t0
 
     _run_one(candidates[len(candidates) // 2])  # warm-up (Python/numpy JIT)
@@ -125,7 +125,7 @@ def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
 
 
 def _calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
-                           n_repeats=3, prefix=""):
+                           n_repeats=3, prefix="", interp_mode='bilinear'):
     """Find the optimal number of worker processes for maximum total throughput.
 
     Estimates total throughput as ``throughput_per_process(n) × n`` and returns
@@ -174,6 +174,7 @@ def _calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
         n_processes=1,
         n_repeats=n_repeats,
         prefix=prefix,
+        interp_mode=interp_mode,
     )
     # results: list of (batch_size, throughput_samp_per_s), ordered by batch_size
     results_dict = dict(results)
