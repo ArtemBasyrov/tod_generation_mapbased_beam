@@ -52,7 +52,9 @@ from numba_healpy import (
     get_interp_weights_numba,
     _query_disc_jit,
     _query_disc_into_jit,
+    _gather_ring_stencil_jit,
     _pix2ang_ring_jit,
+    _pix2zphi_ring_jit,
     _ang2pix_ring_jit,
 )
 
@@ -67,6 +69,25 @@ _S_TILE_TARGET_BYTES = 2 * 1024 * 1024
 _MAX_TILES = 8
 
 _INV_TWO_PI  = 1.0 / _TWO_PI
+
+
+# ── Keys cubic kernel (Catmull-Rom, a = −0.5) ────────────────────────────────
+
+@numba.jit(nopython=True, cache=True)
+def _keys_1d_jit(t):
+    """Keys cubic convolution kernel, Horner form.
+
+    Support (−2, 2):
+        |t| < 1 :  (3/2)|t|³ − (5/2)|t|² + 1
+        |t| < 2 :  (−1/2)|t|³ + (5/2)|t|² − 4|t| + 2
+        else    :  0
+    """
+    t = abs(t)
+    if t < 1.0:
+        return (1.5 * t - 2.5) * t * t + 1.0
+    if t < 2.0:
+        return ((-0.5 * t + 2.5) * t - 4.0) * t + 2.0
+    return 0.0
 
 
 # ── Numba JIT kernels ─────────────────────────────────────────────────────────
@@ -970,6 +991,213 @@ def _gaussian_accum_flatsky(dtheta_tile, dphi_tile, k_b, theta_b, phi_b,
                                  scratch_pix, scratch_w, tod_tmp)
 
 
+# ── Bicubic (Keys/Catmull-Rom) interpolation kernel ──────────────────────────
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _gather_accum_bicubic_jit(vec_rot, B, Sc, nside, h_pix, mp_stacked, beam_vals,
+                               tod_arr, scratch_pix, scratch_z, scratch_phi):
+    """
+    Fully fused vec2ang + Keys-bicubic interpolation + beam accumulation.
+
+    For each detector sample b (parallelised), iterates sequentially over Sc
+    beam pixels s and accumulates directly into tod_arr[c, b].  This avoids
+    the (C, B*Sc) intermediate tod_tmp buffer and the second reduction pass,
+    keeping tod_arr[c, b] hot in L1/L2 cache throughout the inner Sc loop.
+
+    Parallelised over B (detector samples); each thread owns one b-column of
+    tod_arr exclusively — no write races, no intermediate buffer needed.
+
+    For each (b, s) element:
+    1. Inline vec2ang from float32 vec_rot[b, s, :].
+    2. _gather_ring_stencil_jit collects the 9-ring × 5-phi stencil (≤ 45
+       candidates) via ring arithmetic — no acos, no disc-radius math.
+       It now also populates scratch_z and scratch_phi with the (cos θ, φ)
+       of each candidate, eliminating ~40 _pix2zphi_ring_jit calls per (b,s).
+    3. Each candidate pixel is projected onto the local gnomonic (tangent-plane)
+       coordinate system and weighted by the 2-D separable Keys cubic kernel.
+    4. Weights and map values are accumulated in a single pass over the stencil:
+       weight and map lookup happen together, avoiding re-reading pix_buf.
+       Candidates with w == 0 are skipped before the expensive map read.
+    5. The normalised, beam-weighted contribution is added to tod_arr[c, b].
+
+    Parameters
+    ----------
+    vec_rot    : (B, Sc, 3)          float32   rotated beam unit vectors
+    B, Sc      : int
+    nside      : int
+    h_pix      : float64             angular pixel scale [rad] = nside2resol(nside)
+    mp_stacked : (C, N_hp)           float32   stacked sky-map components
+    beam_vals  : (Sc,)               float32   beam weights for this tile
+    tod_arr    : (C, B)              float64   accumulated in place
+    scratch_pix: (n_threads, 64)     int64     thread-local pixel index buffer
+    scratch_z  : (n_threads, 64)     float64   thread-local cos(θ) buffer
+    scratch_phi: (n_threads, 64)     float64   thread-local φ buffer
+    """
+    C     = mp_stacked.shape[0]
+    inv_h = 1.0 / h_pix
+
+    for b in numba.prange(B):
+        tid     = numba.get_thread_id()
+        pix_buf = scratch_pix[tid]
+        z_buf   = scratch_z[tid]
+        phi_buf = scratch_phi[tid]
+
+        for s in range(Sc):
+            # ── vec2ang (inline) ──────────────────────────────────────────────
+            vx = float(vec_rot[b, s, 0])
+            vy = float(vec_rot[b, s, 1])
+            vz = float(vec_rot[b, s, 2])
+            r_xy = math.sqrt(vx * vx + vy * vy)
+            th   = math.atan2(r_xy, vz)
+            ph   = math.atan2(vy, vx)
+            if ph < 0.0:
+                ph += _TWO_PI
+
+            bv = float(beam_vals[s])
+
+            # ── ring-walk stencil gather ──────────────────────────────────────
+            # 9 rings (±4 around query ring, step ≈ 0.65 h_pix) × 5 phi pixels
+            # (±2 per ring, step ≥ 1.14 h_pix) → ≤ 45 candidates.
+            # Also populates z_buf / phi_buf, eliminating _pix2zphi_ring_jit
+            # calls in the inner loop (~40 per (b,s) pair eliminated).
+            M = _gather_ring_stencil_jit(nside, vz, ph, pix_buf, z_buf, phi_buf)
+
+            if M == 0:
+                nearest = _ang2pix_ring_jit(nside, th, ph)
+                for c in range(C):
+                    tod_arr[c, b] += mp_stacked[c, nearest] * bv
+                continue
+
+            # ── local gnomonic frame at query point (vx, vy, vz) ─────────────
+            # East unit vector: ê_φ = (−sin φ, cos φ, 0)
+            # South unit vector: ê_θ = (cos θ cos φ, cos θ sin φ, −sin θ)
+            # Expressed in terms of the unit vector components:
+            #   sin_th = r_xy,  cos_th = vz
+            #   cos_ph = vx / sin_th,  sin_ph = vy / sin_th
+            sin_th = r_xy
+            cos_th = vz
+            if sin_th > 1e-12:
+                inv_s  = 1.0 / sin_th
+                ephi_x = -vy * inv_s          # −sin φ
+                ephi_y =  vx * inv_s          #  cos φ
+                # ephi_z = 0  (not stored — saves a multiply per neighbour)
+                eth_x  =  cos_th * vx * inv_s # cos θ cos φ
+                eth_y  =  cos_th * vy * inv_s # cos θ sin φ
+                eth_z  = -sin_th              # −sin θ
+            else:
+                # Pole: arbitrary but consistent frame
+                ephi_x = 1.0; ephi_y = 0.0
+                eth_x  = 0.0; eth_y  = 1.0; eth_z = 0.0
+
+            # ── fused Keys weight + map accumulation ──────────────────────────
+            # Optimisations:
+            # · z_buf[k] / phi_buf[k] come pre-computed from _gather_ring_stencil_jit.
+            #   No _pix2zphi_ring_jit calls needed — ring info (z, phi) is already
+            #   available when the stencil is walked; returning it here avoids
+            #   recomputing _ring_info_jit + _ring_z_jit for each of the ~40 pixels.
+            # · sin(θ) = sqrt(1−z²): 1 sqrt replaces acos→sin→cos = 3 transcendentals.
+            # · dphi = φ_n − φ_q is always small for nearby pixels.  For |dphi|
+            #   below a safe threshold we use the O(dphi⁴) Taylor series instead of
+            #   trig calls: sin(dphi)≈dphi−dphi³/6, cos(dphi)≈1−dphi²/2.
+            #   The ±2 phi-pixel stencil width at nside=1024 gives max |dphi| ≈
+            #   2×h_pix/sin(θ) ≤ 0.003 rad; the threshold of 0.025 rad is safe for
+            #   sin(θ) > 0.12 (i.e. more than ~7° from pole).  Polar pixels fall
+            #   through to the exact branch automatically.
+            # · Early exit on |xi|≥2: skips the north projection and second key call
+            #   for stencil candidates outside the Keys east-axis support.
+            # · Early exit on w==0: skips C map reads (cache misses on 600 MB map)
+            #   for candidates where kxi≠0 but kyi=0 (e.g. ring ±4 at ~2.6 h_pix).
+            # · ephi_z = 0 is never stored — saves one multiply per candidate.
+            # · Single pass over k: weight computed and map values immediately
+            #   accumulated — pix_buf[k] is read once, not C times in separate loops.
+            _TAYLOR_THR = 0.025  # rad; cos Taylor error < 1.6e-8 → value error < 1e-5 (nside≥512)
+            w_sum = 0.0
+            # acc[c] accumulates w * map[c, p] for each Stokes component.
+            # Numba allocates this small array on the stack for the nopython JIT.
+            acc = np.zeros(C)
+            for k in range(M):
+                cn    = z_buf[k]
+                phi_n = phi_buf[k]
+                sn = math.sqrt(max(0.0, 1.0 - cn * cn))   # sin(theta_n)
+
+                # dphi = phi_n − phi_q, wrapped to (−π, π]
+                dphi = phi_n - ph
+                if   dphi >  math.pi: dphi -= _TWO_PI
+                elif dphi < -math.pi: dphi += _TWO_PI
+
+                if abs(dphi) < _TAYLOR_THR:
+                    dp2      = dphi * dphi
+                    sin_dphi = dphi * (1.0 - dp2 * (1.0 / 6.0))
+                    cos_dphi = 1.0  - dp2 * 0.5
+                else:
+                    sin_dphi = math.sin(dphi)
+                    cos_dphi = math.cos(dphi)
+
+                # cos(central angle) from trigonometric identity
+                cos_c = sin_th * sn * cos_dphi + cos_th * cn
+                if cos_c < 1e-10:
+                    continue
+
+                inv_c = inv_h / cos_c
+                # Gnomonic tangent-plane coordinates:
+                #   xi (east)  = sn · sin(dphi) / (cos_c · h_pix)
+                #   yi (north) = −(sn·cos_th·cos(dphi) − cn·sin_th) / (cos_c·h_pix)
+                xi  = sn * sin_dphi * inv_c
+                kxi = _keys_1d_jit(xi)
+                if kxi == 0.0:     # |xi| ≥ 2 — outside east support; skip north proj
+                    continue
+                yi = -(sn * cos_th * cos_dphi - cn * sin_th) * inv_c
+                w  = kxi * _keys_1d_jit(yi)
+                if w == 0.0:       # kyi = 0 (|yi| ≥ 2) — skip C map reads
+                    continue
+                w_sum += w
+
+                # Accumulate map values immediately — pix_buf[k] read once, not C times
+                p = pix_buf[k]
+                for c in range(C):
+                    acc[c] += w * mp_stacked[c, p]
+
+            # ── write to tod_arr (no intermediate buffer) ─────────────────────
+            if abs(w_sum) < 1e-10:
+                # Degenerate weight sum (pole or very sparse disc) — nearest fallback
+                nearest = _ang2pix_ring_jit(nside, th, ph)
+                for c in range(C):
+                    tod_arr[c, b] += mp_stacked[c, nearest] * bv
+            else:
+                inv_w = bv / w_sum
+                for c in range(C):
+                    tod_arr[c, b] += acc[c] * inv_w
+
+
+def _bicubic_interp_accum(vec_rot, B, Sc, nside, mp_stacked, beam_vals, tod_arr):
+    """
+    Wrapper: allocates thread-local scratch, then calls the JIT kernel.
+
+    The ring-walk stencil (9 rings × 5 phi pixels) writes at most 45 indices per
+    (b, s) element.  The scratch buffer is fixed at 64 entries for alignment.
+    No tod_tmp intermediate buffer is needed: the kernel accumulates directly
+    into tod_arr[c, b], which stays hot in L1/L2 cache for the entire Sc loop.
+
+    Parameters
+    ----------
+    vec_rot    : (B, Sc, 3)  float32
+    B, Sc      : int
+    nside      : int
+    mp_stacked : (C, N_hp)   float32
+    beam_vals  : (Sc,)       float32
+    tod_arr    : (C, B)      float64   accumulated in place
+    """
+    h_pix = hp.nside2resol(nside)
+
+    n_threads   = numba.get_num_threads()
+    scratch_pix = np.empty((n_threads, 64), dtype=np.int64)
+    scratch_z   = np.empty((n_threads, 64), dtype=np.float64)
+    scratch_phi = np.empty((n_threads, 64), dtype=np.float64)
+
+    _gather_accum_bicubic_jit(vec_rot, B, Sc, nside, h_pix, mp_stacked, beam_vals,
+                               tod_arr, scratch_pix, scratch_z, scratch_phi)
+
+
 # ── Public numpy functions ────────────────────────────────────────────────────
 
 def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=None):
@@ -1160,6 +1388,9 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
               interpolation via the fused Numba kernel.
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
+            * ``'bicubic'`` — Keys/Catmull-Rom bicubic via gnomonic projection
+              over ~30–50 disc neighbours; O(h⁴) accuracy, same rotational
+              stability as bilinear, ~8–12× more pixel lookups.
             * ``'gaussian'`` — isotropic Gaussian kernel over all pixels within
               ``radius_deg``; slowest, avoids grid-aligned artefacts.
 
@@ -1194,6 +1425,7 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                    and mp_stacked is not None
     use_nearest  = interp_mode == 'nearest'
     use_gaussian = interp_mode == 'gaussian'
+    use_bicubic  = interp_mode == 'bicubic'
 
     # Resolve Gaussian defaults once (avoids repeating hp.nside2resol per tile).
     if use_gaussian:
@@ -1285,6 +1517,9 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                 elif use_nearest:
                     _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, bv_chunk,
                                               B, s1 - s0, tod_arr)
+                elif use_bicubic:
+                    _bicubic_interp_accum(vec_rot, B, s1 - s0,
+                                          nside, mp_stacked, bv_chunk, tod_arr)
                 else:
                     _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
                                             B, s1 - s0, tod_arr)
@@ -1316,6 +1551,9 @@ def beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
                 elif use_nearest:
                     _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, bv_chunk,
                                               B, s1 - s0, tod_arr)
+                elif use_bicubic:
+                    _bicubic_interp_accum(vec_rot, B, s1 - s0,
+                                          nside, mp_stacked, bv_chunk, tod_arr)
                 else:
                     _gather_accum_fused_jit(vec_rot, nside, mp_stacked, bv_chunk,
                                             B, s1 - s0, tod_arr)

@@ -19,6 +19,10 @@ pix2ang_numba           — public wrapper; drop-in for hp.pix2ang(nest=False).
 _query_disc_jit         — nopython query_disc: returns int64 array of RING pixel
                           indices within a disc, callable from inside JIT kernels.
 query_disc_numba        — public wrapper; drop-in for hp.query_disc(nest=False).
+
+_gather_ring_stencil_jit — fast Keys/Catmull-Rom stencil gather via ring walk.
+                           Replaces _query_disc_into_jit in the bicubic hot loop,
+                           eliminating the ~9 acos calls per (b,s) element.
 """
 import math
 import numpy as np
@@ -284,6 +288,37 @@ def _pix2ang_ring_jit(nside, pix):
     phi   = phi0 + ip_in * dphi
     z     = _ring_z_jit(nside, iring)
     return math.acos(z), phi
+
+
+@numba.jit(nopython=True, cache=True)
+def _pix2zphi_ring_jit(nside, pix):
+    """(z, phi) for a single RING-scheme pixel, where z = cos(theta).
+
+    Identical logic to _pix2ang_ring_jit but returns the ring's z = cos(theta)
+    directly instead of acos(z).  Callers that need sin(theta) compute it as
+    sqrt(max(0, 1 - z²)) — one sqrt instead of one acos + one sin + one cos.
+    """
+    npix = 12 * nside * nside
+    ncap = 2 * nside * (nside - 1)
+
+    if pix < ncap:
+        iring = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * pix)))
+        ip_in = pix - 2 * iring * (iring - 1)
+    elif pix < npix - ncap:
+        ip    = pix - ncap
+        iring = ip // (4 * nside) + nside
+        ip_in = ip % (4 * nside)
+    else:
+        ip_s    = npix - pix - 1
+        iring_s = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * ip_s)))
+        iring   = 4 * nside - iring_s
+        first_s = npix - 2 * iring_s * (iring_s + 1)
+        ip_in   = pix - first_s
+
+    _n, _fp, phi0, dphi_r = _ring_info_jit(nside, iring, npix)
+    phi = phi0 + ip_in * dphi_r
+    z   = _ring_z_jit(nside, iring)
+    return z, phi
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
@@ -554,6 +589,88 @@ def _query_disc_into_jit(nside, theta_q, phi_q, radius_rad, inclusive, out_buf):
         else:
             for ip_idx in range(ip_lo, ip_hi + 1):
                 out_buf[count] = fp + ip_idx % n_p
+                count += 1
+
+    return count
+
+
+@numba.jit(nopython=True, cache=True)
+def _gather_ring_stencil_jit(nside, vz, ph, out_buf, z_buf, phi_buf):
+    """
+    Gather RING pixel indices for the Keys/Catmull-Rom bicubic stencil,
+    and simultaneously populate z_buf / phi_buf with (cos θ, φ) for each
+    gathered pixel — eliminating the need to call _pix2zphi_ring_jit in the
+    hot loop.
+
+    While building the stencil this function already has ring geometry in hand
+    (from _ring_info_jit and _ring_z_jit).  Returning (z, phi) alongside the
+    pixel index removes ~40 redundant function-call chains per (b, s) element:
+    each chain would otherwise re-run _ring_info_jit + _ring_z_jit + branch
+    logic to recover the same values from the pixel index.
+
+    Replaces _query_disc_into_jit in the bicubic hot loop, eliminating the
+    ~9 acos + ~4 cos calls that dominate disc-search cost (~240 ns → ~5 ns).
+
+    Geometry
+    --------
+    HEALPix ring spacing is ~0.65 h_pix in both the equatorial belt and the
+    polar cap, so ±4 rings cover the Keys north–south support |yi| < 2.
+
+    The phi pixel step satisfies:
+      · equatorial belt: step ≥ 1.14 h_pix  (at the equatorial–polar boundary)
+      · polar cap:       step ≈ √π h_pix ≈ 1.77 h_pix
+    In both zones ±2 phi pixels per ring covers the east–west support |xi| < 2.
+
+    Stencil: 9 rings × 5 phi pixels = 45 candidates maximum.
+    Rings with n_p ≤ 4 (only ir = 1 at any nside) include all their pixels
+    directly, to avoid duplicate indices from modulo wrapping.
+
+    Parameters
+    ----------
+    nside   : int
+    vz      : float64   cos(θ) of the query point  (= vec_rot[b,s,2])
+    ph      : float64   longitude [rad], in [0, 2π)
+    out_buf : (≥ 45,) int64    caller-allocated pixel index buffer
+    z_buf   : (≥ 45,) float64  caller-allocated cos(θ) buffer
+    phi_buf : (≥ 45,) float64  caller-allocated φ [rad] buffer
+
+    Returns
+    -------
+    M : int   number of entries written into out_buf[:M] / z_buf[:M] / phi_buf[:M]
+    """
+    npix_total = 12 * nside * nside
+
+    ir_center = _ring_above_jit(nside, vz)
+    # _ring_above_jit returns 0 at/above the very north pole; clamp to [1, 4n-1].
+    if ir_center < 1:
+        ir_center = 1
+    elif ir_center > 4 * nside - 1:
+        ir_center = 4 * nside - 1
+
+    ir_lo = max(1,             ir_center - 4)
+    ir_hi = min(4 * nside - 1, ir_center + 4)
+
+    count = 0
+    for ir in range(ir_lo, ir_hi + 1):
+        n_p, fp, phi0, dphi = _ring_info_jit(nside, ir, npix_total)
+        z_ring = _ring_z_jit(nside, ir)   # cos(θ) for this ring — computed once
+
+        if n_p <= 4:
+            # ir = 1 at any nside: only 4 pixels in the ring.
+            # ±2 wrapping would repeat pixel indices, so include all directly.
+            for ip in range(n_p):
+                out_buf[count] = fp + ip
+                z_buf[count]   = z_ring
+                phi_buf[count] = phi0 + ip * dphi
+                count += 1
+        else:
+            # Nearest pixel in phi, then ±2 neighbours with wrap-around.
+            ip_center = int(math.floor((ph - phi0) / dphi + 0.5)) % n_p
+            for dip in range(-2, 3):
+                ip_in = (ip_center + dip) % n_p
+                out_buf[count] = fp + ip_in
+                z_buf[count]   = z_ring
+                phi_buf[count] = phi0 + ip_in * dphi
                 count += 1
 
     return count
