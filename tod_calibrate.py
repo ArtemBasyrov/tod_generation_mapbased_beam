@@ -28,6 +28,7 @@ from tod_utils import _fmt_time, _get_memory_per_process, compute_bell
 _BYTES_PER_SAMPLE_PER_BEAM = 100   # memory model ceiling constant
 _MEMORY_SAFETY_FACTOR       = 1.5
 _MIN_BATCHES_PER_PROBE      = 6   # each candidate must fill this many batches
+_MAX_PROBE_SAMPLES          = 100_000  # cap probe at 100K samples for fast calibration
 
 
 def _memory_cap(max_memory_gb, max_beam_sel):
@@ -35,12 +36,38 @@ def _memory_cap(max_memory_gb, max_beam_sel):
     return max(1, int(budget // (_BYTES_PER_SAMPLE_PER_BEAM * max_beam_sel)))
 
 
-def _candidate_batch_sizes(mem_cap):
+def _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=None):
+    """Generate candidate batch sizes, with adaptive minimum based on system size.
+
+    For small systems (< 10 GB/proc, e.g., laptops), the optimal batch size is
+    often 256–512. For large systems (> 100 GB/proc, e.g., HPC clusters),
+    it's almost always 4K+. This scales the floor accordingly.
+
+    Args:
+        mem_cap (int): Maximum batch size (samples) that fit in memory.
+        max_memory_per_process_gb (float | None): Available memory per process in GB.
+            If None, no filtering applied (backward compatible with tests).
+            If provided, adaptive minimum scales with system size.
+
+    Returns:
+        list[int]: Sorted candidate batch sizes.
+    """
+    # Adaptive minimum: scale with available memory per process
+    # Heuristic: min_bs ≈ 128 + (memory_gb * 256)
+    # - 1.5 GB/proc  → ~256–384
+    # - 10 GB/proc   → ~2.5K
+    # - 100+ GB/proc → ~25K+
+    # When None (tests/legacy code), use no filtering for backward compatibility
+    if max_memory_per_process_gb is None:
+        min_bs = 1  # backward compatible: include all powers of 2
+    else:
+        min_bs = max(256, int(128 + max_memory_per_process_gb * 256))
+
     log_max    = int(np.log2(mem_cap)) + 1
     powers     = [int(2**k) for k in range(1, log_max + 1)]
     extras     = [mem_cap, mem_cap // 2, mem_cap // 4]
     candidates = sorted(set(powers + [c for c in extras if c >= 1]))
-    return [c for c in candidates if c <= mem_cap]
+    return [c for c in candidates if min_bs <= c <= mem_cap]
 
 
 def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
@@ -78,11 +105,12 @@ def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
 
     max_memory_gb = _get_memory_per_process(n_processes)
     mem_cap       = _memory_cap(max_memory_gb, max_beam_sel)
-    candidates = _candidate_batch_sizes(mem_cap)
+    candidates = _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=max_memory_gb)
 
     # Every candidate must run at least _MIN_BATCHES_PER_PROBE full batches.
     # The largest candidate (mem_cap) is the binding constraint.
-    probe_n = mem_cap * _MIN_BATCHES_PER_PROBE
+    # Cap at _MAX_PROBE_SAMPLES to keep calibration fast (~5 min even on small systems).
+    probe_n = min(mem_cap * _MIN_BATCHES_PER_PROBE, _MAX_PROBE_SAMPLES)
     theta_p, phi_p, psi_p = _load_scan_data_batch(folder_scan, probe_day, 0, probe_n)
     probe_n = min(probe_n, len(phi_p))
 
