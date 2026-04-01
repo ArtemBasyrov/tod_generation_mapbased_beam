@@ -53,15 +53,15 @@ def _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=None):
         list[int]: Sorted candidate batch sizes.
     """
     # Adaptive minimum: scale with available memory per process
-    # Heuristic: min_bs ≈ 128 + (memory_gb * 256)
-    # - 1.5 GB/proc  → ~256–384
-    # - 10 GB/proc   → ~2.5K
-    # - 100+ GB/proc → ~25K+
+    # Heuristic: min_bs ≈ 128 + (memory_gb * 64)
+    # - 1.5 GB/proc  → ~128–192
+    # - 10 GB/proc   → ~1.25K
+    # - 100+ GB/proc → ~12.5K+
     # When None (tests/legacy code), use no filtering for backward compatibility
     if max_memory_per_process_gb is None:
         min_bs = 1  # backward compatible: include all powers of 2
     else:
-        min_bs = max(256, int(128 + max_memory_per_process_gb * 256))
+        min_bs = max(256, int(128 + max_memory_per_process_gb * 64))
 
     log_max    = int(np.log2(mem_cap)) + 1
     powers     = [int(2**k) for k in range(1, log_max + 1)]
