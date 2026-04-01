@@ -621,7 +621,7 @@ def _gather_ring_stencil_jit(nside, vz, ph, out_buf, z_buf, phi_buf):
       · polar cap:       step ≈ √π h_pix ≈ 1.77 h_pix
     In both zones ±2 phi pixels per ring covers the east–west support |xi| < 2.
 
-    Stencil: 9 rings × 5 phi pixels = 45 candidates maximum.
+    Stencil: 7 rings × 5 phi pixels = 35 candidates maximum.
     Rings with n_p ≤ 4 (only ir = 1 at any nside) include all their pixels
     directly, to avoid duplicate indices from modulo wrapping.
 
@@ -647,8 +647,14 @@ def _gather_ring_stencil_jit(nside, vz, ph, out_buf, z_buf, phi_buf):
     elif ir_center > 4 * nside - 1:
         ir_center = 4 * nside - 1
 
-    ir_lo = max(1,             ir_center - 4)
-    ir_hi = min(4 * nside - 1, ir_center + 4)
+    # Ring ±4 is always outside the Keys support: even at the minimum equatorial
+    # ring spacing of ~0.65 h_pix, ring ±4 sits at ±2.6 h_pix > 2 h_pix (support
+    # boundary).  In the polar cap (spacing ~0.80 h_pix) ring ±3 is already at
+    # ±2.4 h_pix > 2, so only rings ±1 and ±2 ever contribute there.  Gathering
+    # ring ±4 forces the inner loop to compute coordinates for 10 always-zero-
+    # weight candidates.  Using ±3 eliminates those 10 wasted iterations entirely.
+    ir_lo = max(1,             ir_center - 3)
+    ir_hi = min(4 * nside - 1, ir_center + 3)
 
     count = 0
     for ir in range(ir_lo, ir_hi + 1):
