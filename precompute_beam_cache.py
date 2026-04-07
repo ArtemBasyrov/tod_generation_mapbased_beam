@@ -51,10 +51,11 @@ from tod_utils import _compute_dB_threshold_from_power
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-DEFAULT_N_PSI = 720    # 0.5-degree bins; increase for wider beams
+DEFAULT_N_PSI = 720  # 0.5-degree bins; increase for wider beams
 
 
 # ── Rodrigues rotation (beam-frame, around beam_ctr) ──────────────────────────
+
 
 @numba.jit(nopython=True, cache=True, parallel=True)
 def _roll_vectors_jit(vec_orig, beam_ctr, psi_grid, out):
@@ -70,10 +71,12 @@ def _roll_vectors_jit(vec_orig, beam_ctr, psi_grid, out):
     out       : (N_psi, S, 3)   float32  – written in place
     """
     N_psi = psi_grid.shape[0]
-    S     = vec_orig.shape[0]
-    kx = beam_ctr[0]; ky = beam_ctr[1]; kz = beam_ctr[2]
+    S = vec_orig.shape[0]
+    kx = beam_ctr[0]
+    ky = beam_ctr[1]
+    kz = beam_ctr[2]
 
-    for k in numba.prange(N_psi):      # parallel over psi bins
+    for k in numba.prange(N_psi):  # parallel over psi bins
         cp = np.cos(psi_grid[k])
         sp = np.sin(psi_grid[k])
         om = 1.0 - cp
@@ -81,13 +84,14 @@ def _roll_vectors_jit(vec_orig, beam_ctr, psi_grid, out):
             vx = vec_orig[s, 0]
             vy = vec_orig[s, 1]
             vz = vec_orig[s, 2]
-            dkv = kx*vx + ky*vy + kz*vz
-            out[k, s, 0] = vx*cp + (ky*vz - kz*vy)*sp + kx*dkv*om
-            out[k, s, 1] = vy*cp + (kz*vx - kx*vz)*sp + ky*dkv*om
-            out[k, s, 2] = vz*cp + (kx*vy - ky*vx)*sp + kz*dkv*om
+            dkv = kx * vx + ky * vy + kz * vz
+            out[k, s, 0] = vx * cp + (ky * vz - kz * vy) * sp + kx * dkv * om
+            out[k, s, 1] = vy * cp + (kz * vx - kx * vz) * sp + ky * dkv * om
+            out[k, s, 2] = vz * cp + (kx * vy - ky * vx) * sp + kz * dkv * om
 
 
 # ── Angular-offset precomputation (optional Phase 2) ──────────────────────────
+
 
 def _compute_angular_offsets(vec_rolled, beam_ctr):
     """
@@ -128,12 +132,13 @@ def _compute_angular_offsets(vec_rolled, beam_ctr):
     # For a vector v near beam_ctr, parallel-transport gives:
     #   component along e_theta → v[2]
     #   component along e_phi   → v[1]
-    dtheta = vec_rolled[:, :, 2].copy()   # (N_psi, S)
-    dphi   = vec_rolled[:, :, 1].copy()   # (N_psi, S)
+    dtheta = vec_rolled[:, :, 2].copy()  # (N_psi, S)
+    dphi = vec_rolled[:, :, 1].copy()  # (N_psi, S)
     return dtheta.astype(np.float32), dphi.astype(np.float32)
 
 
 # ── Per-beam precomputation ───────────────────────────────────────────────────
+
 
 def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=True):
     """Load one beam file, select pixels by power, and precompute psi-rolled vectors.
@@ -178,18 +183,21 @@ def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=Tru
 
     # ── pixel selection (mirrors prepare_beam_data) ────────────────────────
     dB_cut = _compute_dB_threshold_from_power(pixel_map, power_threshold)
-    sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > dB_cut)
+    sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > dB_cut
     beam_vals = pixel_map[sel].astype(np.float32)
-    norm      = beam_vals.sum()
+    norm = beam_vals.sum()
     if norm != 0:
         beam_vals /= norm
 
     theta_orig = np.pi / 2 - dec
-    vec_orig   = np.stack([
-        np.sin(theta_orig) * np.cos(ra),
-        np.sin(theta_orig) * np.sin(ra),
-        np.cos(theta_orig),
-    ], axis=-1)[sel].astype(np.float32)   # (S, 3)
+    vec_orig = np.stack(
+        [
+            np.sin(theta_orig) * np.cos(ra),
+            np.sin(theta_orig) * np.sin(ra),
+            np.cos(theta_orig),
+        ],
+        axis=-1,
+    )[sel].astype(np.float32)  # (S, 3)
 
     S = vec_orig.shape[0]
     print(f"    {S} selected pixels", flush=True)
@@ -198,16 +206,37 @@ def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=Tru
     # Centre pixel is computed from the grid shape, matching load_beam() and
     # precompute_rotation_vector_batch().
     center_idx = (ra.shape[0] // 2, ra.shape[1] // 2)
-    phi_c   = float(ra [center_idx])
-    th_c    = float(np.pi / 2 - dec[center_idx])
-    beam_ctr = np.array([
-        np.sin(th_c) * np.cos(phi_c),
-        np.sin(th_c) * np.sin(phi_c),
-        np.cos(th_c),
-    ], dtype=np.float32)
+    phi_c = float(ra[center_idx])
+    th_c = float(np.pi / 2 - dec[center_idx])
+    beam_ctr = np.array(
+        [
+            np.sin(th_c) * np.cos(phi_c),
+            np.sin(th_c) * np.sin(phi_c),
+            np.cos(th_c),
+        ],
+        dtype=np.float32,
+    )
     # ra/dec offsets are already centred, so beam_ctr = [1, 0, 0].
-    assert np.allclose(beam_ctr, [1., 0., 0.], atol=1e-4), (
-        f"Unexpected beam_ctr {beam_ctr} — check that load_beam() centres the grid correctly")
+    # Tolerance: half a beam pixel (angular spacing from adjacent grid cells).
+    _pixel_scale = 0.5 * max(
+        abs(
+            float(
+                ra[center_idx[0], min(center_idx[1] + 1, ra.shape[1] - 1)]
+                - ra[center_idx]
+            )
+        ),
+        abs(
+            float(
+                dec[min(center_idx[0] + 1, dec.shape[0] - 1), center_idx[1]]
+                - dec[center_idx]
+            )
+        ),
+        1e-8,  # floor: avoid zero tolerance on degenerate grids
+    )
+    assert np.allclose(beam_ctr, [1.0, 0.0, 0.0], atol=_pixel_scale), (
+        f"Unexpected beam_ctr {beam_ctr} (tol={_pixel_scale:.2e} rad) — "
+        f"check that load_beam() centres the grid correctly"
+    )
 
     # ── psi grid ──────────────────────────────────────────────────────────
     # Cover the full circle; psi outside [0, 2π] wraps via modulo at runtime.
@@ -228,25 +257,32 @@ def precompute_beam(bf, folder_beam, n_psi, power_threshold, compute_offsets=Tru
     dt = time.perf_counter() - t0
 
     mem_mb = vec_rolled.nbytes / 1e6
-    print(f"    vec_rolled: {n_psi} × {S} × 3  =  {mem_mb:.1f} MB  ({dt:.2f}s)", flush=True)
+    print(
+        f"    vec_rolled: {n_psi} × {S} × 3  =  {mem_mb:.1f} MB  ({dt:.2f}s)",
+        flush=True,
+    )
 
     result = dict(
-        psi_grid   = psi_grid,
-        vec_rolled = vec_rolled,
-        beam_vals  = beam_vals,
-        beam_ctr   = beam_ctr,
+        psi_grid=psi_grid,
+        vec_rolled=vec_rolled,
+        beam_vals=beam_vals,
+        beam_ctr=beam_ctr,
     )
 
     if compute_offsets:
         dtheta, dphi = _compute_angular_offsets(vec_rolled, beam_ctr)
-        result['dtheta'] = dtheta   # (N_psi, S)  flat-sky colatitude offsets
-        result['dphi']   = dphi     # (N_psi, S)  flat-sky phi offsets (raw)
-        print(f"    angular offsets: max |dtheta|={np.max(np.abs(dtheta)):.4f} rad", flush=True)
+        result["dtheta"] = dtheta  # (N_psi, S)  flat-sky colatitude offsets
+        result["dphi"] = dphi  # (N_psi, S)  flat-sky phi offsets (raw)
+        print(
+            f"    angular offsets: max |dtheta|={np.max(np.abs(dtheta)):.4f} rad",
+            flush=True,
+        )
 
     return result
 
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
+
 
 def _cache_filename(bf, output_dir, n_psi):
     """Return the .npz cache path for a given beam filename.
@@ -292,6 +328,7 @@ def _load_cache(path):
 
 # ── Runtime helper (used by main TOD script) ──────────────────────────────────
 
+
 def _lookup_psi_bin(psi_values, psi_grid):
     """Map psi angles to the nearest bin index in an evenly-spaced psi grid.
 
@@ -309,7 +346,7 @@ def _lookup_psi_bin(psi_values, psi_grid):
             Values are in ``[0, N_psi)``.
     """
     n_psi = len(psi_grid)
-    dpsi  = 2 * np.pi / n_psi
+    dpsi = 2 * np.pi / n_psi
     # Wrap to [0, 2π) then divide by bin width
     psi_wrapped = np.mod(psi_values, 2 * np.pi)
     return np.round(psi_wrapped / dpsi).astype(np.int64) % n_psi
@@ -317,14 +354,26 @@ def _lookup_psi_bin(psi_values, psi_grid):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(description="Precompute beam psi-roll cache")
-    parser.add_argument("--n_psi",     type=int,  default=DEFAULT_N_PSI,
-                        help="Number of psi bins (default: %(default)s)")
-    parser.add_argument("--output_dir", type=str, default=None,
-                        help="Where to write .npz files (default: FOLDER_BEAM)")
-    parser.add_argument("--no_offsets", action="store_true",
-                        help="Skip flat-sky angular-offset precomputation (Phase 2)")
+    parser.add_argument(
+        "--n_psi",
+        type=int,
+        default=DEFAULT_N_PSI,
+        help="Number of psi bins (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Where to write .npz files (default: FOLDER_BEAM)",
+    )
+    parser.add_argument(
+        "--no_offsets",
+        action="store_true",
+        help="Skip flat-sky angular-offset precomputation (Phase 2)",
+    )
     args = parser.parse_args()
 
     output_dir = args.output_dir or config.FOLDER_BEAM
@@ -353,9 +402,9 @@ def main():
         cache = precompute_beam(
             bf,
             config.FOLDER_BEAM,
-            n_psi             = args.n_psi,
-            power_threshold   = beam_threshold_map[bf],
-            compute_offsets   = not args.no_offsets,
+            n_psi=args.n_psi,
+            power_threshold=beam_threshold_map[bf],
+            compute_offsets=not args.no_offsets,
         )
         _save_cache(cache, out_path)
         print()

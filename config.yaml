@@ -58,3 +58,7 @@
   # calibration picks the fastest (tail_fraction, n_clusters) pair whose
   # B_ell divergence does not exceed this value.
   clustering_error_threshold: 1.0e-5
+  # Multiprocessing start method: 'spawn' (safe, default) or 'fork' (faster on Linux).
+  # 'fork' avoids re-running Numba JIT compilation in each worker but may deadlock
+  # on macOS. Only change this if you have verified it is safe on your platform.
+  mp_start_method: 'spawn'

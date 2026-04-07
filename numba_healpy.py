@@ -24,20 +24,22 @@ _gather_ring_stencil_jit — fast Keys/Catmull-Rom stencil gather via ring walk.
                            Replaces _query_disc_into_jit in the bicubic hot loop,
                            eliminating the ~9 acos calls per (b,s) element.
 """
+
 import math
 import numpy as np
 import numba
 
 # Module-level float64 constants captured by Numba as compile-time literals.
-_TWO_PI      = 2.0 * math.pi
-_INV_TWO_PI  = 1.0 / _TWO_PI
-_TWO_THIRDS  = 2.0 / 3.0          # HEALPix polar-cap / equatorial boundary
+_TWO_PI = 2.0 * math.pi
+_INV_TWO_PI = 1.0 / _TWO_PI
+_TWO_THIRDS = 2.0 / 3.0  # HEALPix polar-cap / equatorial boundary
 
 
 # ── HEALPix RING-scheme helpers (nopython, no parallel) ───────────────────────
 # These three functions mirror the HEALPix C++ internals for get_interpol.
 # They must NOT carry parallel=True because they are called from within a
 # prange body inside _get_interp_weights_jit.
+
 
 @numba.jit(nopython=True, cache=True)
 def _ring_above_jit(nside, z):
@@ -49,12 +51,12 @@ def _ring_above_jit(nside, z):
     pole); the caller is responsible for clamping as needed.
     """
     az = abs(z)
-    if az > _TWO_THIRDS:                          # polar cap
+    if az > _TWO_THIRDS:  # polar cap
         tp = nside * math.sqrt(3.0 * (1.0 - az))
-        ir = int(tp)                              # floor for tp >= 0
+        ir = int(tp)  # floor for tp >= 0
         if z < 0.0:
-            ir = 4 * nside - ir - 1              # south-cap mirror
-    else:                                         # equatorial belt
+            ir = 4 * nside - ir - 1  # south-cap mirror
+    else:  # equatorial belt
         ir = int(nside * (2.0 - 1.5 * z))
     return ir
 
@@ -71,20 +73,20 @@ def _ring_info_jit(nside, ir, npix_total):
     phi0      : float  longitude of the first pixel [rad]
     dphi      : float  pixel angular spacing [rad]
     """
-    if ir < nside:                                # north polar cap
-        n_pix     = 4 * ir
+    if ir < nside:  # north polar cap
+        n_pix = 4 * ir
         first_pix = 2 * ir * (ir - 1)
-        s         = 1                             # always shifted
-    elif ir <= 3 * nside:                         # equatorial belt
-        n_pix     = 4 * nside
+        s = 1  # always shifted
+    elif ir <= 3 * nside:  # equatorial belt
+        n_pix = 4 * nside
         first_pix = 2 * nside * (nside - 1) + (ir - nside) * 4 * nside
         # shifted when (ir - nside) is EVEN — matches HEALPix C++ get_ring_info_small
-        s         = 1 if (ir - nside) % 2 == 0 else 0
-    else:                                         # south polar cap
-        i2        = 4 * nside - ir
-        n_pix     = 4 * i2
+        s = 1 if (ir - nside) % 2 == 0 else 0
+    else:  # south polar cap
+        i2 = 4 * nside - ir
+        n_pix = 4 * i2
         first_pix = npix_total - 2 * i2 * (i2 + 1)
-        s         = 1                             # always shifted
+        s = 1  # always shifted
     dphi = _TWO_PI / n_pix
     phi0 = s * dphi * 0.5
     return n_pix, first_pix, phi0, dphi
@@ -104,6 +106,7 @@ def _ring_z_jit(nside, ir):
 
 
 # ── Standalone parallel interp-weights kernel ─────────────────────────────────
+
 
 @numba.jit(nopython=True, parallel=True, cache=True)
 def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
@@ -129,9 +132,9 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
     N = theta_arr.shape[0]
     for i in numba.prange(N):
         theta = theta_arr[i]
-        phi   = phi_arr[i]
+        phi = phi_arr[i]
 
-        z        = math.cos(theta)
+        z = math.cos(theta)
         ir_above = _ring_above_jit(nside, z)
         ir_below = ir_above + 1
 
@@ -140,21 +143,21 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             # Point is north of ring 1.  Use ring 1 for all pixel selection;
             # the "above" pair are the two opposite pixels in ring 1 (shift +2).
             na, fpa, phi0a, dphia = _ring_info_jit(nside, 1, npix_total)
-            tw   = ((phi - phi0a) / dphia) % float(na)
-            ip   = int(tw)
+            tw = ((phi - phi0a) / dphia) % float(na)
+            ip = int(tw)
             frac = tw - ip
-            ip2  = (ip + 1) % na
+            ip2 = (ip + 1) % na
             # "below" pixels: the two straddling ring-1 neighbours
             p2 = fpa + ip
             p3 = fpa + ip2
             # "above" pixels: opposite pixels (shifted by na/2 = 2 for ring 1)
-            p0 = (ip  + 2) % na          # fpa = 0 for ring 1
+            p0 = (ip + 2) % na  # fpa = 0 for ring 1
             p1 = (ip2 + 2) % na
             # theta weight: theta1 = 0 at north pole → w = theta / theta2
-            za      = _ring_z_jit(nside, 1)
-            ta      = math.acos(za)
+            za = _ring_z_jit(nside, 1)
+            ta = math.acos(za)
             w_theta = theta / ta
-            nf      = (1.0 - w_theta) * 0.25   # north_factor (equal spread)
+            nf = (1.0 - w_theta) * 0.25  # north_factor (equal spread)
             pix_out[0, i] = p0
             pix_out[1, i] = p1
             pix_out[2, i] = p2
@@ -162,7 +165,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             wgt_out[0, i] = nf
             wgt_out[1, i] = nf
             wgt_out[2, i] = (1.0 - frac) * w_theta + nf
-            wgt_out[3, i] = frac          * w_theta + nf
+            wgt_out[3, i] = frac * w_theta + nf
 
         elif ir_below == 4 * nside:
             # ── South-pole boundary ───────────────────────────────────────────
@@ -170,27 +173,27 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             # all pixel selection; the "below" pair are the two opposite pixels.
             ir_last = 4 * nside - 1
             na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_last, npix_total)
-            tw   = ((phi - phi0a) / dphia) % float(na)
-            ip   = int(tw)
+            tw = ((phi - phi0a) / dphia) % float(na)
+            ip = int(tw)
             frac = tw - ip
-            ip2  = (ip + 1) % na
+            ip2 = (ip + 1) % na
             # "above" pixels: normal ring ir_last neighbours
             p0 = fpa + ip
             p1 = fpa + ip2
             # "below" pixels: opposite pixels in the same 4-pixel last ring
-            p2 = (ip  + 2) % na + fpa
+            p2 = (ip + 2) % na + fpa
             p3 = (ip2 + 2) % na + fpa
             # theta weight toward south pole
-            za            = _ring_z_jit(nside, ir_last)
-            ta            = math.acos(za)
+            za = _ring_z_jit(nside, ir_last)
+            ta = math.acos(za)
             w_theta_south = (theta - ta) / (math.pi - ta)
-            sf            = w_theta_south * 0.25           # south_factor
+            sf = w_theta_south * 0.25  # south_factor
             pix_out[0, i] = p0
             pix_out[1, i] = p1
             pix_out[2, i] = p2
             pix_out[3, i] = p3
             wgt_out[0, i] = (1.0 - frac) * (1.0 - w_theta_south) + sf
-            wgt_out[1, i] = frac          * (1.0 - w_theta_south) + sf
+            wgt_out[1, i] = frac * (1.0 - w_theta_south) + sf
             wgt_out[2, i] = sf
             wgt_out[3, i] = sf
 
@@ -205,7 +208,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
 
             # Ring above → pixels 0, 1
             na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_above, npix_total)
-            tw    = ((phi - phi0a) / dphia) % float(na)
+            tw = ((phi - phi0a) / dphia) % float(na)
             iphia = int(tw)
             fphia = tw - iphia
             pix_out[0, i] = fpa + iphia
@@ -215,7 +218,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
 
             # Ring below → pixels 2, 3
             nb, fpb, phi0b, dphib = _ring_info_jit(nside, ir_below, npix_total)
-            tw    = ((phi - phi0b) / dphib) % float(nb)
+            tw = ((phi - phi0b) / dphib) % float(nb)
             iphib = int(tw)
             fphib = tw - iphib
             pix_out[2, i] = fpb + iphib
@@ -232,9 +235,9 @@ def get_interp_weights_numba(nside, theta, phi):
     ``float64``, identical to the healpy convention.  Input arrays are
     automatically cast to float64 and ravelled.
     """
-    theta   = np.asarray(theta, dtype=np.float64).ravel()
-    phi     = np.asarray(phi,   dtype=np.float64).ravel()
-    N       = theta.shape[0]
+    theta = np.asarray(theta, dtype=np.float64).ravel()
+    phi = np.asarray(phi, dtype=np.float64).ravel()
+    N = theta.shape[0]
     pix_out = np.empty((4, N), dtype=np.int64)
     wgt_out = np.empty((4, N), dtype=np.float64)
     _get_interp_weights_jit(nside, theta, phi, pix_out, wgt_out)
@@ -242,6 +245,7 @@ def get_interp_weights_numba(nside, theta, phi):
 
 
 # ── HEALPix pix2ang (RING scheme, scalar) ────────────────────────────────────
+
 
 @numba.jit(nopython=True, cache=True)
 def _pix2ang_ring_jit(nside, pix):
@@ -264,29 +268,29 @@ def _pix2ang_ring_jit(nside, pix):
     phi   : float  longitude  [rad]
     """
     npix = 12 * nside * nside
-    ncap = 2 * nside * (nside - 1)   # pixels in north polar cap
+    ncap = 2 * nside * (nside - 1)  # pixels in north polar cap
 
-    if pix < ncap:                    # ── north polar cap ──
+    if pix < ncap:  # ── north polar cap ──
         # Ring iring (1-based) starts at pixel 2*iring*(iring-1).
         iring = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * pix)))
         ip_in = pix - 2 * iring * (iring - 1)
 
-    elif pix < npix - ncap:           # ── equatorial belt ──
-        ip    = pix - ncap
+    elif pix < npix - ncap:  # ── equatorial belt ──
+        ip = pix - ncap
         iring = ip // (4 * nside) + nside
         ip_in = ip % (4 * nside)
 
-    else:                             # ── south polar cap ──
+    else:  # ── south polar cap ──
         # ip_s counts from the south-pole end (pix=npix-1 → ip_s=0).
-        ip_s      = npix - pix - 1
-        iring_s   = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * ip_s)))
-        iring     = 4 * nside - iring_s
-        first_s   = npix - 2 * iring_s * (iring_s + 1)
-        ip_in     = pix - first_s
+        ip_s = npix - pix - 1
+        iring_s = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * ip_s)))
+        iring = 4 * nside - iring_s
+        first_s = npix - 2 * iring_s * (iring_s + 1)
+        ip_in = pix - first_s
 
     _n, _fp, phi0, dphi = _ring_info_jit(nside, iring, npix)
-    phi   = phi0 + ip_in * dphi
-    z     = _ring_z_jit(nside, iring)
+    phi = phi0 + ip_in * dphi
+    z = _ring_z_jit(nside, iring)
     return math.acos(z), phi
 
 
@@ -305,19 +309,19 @@ def _pix2zphi_ring_jit(nside, pix):
         iring = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * pix)))
         ip_in = pix - 2 * iring * (iring - 1)
     elif pix < npix - ncap:
-        ip    = pix - ncap
+        ip = pix - ncap
         iring = ip // (4 * nside) + nside
         ip_in = ip % (4 * nside)
     else:
-        ip_s    = npix - pix - 1
+        ip_s = npix - pix - 1
         iring_s = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * ip_s)))
-        iring   = 4 * nside - iring_s
+        iring = 4 * nside - iring_s
         first_s = npix - 2 * iring_s * (iring_s + 1)
-        ip_in   = pix - first_s
+        ip_in = pix - first_s
 
     _n, _fp, phi0, dphi_r = _ring_info_jit(nside, iring, npix)
     phi = phi0 + ip_in * dphi_r
-    z   = _ring_z_jit(nside, iring)
+    z = _ring_z_jit(nside, iring)
     return z, phi
 
 
@@ -337,15 +341,16 @@ def pix2ang_numba(nside, pix, nest=False):
     """
     if nest:
         raise ValueError("pix2ang_numba only supports nest=False (RING scheme)")
-    pix_arr   = np.asarray(pix, dtype=np.int64).ravel()
-    N         = pix_arr.shape[0]
+    pix_arr = np.asarray(pix, dtype=np.int64).ravel()
+    N = pix_arr.shape[0]
     theta_out = np.empty(N, dtype=np.float64)
-    phi_out   = np.empty(N, dtype=np.float64)
+    phi_out = np.empty(N, dtype=np.float64)
     _pix2ang_ring_batch(nside, pix_arr, theta_out, phi_out)
     return theta_out, phi_out
 
 
 # ── HEALPix ang2pix (RING scheme, scalar) ────────────────────────────────────
+
 
 @numba.jit(nopython=True, cache=True)
 def _ang2pix_ring_jit(nside, theta, phi):
@@ -366,8 +371,8 @@ def _ang2pix_ring_jit(nside, theta, phi):
        the one with the maximum cos(angular distance).
     """
     npix_total = 12 * nside * nside
-    z     = math.cos(theta)
-    phi_w = phi % _TWO_PI   # wrap to [0, 2π)
+    z = math.cos(theta)
+    phi_w = phi % _TWO_PI  # wrap to [0, 2π)
 
     # ── Two candidate global rings bracketing z ───────────────────────────────
     ir_above = _ring_above_jit(nside, z)
@@ -380,15 +385,15 @@ def _ang2pix_ring_jit(nside, theta, phi):
 
     # ── For each candidate ring find the best-phi pixel ───────────────────────
     best_pix = -1
-    best_cos = -2.0   # maximise cos(angular_dist) ≡ minimise distance
-    sin_th   = math.sin(theta)
-    cos_th   = z
+    best_cos = -2.0  # maximise cos(angular_dist) ≡ minimise distance
+    sin_th = math.sin(theta)
+    cos_th = z
 
     for ir_g in (ir_above, ir_below):
         if ir_g < 1 or ir_g > 4 * nside - 1:
             continue
         n_pix, first_pix, phi0, dphi = _ring_info_jit(nside, ir_g, npix_total)
-        z_c     = _ring_z_jit(nside, ir_g)
+        z_c = _ring_z_jit(nside, ir_g)
         sin_z_c = math.sqrt(max(0.0, 1.0 - z_c * z_c))
         # Nearest pixel in phi: Voronoi boundary at multiples of dphi.
         ip_base = int(phi_w * n_pix / _TWO_PI) % n_pix
@@ -403,6 +408,7 @@ def _ang2pix_ring_jit(nside, theta, phi):
 
 
 # ── HEALPix query_disc (RING scheme) ─────────────────────────────────────────
+
 
 @numba.jit(nopython=True, cache=True)
 def _query_disc_jit(nside, theta_q, phi_q, radius_rad, inclusive):
@@ -438,8 +444,8 @@ def _query_disc_jit(nside, theta_q, phi_q, radius_rad, inclusive):
     result : (M,) int64  RING pixel indices inside the disc
     """
     npix_total = 12 * nside * nside
-    z_q        = math.cos(theta_q)
-    sin_th_q   = math.sqrt(max(0.0, 1.0 - z_q * z_q))
+    z_q = math.cos(theta_q)
+    sin_th_q = math.sqrt(max(0.0, 1.0 - z_q * z_q))
 
     # Approximate max pixel angular radius: sqrt(π / (3·nside²))
     if inclusive:
@@ -453,10 +459,10 @@ def _query_disc_jit(nside, theta_q, phi_q, radius_rad, inclusive):
     cos_search = math.cos(search_rad)
 
     # Ring-index band whose z-centres intersect the widened disc.
-    theta_lo = max(0.0,       theta_q - search_rad)
-    theta_hi = min(math.pi,   theta_q + search_rad)
-    ir_min   = max(1,             _ring_above_jit(nside, math.cos(theta_lo)) + 1)
-    ir_max   = min(4 * nside - 1, _ring_above_jit(nside, math.cos(theta_hi)))
+    theta_lo = max(0.0, theta_q - search_rad)
+    theta_hi = min(math.pi, theta_q + search_rad)
+    ir_min = max(1, _ring_above_jit(nside, math.cos(theta_lo)) + 1)
+    ir_max = min(4 * nside - 1, _ring_above_jit(nside, math.cos(theta_hi)))
 
     if ir_min > ir_max:
         return np.empty(0, dtype=np.int64)
@@ -467,10 +473,10 @@ def _query_disc_jit(nside, theta_q, phi_q, radius_rad, inclusive):
         max_pix = npix_total
 
     result = np.empty(max_pix, dtype=np.int64)
-    count  = 0
+    count = 0
 
     for ir in range(ir_min, ir_max + 1):
-        z_r      = _ring_z_jit(nside, ir)
+        z_r = _ring_z_jit(nside, ir)
         sin_th_r = math.sqrt(max(0.0, 1.0 - z_r * z_r))
         n_p, fp, phi0, dphi = _ring_info_jit(nside, ir, npix_total)
 
@@ -486,9 +492,9 @@ def _query_disc_jit(nside, theta_q, phi_q, radius_rad, inclusive):
         #   cos(d) = sin(θ_q)·sin(θ_r)·cos(Δφ) + cos(θ_q)·cos(θ_r) = cos(search_rad)
         x = (cos_search - z_q * z_r) / denom
         if x > 1.0:
-            continue                   # ring too far from disc centre
+            continue  # ring too far from disc centre
         if x <= -1.0:
-            for ip in range(n_p):      # entire ring inside disc
+            for ip in range(n_p):  # entire ring inside disc
                 result[count] = fp + ip
                 count += 1
             continue
@@ -496,8 +502,10 @@ def _query_disc_jit(nside, theta_q, phi_q, radius_rad, inclusive):
         dphi_half = math.acos(x)
 
         # Pixel-index range within ring (may be negative or > n_p, handled by %).
-        ip_lo = int(math.ceil( (phi_q - dphi_half - phi0) / dphi - 1e-10))
-        ip_hi = int(math.floor((phi_q + dphi_half - phi0) / dphi + 1e-10))
+        # Exact ceil/floor — no fudge factor needed since the disc test already
+        # has a small tolerance and boundary-exact pixels are not science-critical.
+        ip_lo = int(math.ceil((phi_q - dphi_half - phi0) / dphi))
+        ip_hi = int(math.floor((phi_q + dphi_half - phi0) / dphi))
 
         if ip_hi - ip_lo + 1 >= n_p:
             for ip in range(n_p):
@@ -531,8 +539,8 @@ def _query_disc_into_jit(nside, theta_q, phi_q, radius_rad, inclusive, out_buf):
     M : int  number of pixels written into out_buf[:M]
     """
     npix_total = 12 * nside * nside
-    z_q        = math.cos(theta_q)
-    sin_th_q   = math.sqrt(max(0.0, 1.0 - z_q * z_q))
+    z_q = math.cos(theta_q)
+    sin_th_q = math.sqrt(max(0.0, 1.0 - z_q * z_q))
 
     if inclusive:
         search_rad = radius_rad + math.sqrt(math.pi / (3.0 * nside * nside))
@@ -546,10 +554,10 @@ def _query_disc_into_jit(nside, theta_q, phi_q, radius_rad, inclusive, out_buf):
 
     cos_search = math.cos(search_rad)
 
-    theta_lo = max(0.0,      theta_q - search_rad)
-    theta_hi = min(math.pi,  theta_q + search_rad)
-    ir_min   = max(1,             _ring_above_jit(nside, math.cos(theta_lo)) + 1)
-    ir_max   = min(4 * nside - 1, _ring_above_jit(nside, math.cos(theta_hi)))
+    theta_lo = max(0.0, theta_q - search_rad)
+    theta_hi = min(math.pi, theta_q + search_rad)
+    ir_min = max(1, _ring_above_jit(nside, math.cos(theta_lo)) + 1)
+    ir_max = min(4 * nside - 1, _ring_above_jit(nside, math.cos(theta_hi)))
 
     if ir_min > ir_max:
         return 0
@@ -557,7 +565,7 @@ def _query_disc_into_jit(nside, theta_q, phi_q, radius_rad, inclusive, out_buf):
     count = 0
 
     for ir in range(ir_min, ir_max + 1):
-        z_r      = _ring_z_jit(nside, ir)
+        z_r = _ring_z_jit(nside, ir)
         sin_th_r = math.sqrt(max(0.0, 1.0 - z_r * z_r))
         n_p, fp, phi0, dphi = _ring_info_jit(nside, ir, npix_total)
 
@@ -579,7 +587,7 @@ def _query_disc_into_jit(nside, theta_q, phi_q, radius_rad, inclusive, out_buf):
 
         dphi_half = math.acos(x)
 
-        ip_lo = int(math.ceil( (phi_q - dphi_half - phi0) / dphi - 1e-10))
+        ip_lo = int(math.ceil((phi_q - dphi_half - phi0) / dphi - 1e-10))
         ip_hi = int(math.floor((phi_q + dphi_half - phi0) / dphi + 1e-10))
 
         if ip_hi - ip_lo + 1 >= n_p:
@@ -653,20 +661,20 @@ def _gather_ring_stencil_jit(nside, vz, ph, out_buf, z_buf, phi_buf):
     # ±2.4 h_pix > 2, so only rings ±1 and ±2 ever contribute there.  Gathering
     # ring ±4 forces the inner loop to compute coordinates for 10 always-zero-
     # weight candidates.  Using ±3 eliminates those 10 wasted iterations entirely.
-    ir_lo = max(1,             ir_center - 3)
+    ir_lo = max(1, ir_center - 3)
     ir_hi = min(4 * nside - 1, ir_center + 3)
 
     count = 0
     for ir in range(ir_lo, ir_hi + 1):
         n_p, fp, phi0, dphi = _ring_info_jit(nside, ir, npix_total)
-        z_ring = _ring_z_jit(nside, ir)   # cos(θ) for this ring — computed once
+        z_ring = _ring_z_jit(nside, ir)  # cos(θ) for this ring — computed once
 
         if n_p <= 4:
             # ir = 1 at any nside: only 4 pixels in the ring.
             # ±2 wrapping would repeat pixel indices, so include all directly.
             for ip in range(n_p):
                 out_buf[count] = fp + ip
-                z_buf[count]   = z_ring
+                z_buf[count] = z_ring
                 phi_buf[count] = phi0 + ip * dphi
                 count += 1
         else:
@@ -675,7 +683,7 @@ def _gather_ring_stencil_jit(nside, vz, ph, out_buf, z_buf, phi_buf):
             for dip in range(-2, 3):
                 ip_in = (ip_center + dip) % n_p
                 out_buf[count] = fp + ip_in
-                z_buf[count]   = z_ring
+                z_buf[count] = z_ring
                 phi_buf[count] = phi0 + ip_in * dphi
                 count += 1
 
@@ -701,8 +709,8 @@ def query_disc_numba(nside, vec, radius_rad, inclusive=True, nest=False):
     """
     if nest:
         raise ValueError("query_disc_numba only supports nest=False (RING scheme)")
-    v         = np.asarray(vec, dtype=np.float64).ravel()
-    z         = float(np.clip(v[2], -1.0, 1.0))
-    theta_q   = math.acos(z)
-    phi_q     = math.atan2(float(v[1]), float(v[0])) % _TWO_PI
+    v = np.asarray(vec, dtype=np.float64).ravel()
+    z = float(np.clip(v[2], -1.0, 1.0))
+    theta_q = math.acos(z)
+    phi_q = math.atan2(float(v[1]), float(v[0])) % _TWO_PI
     return _query_disc_jit(nside, theta_q, phi_q, float(radius_rad), bool(inclusive))

@@ -8,37 +8,43 @@ import numpy as np
 import healpy as hp
 
 import tod_config as config
-from tod_io              import load_beam, load_scan_information, open_scan_day
-from tod_core            import precompute_rotation_vector_batch, beam_tod_batch
-from tod_calibrate       import _calibrate_n_processes, calibrate_beam_clustering
-from tod_utils           import _get_ncpus, _fmt_time, _should_print_batch, _compute_dB_threshold_from_power
+from tod_io import load_beam, load_scan_information, open_scan_day
+from tod_core import precompute_rotation_vector_batch, beam_tod_batch
+from tod_calibrate import _calibrate_n_processes, calibrate_beam_clustering
+from tod_utils import (
+    _get_ncpus,
+    _fmt_time,
+    _should_print_batch,
+    _compute_dB_threshold_from_power,
+)
 from precompute_beam_cache import _cache_filename, _load_cache
-from beam_cluster        import cluster_beam_pixels, cluster_cached_arrays
+from beam_cluster import cluster_beam_pixels, cluster_cached_arrays
 
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-folder_beam          = config.FOLDER_BEAM
-folder_scan          = config.FOLDER_SCAN
-folder_tod_output    = config.FOLDER_TOD_OUTPUT
-beam_files           = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
+folder_beam = config.FOLDER_BEAM
+folder_scan = config.FOLDER_SCAN
+folder_tod_output = config.FOLDER_TOD_OUTPUT
+beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
 start_day = config.start_day
-end_day   = config.end_day
+end_day = config.end_day
 
-interp_mode          = config.beam_interp_method
-interp_sigma_deg     = config.beam_interp_sigma_deg
-interp_radius_deg    = config.beam_interp_radius_deg
+interp_mode = config.beam_interp_method
+interp_sigma_deg = config.beam_interp_sigma_deg
+interp_radius_deg = config.beam_interp_radius_deg
 
 # ── Worker-global state (populated by _worker_init in each spawned process) ───
 # MP is loaded in the parent, placed in shared memory, and attached here
 # read-only by each worker — no copies, no re-loading the FITS file.
-_g_mp          = None   # list of 3 float32 arrays (views into shared memory)
-_g_beam_data   = None   # beam_data dict with mp_stacked from shared memory
-_g_shm_handles = []     # SharedMemory handles kept alive for worker lifetime
+_g_mp = None  # list of 3 float32 arrays (views into shared memory)
+_g_beam_data = None  # beam_data dict with mp_stacked from shared memory
+_g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
 
 
 # ── Pool initialiser ─────────────────────────────────────────────────────────
+
 
 def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
     """
@@ -64,31 +70,34 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
     global _g_mp, _g_beam_data, _g_shm_handles
 
     # Attach to the stacked (3, npix) sky-map block
-    shm_mp = SharedMemory(name=mp_desc['name'])
-    _g_shm_handles.append(shm_mp)                      # keep alive
-    mp_full = np.ndarray(mp_desc['shape'], dtype=mp_desc['dtype'], buffer=shm_mp.buf)
-    _g_mp = [mp_full[i] for i in range(mp_desc['shape'][0])]   # list of 3 views
+    shm_mp = SharedMemory(name=mp_desc["name"])
+    _g_shm_handles.append(shm_mp)  # keep alive
+    mp_full = np.ndarray(mp_desc["shape"], dtype=mp_desc["dtype"], buffer=shm_mp.buf)
+    _g_mp = [mp_full[i] for i in range(mp_desc["shape"][0])]  # list of 3 views
 
     # Attach to each beam entry's mp_stacked block, then attach any
     # beam-cache arrays (vec_rolled, dtheta, dphi) from their own blocks.
     _g_beam_data = {}
     for bf, static in beam_data_static.items():
         desc = beam_shm_descs[bf]
-        shm  = SharedMemory(name=desc['name'])
+        shm = SharedMemory(name=desc["name"])
         _g_shm_handles.append(shm)
-        ms = np.ndarray(desc['shape'], dtype=desc['dtype'], buffer=shm.buf)
+        ms = np.ndarray(desc["shape"], dtype=desc["dtype"], buffer=shm.buf)
         entry = dict(static)
-        entry['mp_stacked'] = ms
+        entry["mp_stacked"] = ms
 
         for key, cdesc in cache_shm_descs.get(bf, {}).items():
-            cshm = SharedMemory(name=cdesc['name'])
+            cshm = SharedMemory(name=cdesc["name"])
             _g_shm_handles.append(cshm)
-            entry[key] = np.ndarray(cdesc['shape'], dtype=cdesc['dtype'], buffer=cshm.buf)
+            entry[key] = np.ndarray(
+                cdesc["shape"], dtype=cdesc["dtype"], buffer=cshm.buf
+            )
 
         _g_beam_data[bf] = entry
 
 
 # ── Beam preparation ──────────────────────────────────────────────────────────
+
 
 def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
     """Load and preprocess all unique beam files into a beam-data dictionary.
@@ -148,24 +157,30 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
         ra, dec, pixel_map = load_beam(folder_beam, bf)
 
         db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
-        sel       = (10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut)
+        sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
         beam_vals = pixel_map[sel].astype(np.float32)
-        norm      = beam_vals.sum()
+        norm = beam_vals.sum()
         if norm != 0:
             beam_vals /= norm
 
-        theta_orig = np.pi/2 - dec
-        vec_orig   = np.stack([np.sin(theta_orig) * np.cos(ra),
-                               np.sin(theta_orig) * np.sin(ra),
-                               np.cos(theta_orig)], axis=-1)[sel].astype(np.float32)
+        theta_orig = np.pi / 2 - dec
+        vec_orig = np.stack(
+            [
+                np.sin(theta_orig) * np.cos(ra),
+                np.sin(theta_orig) * np.sin(ra),
+                np.cos(theta_orig),
+            ],
+            axis=-1,
+        )[sel].astype(np.float32)
 
         beam_data[bf] = {
-            'ra': ra, 'dec': dec,
-            'beam_vals': beam_vals,
-            'sel': sel,
-            'comp_indices': comp_indices,
-            'n_sel': int(sel.sum()),
-            'vec_orig': vec_orig,
+            "ra": ra,
+            "dec": dec,
+            "beam_vals": beam_vals,
+            "sel": sel,
+            "comp_indices": comp_indices,
+            "n_sel": int(sel.sum()),
+            "vec_orig": vec_orig,
         }
         print(f"  Beam {bf}: {sel.sum()} selected pixels")
 
@@ -173,18 +188,22 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
             cache_path = _cache_filename(bf, cache_dir, cache_n_psi)
             if os.path.exists(cache_path):
                 cache = _load_cache(cache_path)
-                beam_data[bf]['vec_rolled'] = cache['vec_rolled']  # (N_psi, S, 3)
-                beam_data[bf]['psi_grid']   = cache['psi_grid']    # (N_psi,)
+                beam_data[bf]["vec_rolled"] = cache["vec_rolled"]  # (N_psi, S, 3)
+                beam_data[bf]["psi_grid"] = cache["psi_grid"]  # (N_psi,)
                 mode = "single-Rodrigues"
-                if 'dtheta' in cache and 'dphi' in cache:
-                    beam_data[bf]['dtheta'] = cache['dtheta']      # (N_psi, S)
-                    beam_data[bf]['dphi']   = cache['dphi']        # (N_psi, S)
+                if "dtheta" in cache and "dphi" in cache:
+                    beam_data[bf]["dtheta"] = cache["dtheta"]  # (N_psi, S)
+                    beam_data[bf]["dphi"] = cache["dphi"]  # (N_psi, S)
                     mode = "flat-sky (both rotations skipped)"
-                print(f"    Beam cache loaded: {cache_path}  "
-                      f"(N_psi={len(cache['psi_grid'])}, S={cache['vec_rolled'].shape[1]}, "
-                      f"mode={mode})")
+                print(
+                    f"    Beam cache loaded: {cache_path}  "
+                    f"(N_psi={len(cache['psi_grid'])}, S={cache['vec_rolled'].shape[1]}, "
+                    f"mode={mode})"
+                )
             else:
-                print(f"    [warn] Beam cache not found: {cache_path} — using exact double Rodrigues")
+                print(
+                    f"    [warn] Beam cache not found: {cache_path} — using exact double Rodrigues"
+                )
 
     return beam_data
 
@@ -204,14 +223,17 @@ def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
         tail_fraction (float | None): Fraction of power to treat as tail.
             None → full mode (cluster all pixels).
     """
-    _CACHE_KEYS = ('vec_rolled', 'dtheta', 'dphi')
+    _CACHE_KEYS = ("vec_rolled", "dtheta", "dphi")
     for bf, data in beam_data.items():
-        bv_pre = data['beam_vals']   # (S,) — needed as weights before overwrite
-        vo_pre = data['vec_orig']    # (S, 3)
-        S = data['n_sel']
+        bv_pre = data["beam_vals"]  # (S,) — needed as weights before overwrite
+        vo_pre = data["vec_orig"]  # (S, 3)
+        S = data["n_sel"]
 
         vec_out, bv_out, labels = cluster_beam_pixels(
-            vo_pre, bv_pre, n_clusters=n_clusters, tail_fraction=tail_fraction,
+            vo_pre,
+            bv_pre,
+            n_clusters=n_clusters,
+            tail_fraction=tail_fraction,
         )
         K = len(bv_out)
 
@@ -223,13 +245,14 @@ def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
             for k, arr in clustered.items():
                 data[k] = arr
 
-        data['beam_vals'] = bv_out
-        data['vec_orig']  = vec_out
-        data['n_sel']     = K
+        data["beam_vals"] = bv_out
+        data["vec_orig"] = vec_out
+        data["n_sel"] = K
         print(f"  [{bf}] Beam clustered: {S} → {K} pixels")
 
 
 # ── TOD generation ────────────────────────────────────────────────────────────
+
 
 def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=None):
     """Generate TOD for a single observation day using batched processing.
@@ -255,29 +278,32 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
         numpy.ndarray: TOD array of shape ``(3, n_samples)``, dtype
             ``float64``. Axis 0 is the Stokes component index ``[I, Q, U]``.
     """
-    prefix    = f"[{process_name}] " if process_name else ""
-    nside     = hp.get_nside(mp[0])
+    prefix = f"[{process_name}] " if process_name else ""
+    nside = hp.get_nside(mp[0])
 
     # Open mmaps once for the whole day — avoids re-opening 3 files per batch,
     # which at batch_size=8 would otherwise dominate I/O overhead.
     theta_mmap, phi_mmap, psi_mmap = open_scan_day(folder_scan, day_index)
     n_samples = len(phi_mmap)
 
-    first_bf  = next(iter(beam_data))
-    ra0, dec0 = beam_data[first_bf]['ra'], beam_data[first_bf]['dec']
+    first_bf = next(iter(beam_data))
+    ra0, dec0 = beam_data[first_bf]["ra"], beam_data[first_bf]["dec"]
 
     batch_size = max(1, min(batch_size, n_samples))
-    n_batches  = (n_samples + batch_size - 1) // batch_size
-    print(prefix + f"Day {day_index} — {n_samples} samples, batch_size={batch_size}, n_batches={n_batches}")
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    print(
+        prefix
+        + f"Day {day_index} — {n_samples} samples, batch_size={batch_size}, n_batches={n_batches}"
+    )
 
-    tod_day    = np.zeros((3, n_samples))
+    tod_day = np.zeros((3, n_samples))
     start_time = time.time()
 
     for batch_idx in range(n_batches):
         bs = batch_idx * batch_size
         be = min(bs + batch_size, n_samples)
 
-        #ETA
+        # ETA
         if _should_print_batch(batch_idx, n_batches):
             elapsed = time.time() - start_time
             if batch_idx > 0:
@@ -285,31 +311,46 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
                 eta_str = _fmt_time(eta)
             else:
                 eta_str = "..."
-            print(prefix + f"Batch {batch_idx+1}/{n_batches}  samples {bs}-{be-1}  ETA {eta_str}")
+            print(
+                prefix
+                + f"Batch {batch_idx + 1}/{n_batches}  samples {bs}-{be - 1}  ETA {eta_str}"
+            )
 
         theta_b = np.array(theta_mmap[bs:be], dtype=np.float32)
-        phi_b   = np.array(phi_mmap[bs:be],   dtype=np.float32)
-        psi_b   = np.array(psi_mmap[bs:be],   dtype=np.float32)
-        rot_vecs, betas        = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
-        psis_b                 = -betas + psi_b
+        phi_b = np.array(phi_mmap[bs:be], dtype=np.float32)
+        psi_b = np.array(psi_mmap[bs:be], dtype=np.float32)
+        rot_vecs, betas = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
+        psis_b = -betas + psi_b
 
         tod_batch = np.zeros((3, be - bs))
         for data in beam_data.values():
-            contrib = beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
-                                     interp_mode=interp_mode,
-                                     sigma_deg=interp_sigma_deg,
-                                     radius_deg=interp_radius_deg)
+            contrib = beam_tod_batch(
+                nside,
+                mp,
+                data,
+                rot_vecs,
+                phi_b,
+                theta_b,
+                psis_b,
+                interp_mode=interp_mode,
+                sigma_deg=interp_sigma_deg,
+                radius_deg=interp_radius_deg,
+            )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
 
         tod_day[:, bs:be] = tod_batch
 
     total = time.time() - start_time
-    print(prefix + f"Done — {n_samples} samples in {_fmt_time(total)} ({total/n_batches:.2f}s/batch)")
+    print(
+        prefix
+        + f"Done — {n_samples} samples in {_fmt_time(total)} ({total / n_batches:.2f}s/batch)"
+    )
     return tod_day
 
 
 # ── Per-day worker (used by multiprocessing pool) ─────────────────────────────
+
 
 def _process_day(day_index, batch_size, Nb):
     """
@@ -318,10 +359,12 @@ def _process_day(day_index, batch_size, Nb):
     pickling / copying of the large sky-map arrays occurs per task.
     """
     process_name = multiprocessing.current_process().name
-    print(f"[{process_name}] Processing day {day_index+1}/{Nb}")
+    print(f"[{process_name}] Processing day {day_index + 1}/{Nb}")
     try:
-        tod_day     = tod_exact_gen_batched(_g_beam_data, day_index, _g_mp, batch_size, process_name=process_name)
-        output_file = f'{folder_tod_output}tod_day_{day_index}.npy'
+        tod_day = tod_exact_gen_batched(
+            _g_beam_data, day_index, _g_mp, batch_size, process_name=process_name
+        )
+        output_file = f"{folder_tod_output}tod_day_{day_index}.npy"
         np.save(output_file, tod_day)
         print(f"[{process_name}] Saved {output_file}")
         return day_index, True, None
@@ -332,45 +375,65 @@ def _process_day(day_index, batch_size, Nb):
 
 # ── Calibration cache ─────────────────────────────────────────────────────────
 
+
 def _save_calibration(n_processes, batch_size):
     """Write calibration results back to the active config file."""
     import yaml
+
     with open(config.CONFIG_FILE) as f:
         raw = yaml.safe_load(f)
-    raw['calibration_n_processes'] = int(n_processes)
-    raw['calibration_batch_size']  = int(batch_size)
-    raw['calibration_enabled']     = False
-    with open(config.CONFIG_FILE, 'w') as f:
-        yaml.dump(raw, f, default_flow_style=False, allow_unicode=True,
-                  explicit_start=True, sort_keys=False)
-    print(f"Calibration saved to {config.CONFIG_FILE} "
-          f"(n_processes={n_processes}, batch_size={batch_size})")
+    raw["calibration_n_processes"] = int(n_processes)
+    raw["calibration_batch_size"] = int(batch_size)
+    raw["calibration_enabled"] = False
+    with open(config.CONFIG_FILE, "w") as f:
+        yaml.dump(
+            raw,
+            f,
+            default_flow_style=False,
+            allow_unicode=True,
+            explicit_start=True,
+            sort_keys=False,
+        )
+    print(
+        f"Calibration saved to {config.CONFIG_FILE} "
+        f"(n_processes={n_processes}, batch_size={batch_size})"
+    )
 
 
 def _save_clustering_calibration(tail_fraction, n_clusters):
     """Write clustering calibration results to the active config YAML file."""
     import yaml
+
     with open(config.CONFIG_FILE) as f:
         raw = yaml.safe_load(f)
-    raw['n_beam_clusters']             = int(n_clusters)
-    raw['beam_cluster_tail_fraction']  = float(tail_fraction)
-    raw['clustering_calibration_enabled'] = False   # disable after save
-    with open(config.CONFIG_FILE, 'w') as f:
-        yaml.dump(raw, f, default_flow_style=False, allow_unicode=True,
-                  explicit_start=True, sort_keys=False)
-    print(f"Clustering calibration saved: tail_fraction={tail_fraction:.4f}, "
-          f"n_clusters={n_clusters}")
+    raw["n_beam_clusters"] = int(n_clusters)
+    raw["beam_cluster_tail_fraction"] = float(tail_fraction)
+    raw["clustering_calibration_enabled"] = False  # disable after save
+    with open(config.CONFIG_FILE, "w") as f:
+        yaml.dump(
+            raw,
+            f,
+            default_flow_style=False,
+            allow_unicode=True,
+            explicit_start=True,
+            sort_keys=False,
+        )
+    print(
+        f"Clustering calibration saved: tail_fraction={tail_fraction:.4f}, "
+        f"n_clusters={n_clusters}"
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 
 def main(n_cpu_ceiling):
     t0 = time.time()
     Nb, _ = load_scan_information(folder_scan)
 
     start = max(start_day or 0, 0)
-    end   = min(end_day   or Nb, Nb)
-    days  = range(start, end)
+    end = min(end_day or Nb, Nb)
+    days = range(start, end)
 
     os.makedirs(folder_tod_output, exist_ok=True)
 
@@ -378,14 +441,16 @@ def main(n_cpu_ceiling):
     # spawned worker processes — which re-import this module — never execute
     # this line themselves.
     print("Loading sky map...")
-    MP = [m.astype(np.float32) for m in hp.read_map(config.path_to_map, field=(0, 1, 2))]
+    MP = [
+        m.astype(np.float32) for m in hp.read_map(config.path_to_map, field=(0, 1, 2))
+    ]
 
     # ── Load exact beam data (clustering applied separately below) ─────────────
     print("Loading beam data...")
     beam_data = prepare_beam_data(
         beam_files,
-        cache_dir    = config.beam_cache_dir,
-        cache_n_psi  = config.beam_cache_n_psi,
+        cache_dir=config.beam_cache_dir,
+        cache_n_psi=config.beam_cache_n_psi,
     )
 
     # ── Beam pixel clustering ──────────────────────────────────────────────────
@@ -396,79 +461,87 @@ def main(n_cpu_ceiling):
         print("Running beam clustering calibration …")
         best_tf, best_K = calibrate_beam_clustering(
             beam_data,
-            folder_scan      = folder_scan,
-            probe_day        = start,
-            mp               = MP,
-            error_threshold  = config.clustering_error_threshold,
-            interp_mode      = interp_mode,
-            interp_sigma_deg = interp_sigma_deg,
-            interp_radius_deg= interp_radius_deg,
+            folder_scan=folder_scan,
+            probe_day=start,
+            mp=MP,
+            error_threshold=config.clustering_error_threshold,
+            interp_mode=interp_mode,
+            interp_sigma_deg=interp_sigma_deg,
+            interp_radius_deg=interp_radius_deg,
         )
         _save_clustering_calibration(best_tf, best_K)
         # Update in-memory config so clustering is applied this run too
-        config.n_beam_clusters            = best_K
+        config.n_beam_clusters = best_K
         config.beam_cluster_tail_fraction = best_tf
 
     if config.n_beam_clusters is not None:
-        print(f"Applying beam clustering "
-              f"(tail_fraction={config.beam_cluster_tail_fraction}, "
-              f"n_clusters={config.n_beam_clusters}) …")
+        print(
+            f"Applying beam clustering "
+            f"(tail_fraction={config.beam_cluster_tail_fraction}, "
+            f"n_clusters={config.n_beam_clusters}) …"
+        )
         apply_beam_clustering(
             beam_data,
-            n_clusters    = config.n_beam_clusters,
-            tail_fraction = config.beam_cluster_tail_fraction,
+            n_clusters=config.n_beam_clusters,
+            tail_fraction=config.beam_cluster_tail_fraction,
         )
 
     # Stack sky-map components per beam entry into a contiguous (C, N) float32
     # array.  The Numba gather kernel requires this layout.
     for data in beam_data.values():
-        data['mp_stacked'] = np.ascontiguousarray(
-            np.stack([MP[c] for c in data['comp_indices']])  # (C, N_hp)
+        data["mp_stacked"] = np.ascontiguousarray(
+            np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
         )
 
-    use_cached = (
-        not config.calibration_enabled
-        or (config.calibration_n_processes is not None
-            and config.calibration_batch_size is not None)
+    use_cached = not config.calibration_enabled or (
+        config.calibration_n_processes is not None
+        and config.calibration_batch_size is not None
     )
     if use_cached:
-        ncpus      = config.calibration_n_processes
+        ncpus = config.calibration_n_processes
         batch_size = config.calibration_batch_size
         print(f"Using cached calibration: n_processes={ncpus}, batch_size={batch_size}")
     else:
         print("Calibrating optimal worker count and batch size...")
         ncpus, batch_size = _calibrate_n_processes(
-            beam_data, folder_scan, probe_day=start,
-            mp=MP, n_cpu_ceiling=n_cpu_ceiling,
+            beam_data,
+            folder_scan,
+            probe_day=start,
+            mp=MP,
+            n_cpu_ceiling=n_cpu_ceiling,
             interp_mode=interp_mode,
         )
         _save_calibration(ncpus, batch_size)
-    print(f"Processing days {start}–{end-1}  ({len(days)} days,  {ncpus} workers)")
+    print(f"Processing days {start}–{end - 1}  ({len(days)} days,  {ncpus} workers)")
 
     if ncpus > 1:
         # ── Allocate shared memory ─────────────────────────────────────────
         # Pack all three MP components into one contiguous (3, npix) block so
         # that a single SharedMemory allocation covers everything.
-        mp_arr = np.ascontiguousarray(np.stack(MP))           # (3, npix) float32
+        mp_arr = np.ascontiguousarray(np.stack(MP))  # (3, npix) float32
         shm_mp = SharedMemory(create=True, size=mp_arr.nbytes)
         np.ndarray(mp_arr.shape, dtype=mp_arr.dtype, buffer=shm_mp.buf)[:] = mp_arr
-        mp_desc = {'name': shm_mp.name, 'shape': mp_arr.shape, 'dtype': mp_arr.dtype}
+        mp_desc = {"name": shm_mp.name, "shape": mp_arr.shape, "dtype": mp_arr.dtype}
 
         # One block per unique beam file for mp_stacked (C, npix) float32.
-        beam_shms      = {}
+        beam_shms = {}
         beam_shm_descs = {}
         for bf, data in beam_data.items():
-            ms  = data['mp_stacked']
+            ms = data["mp_stacked"]
             shm = SharedMemory(create=True, size=ms.nbytes)
             np.ndarray(ms.shape, dtype=ms.dtype, buffer=shm.buf)[:] = ms
-            beam_shms[bf]      = shm
-            beam_shm_descs[bf] = {'name': shm.name, 'shape': ms.shape, 'dtype': ms.dtype}
+            beam_shms[bf] = shm
+            beam_shm_descs[bf] = {
+                "name": shm.name,
+                "shape": ms.shape,
+                "dtype": ms.dtype,
+            }
 
         # Beam-cache arrays (vec_rolled, dtheta, dphi) — potentially large
         # (N_psi × S × 3) and previously pickled to every worker. Move them
         # into shared memory so workers attach zero-copy views instead.
-        _CACHE_KEYS = ('vec_rolled', 'dtheta', 'dphi')
-        cache_shms      = {bf: {} for bf in beam_data}
+        _CACHE_KEYS = ("vec_rolled", "dtheta", "dphi")
+        cache_shms = {bf: {} for bf in beam_data}
         cache_shm_descs = {bf: {} for bf in beam_data}
         for bf, data in beam_data.items():
             for key in _CACHE_KEYS:
@@ -477,13 +550,16 @@ def main(n_cpu_ceiling):
                 arr = np.ascontiguousarray(data[key])
                 shm = SharedMemory(create=True, size=arr.nbytes)
                 np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)[:] = arr
-                cache_shms[bf][key]      = shm
-                cache_shm_descs[bf][key] = {'name': shm.name, 'shape': arr.shape,
-                                             'dtype': arr.dtype}
+                cache_shms[bf][key] = shm
+                cache_shm_descs[bf][key] = {
+                    "name": shm.name,
+                    "shape": arr.shape,
+                    "dtype": arr.dtype,
+                }
 
         # Only small arrays remain in the pickle payload: beam_vals, vec_orig,
         # psi_grid, sel, ra, dec, comp_indices, n_sel.
-        _SHARED_KEYS = {'mp_stacked'} | set(_CACHE_KEYS)
+        _SHARED_KEYS = {"mp_stacked"} | set(_CACHE_KEYS)
         beam_data_static = {
             bf: {k: v for k, v in data.items() if k not in _SHARED_KEYS}
             for bf, data in beam_data.items()
@@ -492,33 +568,38 @@ def main(n_cpu_ceiling):
         worker = partial(_process_day, batch_size=batch_size, Nb=Nb)
         try:
             with multiprocessing.Pool(
-                    processes=ncpus,
-                    initializer=_worker_init,
-                    initargs=(beam_data_static, mp_desc,
-                              beam_shm_descs, cache_shm_descs)) as pool:
+                processes=ncpus,
+                initializer=_worker_init,
+                initargs=(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs),
+            ) as pool:
                 results = pool.map(worker, days)
         finally:
             # Release shared memory only after all workers have finished.
-            shm_mp.close(); shm_mp.unlink()
+            shm_mp.close()
+            shm_mp.unlink()
             for shm in beam_shms.values():
-                shm.close(); shm.unlink()
+                shm.close()
+                shm.unlink()
             for per_beam in cache_shms.values():
                 for shm in per_beam.values():
-                    shm.close(); shm.unlink()
+                    shm.close()
+                    shm.unlink()
 
         failed = [r for r in results if not r[1]]
-        print(f"\nDone — {len(results)-len(failed)}/{len(results)} days OK")
+        print(f"\nDone — {len(results) - len(failed)}/{len(results)} days OK")
         for day, _, err in failed:
             print(f"  Day {day} failed: {err}")
     else:
         for day_index in days:
-            tod_day     = tod_exact_gen_batched(beam_data, day_index, MP, batch_size, process_name="main")
-            output_file = f'{folder_tod_output}/tod_day_{day_index}.npy'
+            tod_day = tod_exact_gen_batched(
+                beam_data, day_index, MP, batch_size, process_name="main"
+            )
+            output_file = f"{folder_tod_output}/tod_day_{day_index}.npy"
             np.save(output_file, tod_day)
 
-    print(f"\nTotal run time: {(time.time()-t0)/60:.2f}m")
+    print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")
 
 
-if __name__ == '__main__':
-    multiprocessing.set_start_method('spawn')
+if __name__ == "__main__":
+    multiprocessing.set_start_method(config.mp_start_method)
     main(_get_ncpus())

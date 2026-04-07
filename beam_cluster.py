@@ -66,10 +66,10 @@ from scipy.sparse import csr_matrix
 
 # ── k-means++ initialisation ──────────────────────────────────────────────────
 
-def _kmeans_plus_plus_init(vec: np.ndarray,
-                            weights: np.ndarray,
-                            K: int,
-                            rng: np.random.Generator) -> np.ndarray:
+
+def _kmeans_plus_plus_init(
+    vec: np.ndarray, weights: np.ndarray, K: int, rng: np.random.Generator
+) -> np.ndarray:
     """
     Weighted k-means++ initialisation on the unit sphere.
 
@@ -89,10 +89,10 @@ def _kmeans_plus_plus_init(vec: np.ndarray,
     centroids = np.empty((K, 3), dtype=np.float64)
 
     centroids[0] = vec[rng.choice(S, p=prob)]
-    nearest_cos = vec @ centroids[0]                             # (S,) — running max similarity
+    nearest_cos = vec @ centroids[0]  # (S,) — running max similarity
 
     for k in range(1, K):
-        cos_dist_sq = np.maximum(1.0 - nearest_cos, 0.0) ** 2   # (S,)
+        cos_dist_sq = np.maximum(1.0 - nearest_cos, 0.0) ** 2  # (S,)
 
         p = weights * cos_dist_sq
         total = p.sum()
@@ -105,14 +105,17 @@ def _kmeans_plus_plus_init(vec: np.ndarray,
 
 # ── Core k-means EM loop ──────────────────────────────────────────────────────
 
-def _kmeans_sphere(vec: np.ndarray,
-                   bvals: np.ndarray,
-                   K: int,
-                   max_iter: int,
-                   tol: float,
-                   rng: np.random.Generator,
-                   label: str = "",
-                   verbose: bool = True) -> tuple:
+
+def _kmeans_sphere(
+    vec: np.ndarray,
+    bvals: np.ndarray,
+    K: int,
+    max_iter: int,
+    tol: float,
+    rng: np.random.Generator,
+    label: str = "",
+    verbose: bool = True,
+) -> tuple:
     """
     Weighted spherical k-means.  Internal function; called by cluster_beam_pixels.
 
@@ -131,26 +134,28 @@ def _kmeans_sphere(vec: np.ndarray,
     S = len(bvals)
     centroids = _kmeans_plus_plus_init(vec, bvals, K, rng)
     labels = np.empty(S, dtype=np.int32)
-    cos_disp = np.full(K, -1.0)   # sentinel: triggers arccos only when needed
+    cos_disp = np.full(K, -1.0)  # sentinel: triggers arccos only when needed
 
     for iteration in range(max_iter):
-        sim    = vec @ centroids.T                          # (S, K)
+        sim = vec @ centroids.T  # (S, K)
         labels = sim.argmax(axis=1).astype(np.int32)
 
         new_weights = np.bincount(labels, weights=bvals, minlength=K)
-        new_centroids = np.column_stack([
-            np.bincount(labels, weights=bvals * vec[:, i], minlength=K)
-            for i in range(3)
-        ])
+        new_centroids = np.column_stack(
+            [
+                np.bincount(labels, weights=bvals * vec[:, i], minlength=K)
+                for i in range(3)
+            ]
+        )
 
         # Reinitialise empty clusters from the pixel farthest from its centroid
-        empty_mask = (new_weights == 0)
+        empty_mask = new_weights == 0
         if empty_mask.any():
             cos_to_assigned = sim[np.arange(S), labels]
             for k in np.where(empty_mask)[0]:
                 idx = int(np.argmin(cos_to_assigned))
                 new_centroids[k] = vec[idx]
-                new_weights[k]   = bvals[idx]
+                new_weights[k] = bvals[idx]
 
         norms = np.linalg.norm(new_centroids, axis=1, keepdims=True)
         norms = np.where(norms > 0, norms, 1.0)
@@ -162,47 +167,60 @@ def _kmeans_sphere(vec: np.ndarray,
         if cos_disp.min() > np.cos(tol):
             if verbose:
                 max_disp = float(np.arccos(cos_disp).max())
-                print(f"    [cluster{label}] Converged at iter {iteration+1}  "
-                      f"(max_disp={np.degrees(max_disp)*60:.3f}')")
+                print(
+                    f"    [cluster{label}] Converged at iter {iteration + 1}  "
+                    f"(max_disp={np.degrees(max_disp) * 60:.3f}')"
+                )
             break
     else:
         if verbose:
             max_disp = float(np.arccos(cos_disp).max())
-            print(f"    [cluster{label}] max_iter={max_iter} reached  "
-                  f"(max_disp={np.degrees(max_disp)*60:.3f}')")
+            print(
+                f"    [cluster{label}] max_iter={max_iter} reached  "
+                f"(max_disp={np.degrees(max_disp) * 60:.3f}')"
+            )
 
     # Final assignment
-    sim    = vec @ centroids.T
+    sim = vec @ centroids.T
     labels = sim.argmax(axis=1).astype(np.int32)
 
     return centroids, labels
 
 
-def _spread_stats(vec: np.ndarray, centroids: np.ndarray,
-                  labels: np.ndarray, label: str = "",
-                  verbose: bool = True) -> None:
+def _spread_stats(
+    vec: np.ndarray,
+    centroids: np.ndarray,
+    labels: np.ndarray,
+    label: str = "",
+    verbose: bool = True,
+) -> None:
     """Print intra-cluster angular spread statistics [arcmin]."""
     if not verbose:
         return
     sim_assigned = (vec * centroids[labels]).sum(axis=1)
-    cos_clamped  = np.clip(sim_assigned, -1.0, 1.0)
+    cos_clamped = np.clip(sim_assigned, -1.0, 1.0)
     spread_arcmin = np.degrees(np.arccos(cos_clamped)) * 60.0
-    print(f"    [cluster{label}] Intra-cluster spread — "
-          f"mean={spread_arcmin.mean():.2f}'  "
-          f"max={spread_arcmin.max():.2f}'  "
-          f"95th={np.percentile(spread_arcmin, 95):.2f}'")
+    print(
+        f"    [cluster{label}] Intra-cluster spread — "
+        f"mean={spread_arcmin.mean():.2f}'  "
+        f"max={spread_arcmin.max():.2f}'  "
+        f"95th={np.percentile(spread_arcmin, 95):.2f}'"
+    )
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def cluster_beam_pixels(vec_orig: np.ndarray,
-                        beam_vals: np.ndarray,
-                        n_clusters: int,
-                        tail_fraction: float | None = None,
-                        max_iter: int = 150,
-                        tol: float = 1e-5,
-                        random_state: int = 42,
-                        verbose: bool = True) -> tuple:
+
+def cluster_beam_pixels(
+    vec_orig: np.ndarray,
+    beam_vals: np.ndarray,
+    n_clusters: int,
+    tail_fraction: float | None = None,
+    max_iter: int = 150,
+    tol: float = 1e-5,
+    random_state: int = 42,
+    verbose: bool = True,
+) -> tuple:
     """
     Cluster beam pixels into representative centroids using weighted spherical
     k-means with k-means++ initialisation.
@@ -257,29 +275,33 @@ def cluster_beam_pixels(vec_orig: np.ndarray,
         # ── Full mode: cluster all pixels ─────────────────────────────────
         K = min(n_clusters, S)
         if K >= S:
-            return (vec_orig.copy(), beam_vals.copy(),
-                    np.arange(S, dtype=np.int32))
+            return (vec_orig.copy(), beam_vals.copy(), np.arange(S, dtype=np.int32))
 
-        t0    = time.time()
-        vec   = vec_orig.astype(np.float64)
+        t0 = time.time()
+        vec = vec_orig.astype(np.float64)
         bvals = beam_vals.astype(np.float64)
-        rng   = np.random.default_rng(random_state)
+        rng = np.random.default_rng(random_state)
 
-        centroids, labels = _kmeans_sphere(vec, bvals, K, max_iter, tol, rng,
-                                           verbose=verbose)
+        centroids, labels = _kmeans_sphere(
+            vec, bvals, K, max_iter, tol, rng, verbose=verbose
+        )
 
         cluster_weights = np.zeros(K, dtype=np.float64)
         np.add.at(cluster_weights, labels, bvals)
         cluster_weights /= cluster_weights.sum()
 
         if verbose:
-            print(f"    [cluster] Full mode: {S} → {K} pixels  "
-                  f"({S/K:.1f}× reduction)  in {time.time()-t0:.2f}s")
+            print(
+                f"    [cluster] Full mode: {S} → {K} pixels  "
+                f"({S / K:.1f}× reduction)  in {time.time() - t0:.2f}s"
+            )
         _spread_stats(vec, centroids, labels, verbose=verbose)
 
-        return (centroids.astype(np.float32),
-                cluster_weights.astype(np.float32),
-                labels)
+        return (
+            centroids.astype(np.float32),
+            cluster_weights.astype(np.float32),
+            labels,
+        )
 
     # ── Hybrid mode: keep main lobe, cluster tail ──────────────────────────
     if not (0.0 < tail_fraction < 1.0):
@@ -289,40 +311,51 @@ def cluster_beam_pixels(vec_orig: np.ndarray,
 
     # Split pixels into main (high-power) and tail (low-power).
     # Ascending sort → cumulative sum from the weakest pixel up.
-    sort_idx = np.argsort(beam_vals)             # ascending by weight
-    cumsum   = np.cumsum(beam_vals[sort_idx])    # cumulative power from weakest
+    sort_idx = np.argsort(beam_vals)  # ascending by weight
+    cumsum = np.cumsum(beam_vals[sort_idx])  # cumulative power from weakest
 
     # Number of tail pixels: smallest subset whose total weight ≥ tail_fraction.
-    # searchsorted gives the first index where cumsum ≥ tail_fraction.
-    n_tail = int(np.searchsorted(cumsum, tail_fraction, side='left')) + 1
-    n_tail = max(1, min(n_tail, S - 1))          # keep at least 1 main pixel
+    # searchsorted('right') returns the first index k where cumsum[k] > tail_fraction,
+    # i.e. k is already the count of pixels needed (unambiguous when cumsum[k] == tail_fraction).
+    n_tail = int(np.searchsorted(cumsum, tail_fraction, side="right"))
+    n_tail = max(1, min(n_tail, S - 1))  # keep at least 1 main pixel
 
-    tail_idx = sort_idx[:n_tail]                 # (n_tail,)  low-power pixels
-    main_idx = sort_idx[n_tail:]                 # (n_main,)  high-power pixels, ascending
-    n_main   = len(main_idx)
+    tail_idx = sort_idx[:n_tail]  # (n_tail,)  low-power pixels
+    main_idx = sort_idx[n_tail:]  # (n_main,)  high-power pixels, ascending
+    n_main = len(main_idx)
 
     tail_power = float(beam_vals[tail_idx].sum())
     if verbose:
-        print(f"    [cluster] Hybrid mode: {S} pixels  →  "
-              f"{n_main} main (top {100*(1-tail_power):.1f}% power, kept exact)  +  "
-              f"tail {n_tail} px ({100*tail_power:.1f}% power, to be clustered)")
+        print(
+            f"    [cluster] Hybrid mode: {S} pixels  →  "
+            f"{n_main} main (top {100 * (1 - tail_power):.1f}% power, kept exact)  +  "
+            f"tail {n_tail} px ({100 * tail_power:.1f}% power, to be clustered)"
+        )
 
     K_tail = min(n_clusters, n_tail)
 
     if K_tail >= n_tail:
         # Tail is already small enough — no clustering needed
-        vec_tail  = vec_orig[tail_idx]
-        bv_tail   = beam_vals[tail_idx]
+        vec_tail = vec_orig[tail_idx]
+        bv_tail = beam_vals[tail_idx]
         tail_labels = np.arange(n_tail, dtype=np.int32)
         if verbose:
-            print(f"    [cluster] Tail has only {n_tail} pixels — kept as-is (K_tail={K_tail})")
+            print(
+                f"    [cluster] Tail has only {n_tail} pixels — kept as-is (K_tail={K_tail})"
+            )
     else:
-        vec_t  = vec_orig[tail_idx].astype(np.float64)
-        bv_t   = beam_vals[tail_idx].astype(np.float64)
-        rng    = np.random.default_rng(random_state)
+        vec_t = vec_orig[tail_idx].astype(np.float64)
+        bv_t = beam_vals[tail_idx].astype(np.float64)
+        rng = np.random.default_rng(random_state)
 
         centroids_t, tail_labels = _kmeans_sphere(
-            vec_t, bv_t, K_tail, max_iter, tol, rng, label=" tail",
+            vec_t,
+            bv_t,
+            K_tail,
+            max_iter,
+            tol,
+            rng,
+            label=" tail",
             verbose=verbose,
         )
 
@@ -331,40 +364,44 @@ def cluster_beam_pixels(vec_orig: np.ndarray,
         np.add.at(cw_t, tail_labels, bv_t)
         # (No re-normalisation here — combined with main below)
 
-        vec_tail = centroids_t.astype(np.float32)   # (K_tail, 3)
-        bv_tail  = cw_t.astype(np.float32)          # (K_tail,)
+        vec_tail = centroids_t.astype(np.float32)  # (K_tail, 3)
+        bv_tail = cw_t.astype(np.float32)  # (K_tail,)
 
         if verbose:
-            print(f"    [cluster] Tail: {n_tail} → {K_tail} clusters  "
-                  f"({n_tail/K_tail:.1f}× reduction)  in {time.time()-t0:.2f}s")
-        _spread_stats(vec_t, centroids_t, tail_labels, label=" tail",
-                      verbose=verbose)
+            print(
+                f"    [cluster] Tail: {n_tail} → {K_tail} clusters  "
+                f"({n_tail / K_tail:.1f}× reduction)  in {time.time() - t0:.2f}s"
+            )
+        _spread_stats(vec_t, centroids_t, tail_labels, label=" tail", verbose=verbose)
 
     # ── Build combined output arrays ───────────────────────────────────────
     # Layout: [main_0, main_1, …, main_{n_main-1}, tail_cluster_0, …]
-    vec_out  = np.concatenate([vec_orig[main_idx],  vec_tail],  axis=0)  # (K_out, 3)
-    bv_out   = np.concatenate([beam_vals[main_idx], bv_tail],   axis=0)  # (K_out,)
-    bv_out   = (bv_out / bv_out.sum()).astype(np.float32)                # re-normalise
+    vec_out = np.concatenate([vec_orig[main_idx], vec_tail], axis=0)  # (K_out, 3)
+    bv_out = np.concatenate([beam_vals[main_idx], bv_tail], axis=0)  # (K_out,)
+    bv_out = (bv_out / bv_out.sum()).astype(np.float32)  # re-normalise
 
     K_out = n_main + K_tail
 
     # ── Build labels: original pixel → position in output array ───────────
     labels = np.empty(S, dtype=np.int32)
-    labels[main_idx] = np.arange(n_main, dtype=np.int32)        # identity
-    labels[tail_idx] = n_main + tail_labels                      # cluster offset
+    labels[main_idx] = np.arange(n_main, dtype=np.int32)  # identity
+    labels[tail_idx] = n_main + tail_labels  # cluster offset
 
     if verbose:
-        print(f"    [cluster] Combined: {S} → {K_out} pixels  "
-              f"({S/K_out:.1f}× total reduction)")
+        print(
+            f"    [cluster] Combined: {S} → {K_out} pixels  "
+            f"({S / K_out:.1f}× total reduction)"
+        )
 
     return vec_out, bv_out, labels
 
 
 # ── Sparse assignment matrix ──────────────────────────────────────────────────
 
-def _build_weight_matrix(labels: np.ndarray,
-                         beam_vals: np.ndarray,
-                         K: int) -> csr_matrix:
+
+def _build_weight_matrix(
+    labels: np.ndarray, beam_vals: np.ndarray, K: int
+) -> csr_matrix:
     """
     Build a sparse (S × K) weight matrix W where W[s, k] = beam_vals[s]
     when labels[s] == k, and 0 otherwise.
@@ -383,10 +420,10 @@ def _build_weight_matrix(labels: np.ndarray,
 
 # ── Cache-array clustering ────────────────────────────────────────────────────
 
-def cluster_cached_arrays(cache_dict: dict,
-                           labels: np.ndarray,
-                           beam_vals: np.ndarray,
-                           K: int) -> dict:
+
+def cluster_cached_arrays(
+    cache_dict: dict, labels: np.ndarray, beam_vals: np.ndarray, K: int
+) -> dict:
     """
     Apply the same pixel-clustering to pre-computed beam-cache arrays.
 
@@ -417,45 +454,47 @@ def cluster_cached_arrays(cache_dict: dict,
     """
     result = {}
 
-    W = _build_weight_matrix(labels, beam_vals, K)          # (S, K) csr float32
+    W = _build_weight_matrix(labels, beam_vals, K)  # (S, K) csr float32
 
     # Per-output-pixel weight sum — used to convert weighted sums to means.
     # For main pixels this equals beam_vals[s]; for clusters it is the sum.
-    cluster_w = np.asarray(W.T @ np.ones(len(labels), dtype=np.float32),
-                           dtype=np.float64)                 # (K,)
-    cluster_w = np.where(cluster_w > 0, cluster_w, 1.0)     # guard /0
+    cluster_w = np.asarray(
+        W.T @ np.ones(len(labels), dtype=np.float32), dtype=np.float64
+    )  # (K,)
+    cluster_w = np.where(cluster_w > 0, cluster_w, 1.0)  # guard /0
 
     # ── vec_rolled : (N_psi, S, 3) ───────────────────────────────────────────
-    if 'vec_rolled' in cache_dict:
-        vr = cache_dict['vec_rolled']                        # (N_psi, S, 3)
+    if "vec_rolled" in cache_dict:
+        vr = cache_dict["vec_rolled"]  # (N_psi, S, 3)
         N_psi, S_c, _ = vr.shape
 
         # Transpose to (S, N_psi*3), sparse-multiply, reshape back
-        vr_2d  = np.ascontiguousarray(
-                     vr.transpose(1, 0, 2).reshape(S_c, N_psi * 3))  # (S, N_psi*3)
-        res_2d = W.T @ vr_2d                                # (K, N_psi*3)
-        res    = res_2d.reshape(K, N_psi, 3).transpose(1, 0, 2)      # (N_psi, K, 3)
+        vr_2d = np.ascontiguousarray(
+            vr.transpose(1, 0, 2).reshape(S_c, N_psi * 3)
+        )  # (S, N_psi*3)
+        res_2d = W.T @ vr_2d  # (K, N_psi*3)
+        res = res_2d.reshape(K, N_psi, 3).transpose(1, 0, 2)  # (N_psi, K, 3)
 
-        res /= cluster_w[None, :, None]                     # weighted mean
+        res /= cluster_w[None, :, None]  # weighted mean
 
         # Re-project to unit sphere
         norms = np.linalg.norm(res, axis=2, keepdims=True)
         norms = np.where(norms > 0, norms, 1.0)
-        res  /= norms
+        res /= norms
 
-        result['vec_rolled'] = np.ascontiguousarray(res.astype(np.float32))
+        result["vec_rolled"] = np.ascontiguousarray(res.astype(np.float32))
         print(f"    [cluster] vec_rolled: ({N_psi}, {S_c}, 3) → ({N_psi}, {K}, 3)")
 
     # ── Scalar arrays: dtheta and dphi  (N_psi, S) ───────────────────────────
-    for key in ('dtheta', 'dphi'):
+    for key in ("dtheta", "dphi"):
         if key not in cache_dict:
             continue
-        arr = cache_dict[key]                                # (N_psi, S)
+        arr = cache_dict[key]  # (N_psi, S)
         N_psi, S_c = arr.shape
 
-        arr_2d = np.ascontiguousarray(arr.T)                # (S, N_psi)
-        res_2d = W.T @ arr_2d                               # (K, N_psi)
-        res    = (res_2d / cluster_w[:, None]).T            # (N_psi, K)
+        arr_2d = np.ascontiguousarray(arr.T)  # (S, N_psi)
+        res_2d = W.T @ arr_2d  # (K, N_psi)
+        res = (res_2d / cluster_w[:, None]).T  # (N_psi, K)
 
         result[key] = np.ascontiguousarray(res.astype(np.float32))
         print(f"    [cluster] {key}: ({N_psi}, {S_c}) → ({N_psi}, {K})")

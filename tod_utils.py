@@ -280,8 +280,12 @@ def _compute_dB_threshold_from_power(beam_vals, power_cut):
     # This gives the sum of all pixels with dB >= threshold
     cumulative_sums = np.cumsum(sorted_prof[::-1])[::-1]
     
-    # Find index where cumulative sum is closest to target
-    idx = np.argmin(np.abs(cumulative_sums - target_power))
-    
+    # Find last index where retained power >= target_power.
+    # cumulative_sums is decreasing; flip to ascending for searchsorted.
+    # searchsorted returns the first position in the reversed array where
+    # cumulative_sums >= target_power; convert back to original index.
+    rev_idx = np.searchsorted(cumulative_sums[::-1], target_power, side='left')
+    idx = max(0, len(cumulative_sums) - 1 - rev_idx)
+
     # Return the threshold value
     return sorted_dB[idx]

@@ -16,24 +16,38 @@ Key design decisions
 * mean timing — `min` amplifies the warm-cache best case; `mean` over
   interleaved rounds is more representative of sustained throughput.
 """
+
 import gc
 import time
 import numpy as np
 import healpy as hp
 
-from tod_io   import _load_scan_data_batch, open_scan_day
+from tod_io import _load_scan_data_batch, open_scan_day
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
 from tod_utils import _fmt_time, _get_memory_per_process, compute_bell
 
-_BYTES_PER_SAMPLE_PER_BEAM = 100   # memory model ceiling constant
-_MEMORY_SAFETY_FACTOR       = 1.5
-_MIN_BATCHES_PER_PROBE      = 6   # each candidate must fill this many batches
-_MAX_PROBE_SAMPLES          = 100_000  # cap probe at 100K samples for fast calibration
+# Per-method memory ceiling (bytes per sample per selected beam pixel).
+# Accounts for: rotation vector buffer (B×S×3×float32 = 12 B/sample/pixel),
+# interpolation neighbor indices+weights, and tod accumulation buffers.
+# Empirically measured; bicubic/gaussian query ~40 neighbors vs 4 for bilinear.
+_BYTES_PER_SAMPLE_PER_BEAM = {
+    "nearest": 25,  # 1 neighbor; dominated by rotation buffer
+    "bilinear": 64,  # 4 neighbors (4×index + 4×weight + rotation buffer)
+    "bicubic": 400,  # ~40 gnomonic neighbors
+    "gaussian": 400,  # disc query, comparable to bicubic
+}
+_BYTES_PER_SAMPLE_PER_BEAM_DEFAULT = 100  # fallback for unknown methods
+_MEMORY_SAFETY_FACTOR = 1.5
+_MIN_BATCHES_PER_PROBE = 6  # each candidate must fill this many batches
+_MAX_PROBE_SAMPLES = 100_000  # cap probe at 100K samples for fast calibration
 
 
-def _memory_cap(max_memory_gb, max_beam_sel):
+def _memory_cap(max_memory_gb, max_beam_sel, interp_mode="bilinear"):
+    bpspb = _BYTES_PER_SAMPLE_PER_BEAM.get(
+        interp_mode, _BYTES_PER_SAMPLE_PER_BEAM_DEFAULT
+    )
     budget = max_memory_gb * 1e9 / _MEMORY_SAFETY_FACTOR
-    return max(1, int(budget // (_BYTES_PER_SAMPLE_PER_BEAM * max_beam_sel)))
+    return max(1, int(budget // (bpspb * max_beam_sel)))
 
 
 def _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=None):
@@ -63,15 +77,23 @@ def _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=None):
     else:
         min_bs = max(256, int(128 + max_memory_per_process_gb * 64))
 
-    log_max    = int(np.log2(mem_cap)) + 1
-    powers     = [int(2**k) for k in range(1, log_max + 1)]
-    extras     = [mem_cap, mem_cap // 2, mem_cap // 4]
+    log_max = int(np.log2(mem_cap)) + 1
+    powers = [int(2**k) for k in range(1, log_max + 1)]
+    extras = [mem_cap, mem_cap // 2, mem_cap // 4]
     candidates = sorted(set(powers + [c for c in extras if c >= 1]))
     return [c for c in candidates if min_bs <= c <= mem_cap]
 
 
-def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
-                         n_repeats=3, prefix="", interp_mode='bilinear'):
+def _calibrate_batch_size(
+    beam_data,
+    folder_scan,
+    probe_day,
+    mp,
+    n_processes,
+    n_repeats=3,
+    prefix="",
+    interp_mode="bilinear",
+):
     """Find the batch size that maximises sustained throughput on this hardware.
 
     Runs once before the day loop. Generates candidate batch sizes from a power-
@@ -98,14 +120,16 @@ def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
             - **results** (*list[tuple[int, float]]*) – Per-candidate list of
               ``(batch_size, throughput_samples_per_second)``.
     """
-    nside        = hp.get_nside(mp[0])
-    max_beam_sel = max(d['n_sel'] for d in beam_data.values())
-    first_bf     = next(iter(beam_data))
-    ra0, dec0    = beam_data[first_bf]['ra'], beam_data[first_bf]['dec']
+    nside = hp.get_nside(mp[0])
+    max_beam_sel = max(d["n_sel"] for d in beam_data.values())
+    first_bf = next(iter(beam_data))
+    ra0, dec0 = beam_data[first_bf]["ra"], beam_data[first_bf]["dec"]
 
     max_memory_gb = _get_memory_per_process(n_processes)
-    mem_cap       = _memory_cap(max_memory_gb, max_beam_sel)
-    candidates = _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=max_memory_gb)
+    mem_cap = _memory_cap(max_memory_gb, max_beam_sel, interp_mode=interp_mode)
+    candidates = _candidate_batch_sizes(
+        mem_cap, max_memory_per_process_gb=max_memory_gb
+    )
 
     # Every candidate must run at least _MIN_BATCHES_PER_PROBE full batches.
     # The largest candidate (mem_cap) is the binding constraint.
@@ -114,7 +138,10 @@ def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
     theta_p, phi_p, psi_p = _load_scan_data_batch(folder_scan, probe_day, 0, probe_n)
     probe_n = min(probe_n, len(phi_p))
 
-    print(prefix + f"[calibrate] probe_n={probe_n}, mem_cap={mem_cap}, candidates={candidates}")
+    print(
+        prefix
+        + f"[calibrate] probe_n={probe_n}, mem_cap={mem_cap}, candidates={candidates}"
+    )
 
     def _run_one(bs):
         n_batches = (probe_n + bs - 1) // bs
@@ -122,10 +149,21 @@ def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
         for b in range(n_batches):
             s, e = b * bs, min((b + 1) * bs, probe_n)
             phi_b, theta_b, psi_b = phi_p[s:e], theta_p[s:e], psi_p[s:e]
-            rot_vecs, betas = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
+            rot_vecs, betas = precompute_rotation_vector_batch(
+                ra0, dec0, phi_b, theta_b
+            )
             psis_b = -betas + psi_b
             for data in beam_data.values():
-                beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b, interp_mode=interp_mode)
+                beam_tod_batch(
+                    nside,
+                    mp,
+                    data,
+                    rot_vecs,
+                    phi_b,
+                    theta_b,
+                    psis_b,
+                    interp_mode=interp_mode,
+                )
         return time.perf_counter() - t0
 
     _run_one(candidates[len(candidates) // 2])  # warm-up (Python/numpy JIT)
@@ -142,18 +180,32 @@ def _calibrate_batch_size(beam_data, folder_scan, probe_day, mp, n_processes,
 
     results = []
     for bs in candidates:
-        mean_t     = np.mean(times[bs])
+        mean_t = np.mean(times[bs])
         throughput = probe_n / mean_t
         results.append((bs, throughput))
-        print(prefix + f"[calibrate]   batch_size={bs:8d}  time={_fmt_time(mean_t)}  throughput={throughput:,.0f} samp/s")
+        print(
+            prefix
+            + f"[calibrate]   batch_size={bs:8d}  time={_fmt_time(mean_t)}  throughput={throughput:,.0f} samp/s"
+        )
 
     best_bs, best_tp = max(results, key=lambda x: x[1])
-    print(prefix + f"[calibrate] -> optimal batch_size={best_bs}  ({best_tp:,.0f} samp/s)  [mem_cap={mem_cap}]")
+    print(
+        prefix
+        + f"[calibrate] -> optimal batch_size={best_bs}  ({best_tp:,.0f} samp/s)  [mem_cap={mem_cap}]"
+    )
     return best_bs, results
 
 
-def _calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
-                           n_repeats=3, prefix="", interp_mode='bilinear'):
+def _calibrate_n_processes(
+    beam_data,
+    folder_scan,
+    probe_day,
+    mp,
+    n_cpu_ceiling,
+    n_repeats=3,
+    prefix="",
+    interp_mode="bilinear",
+):
     """Find the optimal number of worker processes for maximum total throughput.
 
     Estimates total throughput as ``throughput_per_process(n) × n`` and returns
@@ -189,16 +241,21 @@ def _calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
             - **batch_size** (*int*) – Optimal batch size for that process
               count.
     """
-    max_beam_sel = max(d['n_sel'] for d in beam_data.values())
+    max_beam_sel = max(d["n_sel"] for d in beam_data.values())
 
     # Total usable memory: _get_memory_per_process(1) = available × fraction / 1
     total_memory_gb = _get_memory_per_process(1)
 
     # Run calibration with full memory to get throughput at all batch sizes.
-    print(prefix + f"[n_proc] Calibrating throughput curve "
-          f"(total_memory={total_memory_gb:.1f} GB, cpu_ceiling={n_cpu_ceiling})...")
+    print(
+        prefix + f"[n_proc] Calibrating throughput curve "
+        f"(total_memory={total_memory_gb:.1f} GB, cpu_ceiling={n_cpu_ceiling})..."
+    )
     _, results = _calibrate_batch_size(
-        beam_data, folder_scan, probe_day, mp,
+        beam_data,
+        folder_scan,
+        probe_day,
+        mp,
         n_processes=1,
         n_repeats=n_repeats,
         prefix=prefix,
@@ -206,7 +263,7 @@ def _calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
     )
     # results: list of (batch_size, throughput_samp_per_s), ordered by batch_size
     results_dict = dict(results)
-    sorted_bs    = sorted(results_dict)
+    sorted_bs = sorted(results_dict)
 
     # For each candidate n compute estimated total throughput.
     print(prefix + f"[n_proc] Scanning n_processes 1 … {n_cpu_ceiling}:")
@@ -214,54 +271,78 @@ def _calibrate_n_processes(beam_data, folder_scan, probe_day, mp, n_cpu_ceiling,
 
     for n in range(1, n_cpu_ceiling + 1):
         mem_per_proc = total_memory_gb / n
-        cap          = _memory_cap(mem_per_proc, max_beam_sel)
-        affordable   = [bs for bs in sorted_bs if bs <= cap]
+        cap = _memory_cap(mem_per_proc, max_beam_sel, interp_mode=interp_mode)
+        affordable = [bs for bs in sorted_bs if bs <= cap]
         if not affordable:
-            print(prefix + f"[n_proc]   n={n:3d}: mem/proc={mem_per_proc:.2f} GB  "
-                  f"→ no affordable batch size, skipping")
+            print(
+                prefix + f"[n_proc]   n={n:3d}: mem/proc={mem_per_proc:.2f} GB  "
+                f"→ no affordable batch size, skipping"
+            )
             continue
-        bs_n       = max(affordable, key=lambda bs: results_dict[bs])
+        bs_n = max(affordable, key=lambda bs: results_dict[bs])
         tp_per_proc = results_dict[bs_n]
-        total_tp   = tp_per_proc * n
-        marker     = "  ←" if total_tp > best_total_tp else ""
-        print(prefix + f"[n_proc]   n={n:3d}: mem/proc={mem_per_proc:.2f} GB  "
-              f"cap={cap}  batch_size={bs_n}  "
-              f"tp/proc={tp_per_proc:,.0f}  total={total_tp:,.0f}{marker}")
+        total_tp = tp_per_proc * n
+        marker = "  ←" if total_tp > best_total_tp else ""
+        print(
+            prefix + f"[n_proc]   n={n:3d}: mem/proc={mem_per_proc:.2f} GB  "
+            f"cap={cap}  batch_size={bs_n}  "
+            f"tp/proc={tp_per_proc:,.0f}  total={total_tp:,.0f}{marker}"
+        )
         if total_tp > best_total_tp:
             best_total_tp = total_tp
-            best_n        = n
-            best_bs       = bs_n
+            best_n = n
+            best_bs = bs_n
 
-    print(prefix + f"[n_proc] → n_optimal={best_n}  batch_size={best_bs}  "
-          f"(est. total throughput={best_total_tp:,.0f} samp/s)")
+    print(
+        prefix + f"[n_proc] → n_optimal={best_n}  batch_size={best_bs}  "
+        f"(est. total throughput={best_total_tp:,.0f} samp/s)"
+    )
     return best_n, best_bs
 
 
-def _run_clustering_probe(nside, mp, beam_entries, rot_vecs, phi_b, theta_b, psis_b,
-                           interp_mode, sigma_deg, radius_deg):
+def _run_clustering_probe(
+    nside,
+    mp,
+    beam_entries,
+    rot_vecs,
+    phi_b,
+    theta_b,
+    psis_b,
+    interp_mode,
+    sigma_deg,
+    radius_deg,
+):
     """Run beam_tod_batch for all entries and accumulate into a (3, B) array."""
     B = len(phi_b)
     tod = np.zeros((3, B), dtype=np.float64)
     for data in beam_entries:
-        contrib = beam_tod_batch(nside, mp, data, rot_vecs, phi_b, theta_b, psis_b,
-                                 interp_mode=interp_mode,
-                                 sigma_deg=sigma_deg,
-                                 radius_deg=radius_deg)
+        contrib = beam_tod_batch(
+            nside,
+            mp,
+            data,
+            rot_vecs,
+            phi_b,
+            theta_b,
+            psis_b,
+            interp_mode=interp_mode,
+            sigma_deg=sigma_deg,
+            radius_deg=radius_deg,
+        )
         for comp, vals in contrib.items():
             tod[comp] += vals
     return tod
 
 
 def calibrate_beam_clustering(
-        beam_data,
-        folder_scan      = None,
-        probe_day        = None,
-        mp               = None,
-        error_threshold  = 1e-3,
-        bell_lmax        = None,
-        interp_mode      = 'bilinear',
-        interp_sigma_deg = None,
-        interp_radius_deg= None,
+    beam_data,
+    folder_scan=None,
+    probe_day=None,
+    mp=None,
+    error_threshold=1e-3,
+    bell_lmax=None,
+    interp_mode="bilinear",
+    interp_sigma_deg=None,
+    interp_radius_deg=None,
 ):
     """Find the (tail_fraction, n_clusters) pair that maximises speedup while
     keeping the B_ell divergence from the analytical beam below
@@ -301,7 +382,7 @@ def calibrate_beam_clustering(
         tuple[float, int]: (best_tail_fraction, best_n_clusters)
     """
     # Search grid — same as before.
-    tail_fractions  = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
+    tail_fractions = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
     n_clusters_list = (10, 20, 50, 100, 200, 500, 1000, 2000)
 
     from beam_cluster import cluster_beam_pixels
@@ -318,34 +399,40 @@ def calibrate_beam_clustering(
         theta_pix, phi_pix = hp.vec2ang(vec)
         dec_offset = np.pi / 2.0 - theta_pix
         _, bell = compute_bell(
-            phi_pix, dec_offset, bvals.astype(np.float64),
-            lmax=bell_lmax, power_cut=1.0, verbose=False,
+            phi_pix,
+            dec_offset,
+            bvals.astype(np.float64),
+            lmax=bell_lmax,
+            power_cut=1.0,
+            verbose=False,
         )
         return bell
 
     # ── Reference B_ell from unclustered beam ────────────────────────────────
-    print("[clust_calib] Computing reference B_ell (power_cut=1.0, lmax="
-          f"{bell_lmax}) …")
+    print(
+        f"[clust_calib] Computing reference B_ell (power_cut=1.0, lmax={bell_lmax}) …"
+    )
     ref_bells = {}
     for bf, data in beam_data.items():
-        ref_bells[bf] = _bell_from_vecs(data['vec_orig'], data['beam_vals'])
+        ref_bells[bf] = _bell_from_vecs(data["vec_orig"], data["beam_vals"])
 
-    S_bf = {bf: data['n_sel'] for bf, data in beam_data.items()}
+    S_bf = {bf: data["n_sel"] for bf, data in beam_data.items()}
 
     # ── Grid sweep using B_ell divergence ────────────────────────────────────
     print("[clust_calib] Sweeping clustering parameters …")
-    results = []   # (tf, K_req, K_out_repr, speedup, bell_div)
+    results = []  # (tf, K_req, K_out_repr, speedup, bell_div)
 
     for tf in tail_fractions:
         for K_req in n_clusters_list:
             K_out_per_bf = {}
-            bell_divs    = []
+            bell_divs = []
 
             for bf, data in beam_data.items():
-                bv_copy = data['beam_vals'].copy()
-                vo_copy = data['vec_orig'].copy()
+                bv_copy = data["beam_vals"].copy()
+                vo_copy = data["vec_orig"].copy()
                 vec_c, bv_c, _ = cluster_beam_pixels(
-                    vo_copy, bv_copy,
+                    vo_copy,
+                    bv_copy,
                     n_clusters=K_req,
                     tail_fraction=tf,
                     verbose=False,
@@ -354,52 +441,64 @@ def calibrate_beam_clustering(
                 K_out_per_bf[bf] = K_out
 
                 bell_clust = _bell_from_vecs(vec_c, bv_c)
-                bell_ref   = ref_bells[bf]
-                ref_rms    = float(np.sqrt(np.mean(bell_ref ** 2)))
-                bell_div   = (float(np.sqrt(np.mean((bell_clust - bell_ref) ** 2)))
-                              / (ref_rms + 1e-30))
+                bell_ref = ref_bells[bf]
+                ref_rms = float(np.sqrt(np.mean(bell_ref**2)))
+                bell_div = float(np.sqrt(np.mean((bell_clust - bell_ref) ** 2))) / (
+                    ref_rms + 1e-30
+                )
                 bell_divs.append(bell_div)
 
             mean_bell_div = float(np.mean(bell_divs))
-            speedup       = float(np.mean([S_bf[bf] / K_out_per_bf[bf]
-                                           for bf in beam_data]))
-            K_out_repr    = int(np.mean(list(K_out_per_bf.values())))
+            speedup = float(np.mean([S_bf[bf] / K_out_per_bf[bf] for bf in beam_data]))
+            K_out_repr = int(np.mean(list(K_out_per_bf.values())))
             results.append((tf, K_req, K_out_repr, speedup, mean_bell_div))
 
     # ── Print ASCII table ─────────────────────────────────────────────────────
     print()
     print(f"[clust_calib] error_threshold={error_threshold:.1e}")
-    print(f"{'tail%':>6s}  {'K':>5s}  {'K_out':>6s}  {'speedup':>8s}  "
-          f"{'B_ell div':>10s}  {'status'}")
+    print(
+        f"{'tail%':>6s}  {'K':>5s}  {'K_out':>6s}  {'speedup':>8s}  "
+        f"{'B_ell div':>10s}  {'status'}"
+    )
     print("-" * 56)
     prev_tf = None
     for tf, K_req, K_out, speedup, bell_div in results:
         if prev_tf is not None and tf != prev_tf:
             print("-" * 56)
         status = "✓" if bell_div <= error_threshold else "✗"
-        print(f"{tf*100:>5.1f}%  {K_req:>5d}  {K_out:>6d}  {speedup:>8.2f}x  "
-              f"{bell_div:>10.2e}  {status}")
+        print(
+            f"{tf * 100:>5.1f}%  {K_req:>5d}  {K_out:>6d}  {speedup:>8.2f}x  "
+            f"{bell_div:>10.2e}  {status}"
+        )
         prev_tf = tf
     print("-" * 56)
 
     # ── Select best ───────────────────────────────────────────────────────────
-    passing = [(tf, K_req, K_out, speedup, bell_div)
-               for tf, K_req, K_out, speedup, bell_div in results
-               if bell_div <= error_threshold]
+    passing = [
+        (tf, K_req, K_out, speedup, bell_div)
+        for tf, K_req, K_out, speedup, bell_div in results
+        if bell_div <= error_threshold
+    ]
 
     if passing:
-        best = max(passing, key=lambda x: x[3])   # max speedup
+        best = max(passing, key=lambda x: x[3])  # max speedup
         best_tf, best_K_req = best[0], best[1]
-        print(f"\n[clust_calib] Recommendation: tail_fraction={best_tf}, "
-              f"n_clusters={best_K_req}  "
-              f"(speedup={best[3]:.2f}x, B_ell div={best[4]:.2e})")
+        print(
+            f"\n[clust_calib] Recommendation: tail_fraction={best_tf}, "
+            f"n_clusters={best_K_req}  "
+            f"(speedup={best[3]:.2f}x, B_ell div={best[4]:.2e})"
+        )
     else:
-        best = min(results, key=lambda x: x[4])   # min B_ell divergence
+        best = min(results, key=lambda x: x[4])  # min B_ell divergence
         best_tf, best_K_req = best[0], best[1]
-        print(f"\n[clust_calib] WARNING: no (tf, K) pair achieved B_ell div <= "
-              f"{error_threshold:.1e}.")
-        print(f"[clust_calib] Returning minimum-divergence pair: "
-              f"tail_fraction={best_tf}, n_clusters={best_K_req}  "
-              f"(B_ell div={best[4]:.2e})")
+        print(
+            f"\n[clust_calib] WARNING: no (tf, K) pair achieved B_ell div <= "
+            f"{error_threshold:.1e}."
+        )
+        print(
+            f"[clust_calib] Returning minimum-divergence pair: "
+            f"tail_fraction={best_tf}, n_clusters={best_K_req}  "
+            f"(B_ell div={best[4]:.2e})"
+        )
 
     return float(best_tf), int(best_K_req)
