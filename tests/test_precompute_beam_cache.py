@@ -50,6 +50,7 @@ from precompute_beam_cache import (
 # TestRollVectorsJit
 # ===========================================================================
 
+
 class TestRollVectorsJit:
     """Tests for precompute_beam_cache._roll_vectors_jit."""
 
@@ -73,7 +74,7 @@ class TestRollVectorsJit:
     def test_identity_at_psi_zero(self):
         """psi = 0 produces identity rotation: vec_rolled == vec_orig."""
         rng = np.random.default_rng(1)
-        S   = 6
+        S = 6
         vec_orig = rng.standard_normal((S, 3)).astype(np.float32)
         vec_orig /= np.linalg.norm(vec_orig, axis=-1, keepdims=True)
         psi_grid = np.array([0.0], dtype=np.float32)
@@ -108,7 +109,7 @@ class TestRollVectorsJit:
     def test_full_cycle_returns_to_start(self):
         """Rotations at psi=0 and psi=2pi give the same result."""
         rng = np.random.default_rng(3)
-        S   = 4
+        S = 4
         vec_orig = rng.standard_normal((S, 3)).astype(np.float32)
         vec_orig /= np.linalg.norm(vec_orig, axis=-1, keepdims=True)
         psi_grid = np.array([0.0, 2 * np.pi], dtype=np.float32)
@@ -121,13 +122,18 @@ class TestRollVectorsJit:
         psi_grid = np.linspace(0, 2 * np.pi, 8, endpoint=False, dtype=np.float32)
         out = self._run(beam_ctr_row, psi_grid)
         for k in range(len(psi_grid)):
-            npt.assert_allclose(out[k, 0], [1.0, 0.0, 0.0], atol=1e-5,
-                                err_msg=f"beam_ctr not fixed at psi={psi_grid[k]:.3f}")
+            npt.assert_allclose(
+                out[k, 0],
+                [1.0, 0.0, 0.0],
+                atol=1e-5,
+                err_msg=f"beam_ctr not fixed at psi={psi_grid[k]:.3f}",
+            )
 
 
 # ===========================================================================
 # TestComputeAngularOffsets
 # ===========================================================================
+
 
 class TestComputeAngularOffsets:
     """Tests for precompute_beam_cache._compute_angular_offsets."""
@@ -163,23 +169,24 @@ class TestComputeAngularOffsets:
         vec_rolled = np.zeros((N_psi, S, 3), dtype=np.float32)
         dtheta, dphi = _compute_angular_offsets(vec_rolled, self._BEAM_CTR)
         assert dtheta.shape == (N_psi, S)
-        assert dphi.shape   == (N_psi, S)
+        assert dphi.shape == (N_psi, S)
 
     def test_independent_of_x_component(self):
         """Modifying only the x component of vec_rolled does not affect outputs."""
         rng = np.random.default_rng(12)
-        vec_rolled  = rng.standard_normal((4, 5, 3)).astype(np.float32)
+        vec_rolled = rng.standard_normal((4, 5, 3)).astype(np.float32)
         dtheta1, dphi1 = _compute_angular_offsets(vec_rolled, self._BEAM_CTR)
         vec_rolled2 = vec_rolled.copy()
         vec_rolled2[:, :, 0] *= 2.5
         dtheta2, dphi2 = _compute_angular_offsets(vec_rolled2, self._BEAM_CTR)
         npt.assert_array_equal(dtheta1, dtheta2)
-        npt.assert_array_equal(dphi1,   dphi2)
+        npt.assert_array_equal(dphi1, dphi2)
 
 
 # ===========================================================================
 # TestCacheFilename
 # ===========================================================================
+
 
 class TestCacheFilename:
     """Tests for precompute_beam_cache._cache_filename."""
@@ -216,6 +223,7 @@ class TestCacheFilename:
 # TestSaveCacheLoadCache
 # ===========================================================================
 
+
 class TestSaveCacheLoadCache:
     """Tests for precompute_beam_cache._save_cache and _load_cache."""
 
@@ -224,10 +232,10 @@ class TestSaveCacheLoadCache:
         if rng is None:
             rng = np.random.default_rng(20)
         return {
-            "psi_grid":   np.linspace(0, 2 * np.pi, 8, dtype=np.float32),
+            "psi_grid": np.linspace(0, 2 * np.pi, 8, dtype=np.float32),
             "vec_rolled": rng.standard_normal((8, 5, 3)).astype(np.float32),
-            "beam_vals":  rng.uniform(0, 1, 5).astype(np.float32),
-            "beam_ctr":   np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            "beam_vals": rng.uniform(0, 1, 5).astype(np.float32),
+            "beam_ctr": np.array([1.0, 0.0, 0.0], dtype=np.float32),
         }
 
     def test_round_trip_values(self):
@@ -240,8 +248,9 @@ class TestSaveCacheLoadCache:
             loaded = _load_cache(path)
             assert set(loaded.keys()) == set(cache.keys())
             for key in cache:
-                npt.assert_array_equal(loaded[key], cache[key],
-                                       err_msg=f"Mismatch for key '{key}'")
+                npt.assert_array_equal(
+                    loaded[key], cache[key], err_msg=f"Mismatch for key '{key}'"
+                )
         finally:
             os.unlink(path)
 
@@ -254,8 +263,9 @@ class TestSaveCacheLoadCache:
             _save_cache(cache, path)
             loaded = _load_cache(path)
             for key in cache:
-                assert loaded[key].dtype == cache[key].dtype, \
+                assert loaded[key].dtype == cache[key].dtype, (
                     f"dtype mismatch for '{key}': {loaded[key].dtype} vs {cache[key].dtype}"
+                )
         finally:
             os.unlink(path)
 
@@ -276,7 +286,7 @@ class TestSaveCacheLoadCache:
         rng = np.random.default_rng(21)
         cache = self._make_cache(rng)
         cache["dtheta"] = rng.standard_normal((8, 5)).astype(np.float32)
-        cache["dphi"]   = rng.standard_normal((8, 5)).astype(np.float32)
+        cache["dphi"] = rng.standard_normal((8, 5)).astype(np.float32)
         with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
             path = f.name
         try:
@@ -292,6 +302,7 @@ class TestSaveCacheLoadCache:
 # TestLookupPsiBin
 # ===========================================================================
 
+
 class TestLookupPsiBin:
     """Tests for precompute_beam_cache._lookup_psi_bin."""
 
@@ -301,53 +312,53 @@ class TestLookupPsiBin:
 
     def test_exact_bin_centers_round_trip(self):
         """psi_grid[k] maps to bin index k for all k."""
-        n_psi    = 12
+        n_psi = 12
         psi_grid = self._make_grid(n_psi)
-        indices  = _lookup_psi_bin(psi_grid.astype(np.float64), psi_grid)
+        indices = _lookup_psi_bin(psi_grid.astype(np.float64), psi_grid)
         npt.assert_array_equal(indices, np.arange(n_psi))
 
     def test_wrapping_full_circle(self):
         """psi = 2π wraps to bin 0."""
-        n_psi    = 8
+        n_psi = 8
         psi_grid = self._make_grid(n_psi)
         idx = _lookup_psi_bin(np.array([2 * np.pi]), psi_grid)
         assert idx[0] == 0
 
     def test_wrapping_negative_psi(self):
         """psi = -dpsi wraps to bin n_psi - 1."""
-        n_psi    = 8
+        n_psi = 8
         psi_grid = self._make_grid(n_psi)
-        dpsi     = 2 * np.pi / n_psi
+        dpsi = 2 * np.pi / n_psi
         idx = _lookup_psi_bin(np.array([-dpsi]), psi_grid)
         assert idx[0] == n_psi - 1
 
     def test_output_in_valid_range(self):
         """All output indices are in [0, n_psi)."""
-        rng        = np.random.default_rng(30)
-        n_psi      = 720
-        psi_grid   = self._make_grid(n_psi)
+        rng = np.random.default_rng(30)
+        n_psi = 720
+        psi_grid = self._make_grid(n_psi)
         psi_values = rng.uniform(-10 * np.pi, 10 * np.pi, 100)
-        indices    = _lookup_psi_bin(psi_values, psi_grid)
+        indices = _lookup_psi_bin(psi_values, psi_grid)
         assert np.all(indices >= 0)
         assert np.all(indices < n_psi)
 
     def test_output_shape_matches_input(self):
         """Output shape matches the input psi_values shape."""
-        psi_grid   = self._make_grid(4)
+        psi_grid = self._make_grid(4)
         psi_values = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
-        indices    = _lookup_psi_bin(psi_values, psi_grid)
+        indices = _lookup_psi_bin(psi_values, psi_grid)
         assert indices.shape == psi_values.shape
 
     def test_output_dtype_int64(self):
         """Output array has dtype int64."""
-        psi_grid   = self._make_grid(4)
+        psi_grid = self._make_grid(4)
         psi_values = np.array([0.0, 1.0])
-        indices    = _lookup_psi_bin(psi_values, psi_grid)
+        indices = _lookup_psi_bin(psi_values, psi_grid)
         assert indices.dtype == np.int64
 
     def test_large_positive_psi_wraps(self):
         """psi = 4π (two full rotations) maps to bin 0."""
-        n_psi    = 8
+        n_psi = 8
         psi_grid = self._make_grid(n_psi)
         idx = _lookup_psi_bin(np.array([4 * np.pi]), psi_grid)
         assert idx[0] == 0
@@ -356,10 +367,10 @@ class TestLookupPsiBin:
     def test_monotone_within_interior(self, n_psi):
         """Indices are non-decreasing for psi values that stay away from the 2π wrap point."""
         psi_grid = self._make_grid(n_psi)
-        dpsi     = 2 * np.pi / n_psi
+        dpsi = 2 * np.pi / n_psi
         # Sample psi values covering [0, 2π - 2*dpsi], well clear of the wrap boundary.
         psi_values = np.linspace(0, 2 * np.pi - 2 * dpsi, n_psi)
-        indices    = _lookup_psi_bin(psi_values, psi_grid)
+        indices = _lookup_psi_bin(psi_values, psi_grid)
         assert np.all(np.diff(indices) >= 0)
 
 
@@ -368,4 +379,5 @@ class TestLookupPsiBin:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import pytest
+
     sys.exit(pytest.main([__file__, "-v"]))

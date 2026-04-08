@@ -55,6 +55,7 @@ from numba_healpy import (
 # TestRingAboveJit
 # ===========================================================================
 
+
 class TestRingAboveJit:
     """Tests for tod_core._ring_above_jit — the scalar HEALPix ring_above helper."""
 
@@ -90,22 +91,21 @@ class TestRingAboveJit:
         for z in rng.uniform(-1.0, 1.0, 200):
             ir = _ring_above_jit(nside, float(z))
             assert 0 <= ir <= 4 * nside - 1, (
-                f"ring_above={ir} out of range [0, {4*nside-1}] for z={z:.6f}")
+                f"ring_above={ir} out of range [0, {4 * nside - 1}] for z={z:.6f}"
+            )
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_consistent_with_ring_z(self, nside):
         """For interior z, z_ring(ir) >= z >= z_ring(ir+1) where ir = ring_above(z)."""
         rng = np.random.default_rng(21)
-        z_vals = rng.uniform(-0.60, 0.60, 50)   # stay away from polar boundaries
+        z_vals = rng.uniform(-0.60, 0.60, 50)  # stay away from polar boundaries
         for z in z_vals:
             ir = _ring_above_jit(nside, float(z))
             if 1 <= ir <= 4 * nside - 2:
                 za = _ring_z_jit(nside, ir)
                 zb = _ring_z_jit(nside, ir + 1)
-                assert za >= float(z) - 1e-12, (
-                    f"z_ring({ir})={za:.8f} < z={z:.8f}")
-                assert zb <= float(z) + 1e-12, (
-                    f"z_ring({ir+1})={zb:.8f} > z={z:.8f}")
+                assert za >= float(z) - 1e-12, f"z_ring({ir})={za:.8f} < z={z:.8f}"
+                assert zb <= float(z) + 1e-12, f"z_ring({ir + 1})={zb:.8f} > z={z:.8f}"
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_monotone_decreasing_output(self, nside):
@@ -122,6 +122,7 @@ class TestRingAboveJit:
 # TestRingInfoJit
 # ===========================================================================
 
+
 class TestRingInfoJit:
     """Tests for tod_core._ring_info_jit — ring layout helper."""
 
@@ -130,11 +131,15 @@ class TestRingInfoJit:
         """Ring 1 (first NPC ring): n_pix=4, first_pix=0, shifted."""
         npix = 12 * nside * nside
         n_pix, first_pix, phi0, dphi = _ring_info_jit(nside, 1, npix)
-        assert n_pix    == 4
+        assert n_pix == 4
         assert first_pix == 0
         npt.assert_allclose(dphi, 2 * np.pi / 4, atol=1e-14)
-        npt.assert_allclose(phi0, dphi / 2,       atol=1e-14,
-                            err_msg="ring 1 should be shifted (phi0 = dphi/2)")
+        npt.assert_allclose(
+            phi0,
+            dphi / 2,
+            atol=1e-14,
+            err_msg="ring 1 should be shifted (phi0 = dphi/2)",
+        )
 
     @pytest.mark.parametrize("nside", [2, 4, 16])
     def test_npc_ring_sizes(self, nside):
@@ -142,7 +147,7 @@ class TestRingInfoJit:
         npix = 12 * nside * nside
         for ir in range(1, nside):
             n_pix, _, _, _ = _ring_info_jit(nside, ir, npix)
-            assert n_pix == 4 * ir, f"ring {ir}: got n_pix={n_pix}, expected {4*ir}"
+            assert n_pix == 4 * ir, f"ring {ir}: got n_pix={n_pix}, expected {4 * ir}"
 
     @pytest.mark.parametrize("nside", [2, 4, 16])
     def test_equatorial_ring_sizes(self, nside):
@@ -151,7 +156,8 @@ class TestRingInfoJit:
         for ir in range(nside, 3 * nside + 1):
             n_pix, _, _, _ = _ring_info_jit(nside, ir, npix)
             assert n_pix == 4 * nside, (
-                f"ring {ir}: got n_pix={n_pix}, expected {4*nside}")
+                f"ring {ir}: got n_pix={n_pix}, expected {4 * nside}"
+            )
 
     @pytest.mark.parametrize("nside", [2, 4, 16])
     def test_first_equatorial_startpix(self, nside):
@@ -160,7 +166,8 @@ class TestRingInfoJit:
         ncap = 2 * nside * (nside - 1)
         _, first_pix, _, _ = _ring_info_jit(nside, nside, npix)
         assert first_pix == ncap, (
-            f"nside={nside}: first_pix={first_pix}, expected ncap={ncap}")
+            f"nside={nside}: first_pix={first_pix}, expected ncap={ncap}"
+        )
 
     @pytest.mark.parametrize("nside", [2, 4, 16])
     def test_equatorial_shift_alternates(self, nside):
@@ -169,11 +176,13 @@ class TestRingInfoJit:
         for ir in range(nside, 3 * nside + 1):
             _, _, phi0, dphi = _ring_info_jit(nside, ir, npix)
             if (ir - nside) % 2 == 0:
-                npt.assert_allclose(phi0, dphi / 2, atol=1e-14,
-                                    err_msg=f"ring {ir} should be shifted")
+                npt.assert_allclose(
+                    phi0, dphi / 2, atol=1e-14, err_msg=f"ring {ir} should be shifted"
+                )
             else:
-                npt.assert_allclose(phi0, 0.0, atol=1e-14,
-                                    err_msg=f"ring {ir} should NOT be shifted")
+                npt.assert_allclose(
+                    phi0, 0.0, atol=1e-14, err_msg=f"ring {ir} should NOT be shifted"
+                )
 
     @pytest.mark.parametrize("nside", [2, 4, 16])
     def test_spc_rings_always_shifted(self, nside):
@@ -181,8 +190,9 @@ class TestRingInfoJit:
         npix = 12 * nside * nside
         for ir in range(3 * nside + 1, 4 * nside):
             _, _, phi0, dphi = _ring_info_jit(nside, ir, npix)
-            npt.assert_allclose(phi0, dphi / 2, atol=1e-14,
-                                err_msg=f"SPC ring {ir} should be shifted")
+            npt.assert_allclose(
+                phi0, dphi / 2, atol=1e-14, err_msg=f"SPC ring {ir} should be shifted"
+            )
 
     @pytest.mark.parametrize("nside", [2, 4, 8, 16])
     def test_partition_covers_all_pixels(self, nside):
@@ -193,10 +203,14 @@ class TestRingInfoJit:
             n_pix, first_pix, _, _ = _ring_info_jit(nside, ir, npix_total)
             assert first_pix >= 0, f"ring {ir}: first_pix={first_pix} < 0"
             assert first_pix + n_pix <= npix_total, (
-                f"ring {ir}: pixel range [{first_pix}, {first_pix+n_pix}) exceeds npix")
-            covered[first_pix:first_pix + n_pix] += 1
-        npt.assert_array_equal(covered, np.ones(npix_total, dtype=np.int32),
-                               err_msg="Some pixels covered 0 or >1 times")
+                f"ring {ir}: pixel range [{first_pix}, {first_pix + n_pix}) exceeds npix"
+            )
+            covered[first_pix : first_pix + n_pix] += 1
+        npt.assert_array_equal(
+            covered,
+            np.ones(npix_total, dtype=np.int32),
+            err_msg="Some pixels covered 0 or >1 times",
+        )
 
     @pytest.mark.parametrize("nside", [2, 4, 16])
     def test_dphi_equals_twopi_over_npix(self, nside):
@@ -204,13 +218,15 @@ class TestRingInfoJit:
         npix = 12 * nside * nside
         for ir in range(1, 4 * nside):
             n_pix, _, _, dphi = _ring_info_jit(nside, ir, npix)
-            npt.assert_allclose(dphi, 2 * np.pi / n_pix, atol=1e-14,
-                                err_msg=f"ring {ir}: dphi mismatch")
+            npt.assert_allclose(
+                dphi, 2 * np.pi / n_pix, atol=1e-14, err_msg=f"ring {ir}: dphi mismatch"
+            )
 
 
 # ===========================================================================
 # TestRingZJit
 # ===========================================================================
+
 
 class TestRingZJit:
     """Tests for tod_core._ring_z_jit — ring centre z=cos(theta) helper."""
@@ -256,7 +272,8 @@ class TestRingZJit:
         for ir in range(2, 4 * nside):
             z = _ring_z_jit(nside, ir)
             assert z < z_prev, (
-                f"z not strictly decreasing at ir={ir}: z[{ir}]={z:.10f} >= z[{ir-1}]={z_prev:.10f}")
+                f"z not strictly decreasing at ir={ir}: z[{ir}]={z:.10f} >= z[{ir - 1}]={z_prev:.10f}"
+            )
             z_prev = z
 
     @pytest.mark.parametrize("nside", [4, 16])
@@ -265,13 +282,15 @@ class TestRingZJit:
         for ir in range(1, 2 * nside):
             z_north = _ring_z_jit(nside, ir)
             z_south = _ring_z_jit(nside, 4 * nside - ir)
-            npt.assert_allclose(z_north, -z_south, atol=1e-14,
-                                err_msg=f"N/S symmetry failed at ir={ir}")
+            npt.assert_allclose(
+                z_north, -z_south, atol=1e-14, err_msg=f"N/S symmetry failed at ir={ir}"
+            )
 
 
 # ===========================================================================
 # TestGetInterpWeightsNumba
 # ===========================================================================
+
 
 class TestGetInterpWeightsNumba:
     """
@@ -287,10 +306,10 @@ class TestGetInterpWeightsNumba:
     @pytest.mark.parametrize("nside", [2, 4, 16, 64])
     def test_output_shapes_and_dtypes(self, nside):
         """pixels: (4, N) int64; weights: (4, N) float64."""
-        rng   = np.random.default_rng(30)
-        N     = 60
+        rng = np.random.default_rng(30)
+        N = 60
         theta = rng.uniform(0.05, np.pi - 0.05, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         pix, wgt = get_interp_weights_numba(nside, theta, phi)
         assert pix.shape == (4, N)
         assert wgt.shape == (4, N)
@@ -300,33 +319,37 @@ class TestGetInterpWeightsNumba:
     @pytest.mark.parametrize("nside", [2, 4, 16, 64])
     def test_weights_sum_to_one(self, nside):
         """The four bilinear weights sum to exactly 1 for every point."""
-        rng   = np.random.default_rng(31)
-        N     = 300
+        rng = np.random.default_rng(31)
+        N = 300
         theta = rng.uniform(0.0, np.pi, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         _, wgt = get_interp_weights_numba(nside, theta, phi)
-        npt.assert_allclose(wgt.sum(axis=0), np.ones(N), atol=1e-14,
-                            err_msg="Bilinear weights do not sum to 1")
+        npt.assert_allclose(
+            wgt.sum(axis=0),
+            np.ones(N),
+            atol=1e-14,
+            err_msg="Bilinear weights do not sum to 1",
+        )
 
     @pytest.mark.parametrize("nside", [2, 4, 16, 64])
     def test_pixels_in_valid_range(self, nside):
         """All pixel indices lie in [0, 12*nside^2)."""
-        npix  = hp.nside2npix(nside)
-        rng   = np.random.default_rng(32)
-        N     = 300
+        npix = hp.nside2npix(nside)
+        rng = np.random.default_rng(32)
+        N = 300
         theta = rng.uniform(0.0, np.pi, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         pix, _ = get_interp_weights_numba(nside, theta, phi)
-        assert int(pix.min()) >= 0,    "Pixel index below 0"
-        assert int(pix.max()) < npix,  f"Pixel index >= npix={npix}"
+        assert int(pix.min()) >= 0, "Pixel index below 0"
+        assert int(pix.max()) < npix, f"Pixel index >= npix={npix}"
 
     @pytest.mark.parametrize("nside", [2, 4, 16, 64])
     def test_weights_non_negative(self, nside):
         """All interpolation weights are >= 0."""
-        rng   = np.random.default_rng(33)
-        N     = 300
+        rng = np.random.default_rng(33)
+        N = 300
         theta = rng.uniform(0.0, np.pi, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         _, wgt = get_interp_weights_numba(nside, theta, phi)
         assert float(wgt.min()) >= -1e-14, f"Negative weight: {wgt.min()}"
 
@@ -335,49 +358,51 @@ class TestGetInterpWeightsNumba:
     @pytest.mark.parametrize("nside", [2, 4, 16, 64])
     def test_agrees_with_healpy_pixels(self, nside):
         """Pixel indices exactly match hp.get_interp_weights on 500 random interior points."""
-        rng   = np.random.default_rng(34)
-        N     = 500
+        rng = np.random.default_rng(34)
+        N = 500
         theta = rng.uniform(0.05, np.pi - 0.05, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
-        pix_hp, _      = hp.get_interp_weights(nside, theta, phi)
-        pix_nb, _      = get_interp_weights_numba(nside, theta, phi)
-        npt.assert_array_equal(pix_nb, pix_hp,
-                               err_msg=f"Pixel mismatch at nside={nside}")
+        phi = rng.uniform(0.0, 2 * np.pi, N)
+        pix_hp, _ = hp.get_interp_weights(nside, theta, phi)
+        pix_nb, _ = get_interp_weights_numba(nside, theta, phi)
+        npt.assert_array_equal(
+            pix_nb, pix_hp, err_msg=f"Pixel mismatch at nside={nside}"
+        )
 
     @pytest.mark.parametrize("nside", [2, 4, 16, 64])
     def test_agrees_with_healpy_weights(self, nside):
         """Bilinear weights match hp.get_interp_weights to 1e-12 on 500 random points."""
-        rng   = np.random.default_rng(35)
-        N     = 500
+        rng = np.random.default_rng(35)
+        N = 500
         theta = rng.uniform(0.05, np.pi - 0.05, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         _, wgt_hp = hp.get_interp_weights(nside, theta, phi)
         _, wgt_nb = get_interp_weights_numba(nside, theta, phi)
-        npt.assert_allclose(wgt_nb, wgt_hp, atol=1e-12,
-                            err_msg=f"Weight mismatch at nside={nside}")
+        npt.assert_allclose(
+            wgt_nb, wgt_hp, atol=1e-12, err_msg=f"Weight mismatch at nside={nside}"
+        )
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_agrees_with_healpy_in_npc(self, nside):
         """Exact pixel+weight agreement in the north polar cap (theta < arccos(2/3))."""
-        rng   = np.random.default_rng(36)
-        N     = 200
+        rng = np.random.default_rng(36)
+        N = 200
         theta = rng.uniform(0.05, math.acos(2.0 / 3.0) - 0.02, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         pix_hp, wgt_hp = hp.get_interp_weights(nside, theta, phi)
         pix_nb, wgt_nb = get_interp_weights_numba(nside, theta, phi)
-        npt.assert_array_equal(pix_nb, pix_hp,  err_msg="NPC pixel mismatch")
+        npt.assert_array_equal(pix_nb, pix_hp, err_msg="NPC pixel mismatch")
         npt.assert_allclose(wgt_nb, wgt_hp, atol=1e-12, err_msg="NPC weight mismatch")
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_agrees_with_healpy_in_spc(self, nside):
         """Exact pixel+weight agreement in the south polar cap (theta > pi-arccos(2/3))."""
-        rng   = np.random.default_rng(37)
-        N     = 200
+        rng = np.random.default_rng(37)
+        N = 200
         theta = rng.uniform(np.pi - math.acos(2.0 / 3.0) + 0.02, np.pi - 0.05, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         pix_hp, wgt_hp = hp.get_interp_weights(nside, theta, phi)
         pix_nb, wgt_nb = get_interp_weights_numba(nside, theta, phi)
-        npt.assert_array_equal(pix_nb, pix_hp,  err_msg="SPC pixel mismatch")
+        npt.assert_array_equal(pix_nb, pix_hp, err_msg="SPC pixel mismatch")
         npt.assert_allclose(wgt_nb, wgt_hp, atol=1e-12, err_msg="SPC weight mismatch")
 
     # ── special/boundary inputs ───────────────────────────────────────────────
@@ -386,10 +411,10 @@ class TestGetInterpWeightsNumba:
     def test_near_poles_valid_outputs(self, nside):
         """Points very close to the poles produce valid pixel indices and unit weight sums."""
         npix = hp.nside2npix(nside)
-        eps  = 1e-6
+        eps = 1e-6
         # North-pole cluster
         theta_n = np.array([eps, eps / 2, eps / 10])
-        phi_n   = np.array([0.0, np.pi / 2, np.pi])
+        phi_n = np.array([0.0, np.pi / 2, np.pi])
         pix, wgt = get_interp_weights_numba(nside, theta_n, phi_n)
         assert pix.min() >= 0 and pix.max() < npix
         npt.assert_allclose(wgt.sum(axis=0), np.ones(3), atol=1e-13)
@@ -402,13 +427,13 @@ class TestGetInterpWeightsNumba:
     def test_constant_map_gives_constant_value(self):
         """Bilinear interpolation of a constant map returns the constant everywhere."""
         nside = 16
-        npix  = hp.nside2npix(nside)
+        npix = hp.nside2npix(nside)
         const = 3.14159
-        cmap  = np.full(npix, const, dtype=np.float64)
-        rng   = np.random.default_rng(38)
-        N     = 150
+        cmap = np.full(npix, const, dtype=np.float64)
+        rng = np.random.default_rng(38)
+        N = 150
         theta = rng.uniform(0.05, np.pi - 0.05, N)
-        phi   = rng.uniform(0.0, 2 * np.pi, N)
+        phi = rng.uniform(0.0, 2 * np.pi, N)
         pix, wgt = get_interp_weights_numba(nside, theta, phi)
         interp = (cmap[pix] * wgt).sum(axis=0)
         npt.assert_allclose(interp, np.full(N, const), atol=1e-12)
@@ -416,7 +441,7 @@ class TestGetInterpWeightsNumba:
     def test_phi_wrap_around(self):
         """Points at phi ≈ 0 and phi ≈ 2*pi give identical results."""
         nside = 16
-        eps   = 1e-9
+        eps = 1e-9
         theta = np.array([np.pi / 2, np.pi / 3])
         phi_lo = np.array([eps, eps])
         phi_hi = np.array([2 * np.pi - eps, 2 * np.pi - eps])
@@ -433,10 +458,10 @@ class TestGetInterpWeightsNumba:
     def test_pre_allocated_buffer_path(self):
         """_get_interp_weights_jit fills pre-allocated arrays consistently with wrapper."""
         nside = 16
-        rng   = np.random.default_rng(39)
-        N     = 80
+        rng = np.random.default_rng(39)
+        N = 80
         theta = np.asarray(rng.uniform(0.05, np.pi - 0.05, N), dtype=np.float64)
-        phi   = np.asarray(rng.uniform(0.0, 2 * np.pi, N),     dtype=np.float64)
+        phi = np.asarray(rng.uniform(0.0, 2 * np.pi, N), dtype=np.float64)
         pix_w, wgt_w = get_interp_weights_numba(nside, theta, phi)
         pix_j = np.empty((4, N), dtype=np.int64)
         wgt_j = np.empty((4, N), dtype=np.float64)
@@ -448,6 +473,7 @@ class TestGetInterpWeightsNumba:
 # ===========================================================================
 # TestPix2AngNumba
 # ===========================================================================
+
 
 class TestPix2AngNumba:
     """
@@ -475,16 +501,16 @@ class TestPix2AngNumba:
         """All theta values lie in [0, pi]."""
         pix = np.arange(hp.nside2npix(nside), dtype=np.int64)
         th, _ = pix2ang_numba(nside, pix)
-        assert float(th.min()) >= 0.0,      f"theta below 0 at nside={nside}"
-        assert float(th.max()) <= math.pi,  f"theta above pi at nside={nside}"
+        assert float(th.min()) >= 0.0, f"theta below 0 at nside={nside}"
+        assert float(th.max()) <= math.pi, f"theta above pi at nside={nside}"
 
     @pytest.mark.parametrize("nside", [2, 4, 16, 64])
     def test_phi_in_zero_to_twopi(self, nside):
         """All phi values lie in [0, 2*pi]."""
         pix = np.arange(hp.nside2npix(nside), dtype=np.int64)
         _, ph = pix2ang_numba(nside, pix)
-        assert float(ph.min()) >= 0.0,          f"phi below 0 at nside={nside}"
-        assert float(ph.max()) <= 2 * math.pi,  f"phi above 2pi at nside={nside}"
+        assert float(ph.min()) >= 0.0, f"phi below 0 at nside={nside}"
+        assert float(ph.max()) <= 2 * math.pi, f"phi above 2pi at nside={nside}"
 
     # ── agreement with healpy ─────────────────────────────────────────────────
 
@@ -494,16 +520,18 @@ class TestPix2AngNumba:
         pix = np.arange(hp.nside2npix(nside), dtype=np.int64)
         th_nb, ph_nb = pix2ang_numba(nside, pix)
         th_hp, ph_hp = hp.pix2ang(nside, pix, nest=False)
-        npt.assert_allclose(th_nb, th_hp, atol=1e-14,
-                            err_msg=f"theta mismatch at nside={nside}")
-        npt.assert_allclose(ph_nb, ph_hp, atol=1e-14,
-                            err_msg=f"phi mismatch at nside={nside}")
+        npt.assert_allclose(
+            th_nb, th_hp, atol=1e-14, err_msg=f"theta mismatch at nside={nside}"
+        )
+        npt.assert_allclose(
+            ph_nb, ph_hp, atol=1e-14, err_msg=f"phi mismatch at nside={nside}"
+        )
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_agrees_with_healpy_north_polar_cap(self, nside):
         """Exact agreement in the north polar cap (pix < 2*nside*(nside-1))."""
         ncap = 2 * nside * (nside - 1)
-        pix  = np.arange(ncap, dtype=np.int64)
+        pix = np.arange(ncap, dtype=np.int64)
         th_nb, ph_nb = pix2ang_numba(nside, pix)
         th_hp, ph_hp = hp.pix2ang(nside, pix, nest=False)
         npt.assert_allclose(th_nb, th_hp, atol=1e-14, err_msg="NPC theta")
@@ -514,7 +542,7 @@ class TestPix2AngNumba:
         """Exact agreement in the equatorial belt."""
         npix = hp.nside2npix(nside)
         ncap = 2 * nside * (nside - 1)
-        pix  = np.arange(ncap, npix - ncap, dtype=np.int64)
+        pix = np.arange(ncap, npix - ncap, dtype=np.int64)
         th_nb, ph_nb = pix2ang_numba(nside, pix)
         th_hp, ph_hp = hp.pix2ang(nside, pix, nest=False)
         npt.assert_allclose(th_nb, th_hp, atol=1e-14, err_msg="belt theta")
@@ -525,7 +553,7 @@ class TestPix2AngNumba:
         """Exact agreement in the south polar cap."""
         npix = hp.nside2npix(nside)
         ncap = 2 * nside * (nside - 1)
-        pix  = np.arange(npix - ncap, npix, dtype=np.int64)
+        pix = np.arange(npix - ncap, npix, dtype=np.int64)
         th_nb, ph_nb = pix2ang_numba(nside, pix)
         th_hp, ph_hp = hp.pix2ang(nside, pix, nest=False)
         npt.assert_allclose(th_nb, th_hp, atol=1e-14, err_msg="SPC theta")
@@ -550,10 +578,11 @@ class TestPix2AngNumba:
     def test_roundtrip_ang2pix_pix2ang(self, nside):
         """pix2ang → ang2pix recovers the original pixel index."""
         pix_orig = np.arange(hp.nside2npix(nside), dtype=np.int64)
-        th, ph   = pix2ang_numba(nside, pix_orig)
+        th, ph = pix2ang_numba(nside, pix_orig)
         pix_back = hp.ang2pix(nside, th, ph, nest=False)
-        npt.assert_array_equal(pix_back, pix_orig,
-                               err_msg=f"Round-trip failed at nside={nside}")
+        npt.assert_array_equal(
+            pix_back, pix_orig, err_msg=f"Round-trip failed at nside={nside}"
+        )
 
     # ── nest=True raises ─────────────────────────────────────────────────────
 
@@ -566,6 +595,7 @@ class TestPix2AngNumba:
 # ===========================================================================
 # TestQueryDiscNumba
 # ===========================================================================
+
 
 class TestQueryDiscNumba:
     """
@@ -590,12 +620,13 @@ class TestQueryDiscNumba:
     def test_pixels_in_valid_range(self, nside):
         """All returned pixel indices lie in [0, 12*nside^2)."""
         npix = hp.nside2npix(nside)
-        rng  = np.random.default_rng(60)
+        rng = np.random.default_rng(60)
         for _ in range(20):
-            vec = hp.ang2vec(rng.uniform(0.1, math.pi - 0.1),
-                             rng.uniform(0, 2 * math.pi))
+            vec = hp.ang2vec(
+                rng.uniform(0.1, math.pi - 0.1), rng.uniform(0, 2 * math.pi)
+            )
             pix = query_disc_numba(nside, vec, rng.uniform(0.02, 0.3))
-            assert int(pix.min()) >= 0,   "pixel index below 0"
+            assert int(pix.min()) >= 0, "pixel index below 0"
             assert int(pix.max()) < npix, f"pixel index >= npix={npix}"
 
     @pytest.mark.parametrize("nside", [4, 16])
@@ -603,8 +634,9 @@ class TestQueryDiscNumba:
         """Returned pixel indices are unique (no duplicates)."""
         rng = np.random.default_rng(61)
         for _ in range(20):
-            vec = hp.ang2vec(rng.uniform(0.1, math.pi - 0.1),
-                             rng.uniform(0, 2 * math.pi))
+            vec = hp.ang2vec(
+                rng.uniform(0.1, math.pi - 0.1), rng.uniform(0, 2 * math.pi)
+            )
             pix = query_disc_numba(nside, vec, rng.uniform(0.02, 0.3))
             assert len(pix) == len(np.unique(pix)), "duplicate pixel indices"
 
@@ -619,16 +651,17 @@ class TestQueryDiscNumba:
         """
         rng = np.random.default_rng(62)
         for _ in range(30):
-            th  = rng.uniform(0.1, math.pi - 0.1)
-            ph  = rng.uniform(0, 2 * math.pi)
-            r   = rng.uniform(0.02, 0.4)
+            th = rng.uniform(0.1, math.pi - 0.1)
+            ph = rng.uniform(0, 2 * math.pi)
+            r = rng.uniform(0.02, 0.4)
             vec = hp.ang2vec(th, ph)
-            pix_hp = hp.query_disc(nside, vec, r, inclusive=True,  nest=False)
+            pix_hp = hp.query_disc(nside, vec, r, inclusive=True, nest=False)
             pix_nb = query_disc_numba(nside, vec, r, inclusive=True)
             missing = np.setdiff1d(pix_hp, pix_nb)
             assert len(missing) == 0, (
                 f"nside={nside} inclusive: {len(missing)} pixels in hp but not numba"
-                f" (th={th:.3f}, ph={ph:.3f}, r={r:.3f})")
+                f" (th={th:.3f}, ph={ph:.3f}, r={r:.3f})"
+            )
 
     @pytest.mark.parametrize("nside", [4, 16, 64])
     def test_non_inclusive_contains_all_healpy_pixels(self, nside):
@@ -638,38 +671,41 @@ class TestQueryDiscNumba:
         """
         rng = np.random.default_rng(63)
         for _ in range(30):
-            th  = rng.uniform(0.1, math.pi - 0.1)
-            ph  = rng.uniform(0, 2 * math.pi)
-            r   = rng.uniform(0.05, 0.4)
+            th = rng.uniform(0.1, math.pi - 0.1)
+            ph = rng.uniform(0, 2 * math.pi)
+            r = rng.uniform(0.05, 0.4)
             vec = hp.ang2vec(th, ph)
             pix_hp = hp.query_disc(nside, vec, r, inclusive=False, nest=False)
             pix_nb = query_disc_numba(nside, vec, r, inclusive=False)
             missing = np.setdiff1d(pix_hp, pix_nb)
             assert len(missing) == 0, (
                 f"nside={nside} non-inclusive: {len(missing)} pixels missing"
-                f" (th={th:.3f}, ph={ph:.3f}, r={r:.3f})")
+                f" (th={th:.3f}, ph={ph:.3f}, r={r:.3f})"
+            )
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_inclusive_is_superset_of_non_inclusive(self, nside):
         """inclusive=True always returns at least as many pixels as inclusive=False."""
         rng = np.random.default_rng(64)
         for _ in range(20):
-            vec = hp.ang2vec(rng.uniform(0.1, math.pi - 0.1),
-                             rng.uniform(0, 2 * math.pi))
-            r   = rng.uniform(0.05, 0.3)
-            pix_inc  = set(query_disc_numba(nside, vec, r, inclusive=True).tolist())
-            pix_exc  = set(query_disc_numba(nside, vec, r, inclusive=False).tolist())
+            vec = hp.ang2vec(
+                rng.uniform(0.1, math.pi - 0.1), rng.uniform(0, 2 * math.pi)
+            )
+            r = rng.uniform(0.05, 0.3)
+            pix_inc = set(query_disc_numba(nside, vec, r, inclusive=True).tolist())
+            pix_exc = set(query_disc_numba(nside, vec, r, inclusive=False).tolist())
             assert pix_exc.issubset(pix_inc), (
-                "inclusive=False returned pixels not in inclusive=True")
+                "inclusive=False returned pixels not in inclusive=True"
+            )
 
     # ── boundary and special cases ────────────────────────────────────────────
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_north_pole_disc(self, nside):
         """Disc centred on the north pole returns the correct pixels."""
-        vec    = np.array([0.0, 0.0, 1.0])
-        r      = 0.3
-        pix_hp = np.sort(hp.query_disc(nside, vec, r, inclusive=True,  nest=False))
+        vec = np.array([0.0, 0.0, 1.0])
+        r = 0.3
+        pix_hp = np.sort(hp.query_disc(nside, vec, r, inclusive=True, nest=False))
         pix_nb = np.sort(query_disc_numba(nside, vec, r, inclusive=True))
         missing = np.setdiff1d(pix_hp, pix_nb)
         assert len(missing) == 0, f"north-pole disc: {len(missing)} pixels missing"
@@ -677,9 +713,9 @@ class TestQueryDiscNumba:
     @pytest.mark.parametrize("nside", [4, 16])
     def test_south_pole_disc(self, nside):
         """Disc centred on the south pole returns the correct pixels."""
-        vec    = np.array([0.0, 0.0, -1.0])
-        r      = 0.3
-        pix_hp = np.sort(hp.query_disc(nside, vec, r, inclusive=True,  nest=False))
+        vec = np.array([0.0, 0.0, -1.0])
+        r = 0.3
+        pix_hp = np.sort(hp.query_disc(nside, vec, r, inclusive=True, nest=False))
         pix_nb = np.sort(query_disc_numba(nside, vec, r, inclusive=True))
         missing = np.setdiff1d(pix_hp, pix_nb)
         assert len(missing) == 0, f"south-pole disc: {len(missing)} pixels missing"
@@ -687,8 +723,8 @@ class TestQueryDiscNumba:
     @pytest.mark.parametrize("nside", [4, 16])
     def test_phi_zero_wraparound(self, nside):
         """Disc straddling phi=0 / phi=2π returns no duplicates and no missing pixels."""
-        vec = hp.ang2vec(math.pi / 2, 0.0)   # points exactly at phi=0
-        r   = 0.25
+        vec = hp.ang2vec(math.pi / 2, 0.0)  # points exactly at phi=0
+        r = 0.25
         pix_hp = np.sort(hp.query_disc(nside, vec, r, inclusive=True, nest=False))
         pix_nb = np.sort(query_disc_numba(nside, vec, r, inclusive=True))
         assert len(pix_nb) == len(np.unique(pix_nb)), "duplicates near phi=0"
@@ -700,8 +736,8 @@ class TestQueryDiscNumba:
         """A disc smaller than a pixel still returns at least its central pixel."""
         rng = np.random.default_rng(65)
         for _ in range(10):
-            th  = rng.uniform(0.05, math.pi - 0.05)
-            ph  = rng.uniform(0, 2 * math.pi)
+            th = rng.uniform(0.05, math.pi - 0.05)
+            ph = rng.uniform(0, 2 * math.pi)
             vec = hp.ang2vec(th, ph)
             pix = query_disc_numba(nside, vec, 1e-5, inclusive=True)
             assert len(pix) >= 1, "tiny disc returned no pixels"
@@ -710,10 +746,11 @@ class TestQueryDiscNumba:
     def test_large_disc_returns_all_pixels(self, nside):
         """A disc with radius >= pi returns every pixel in the map."""
         npix = hp.nside2npix(nside)
-        vec  = np.array([0.0, 0.0, 1.0])
-        pix  = query_disc_numba(nside, vec, math.pi, inclusive=True)
+        vec = np.array([0.0, 0.0, 1.0])
+        pix = query_disc_numba(nside, vec, math.pi, inclusive=True)
         assert len(pix) == npix, (
-            f"full-sky disc: expected {npix} pixels, got {len(pix)}")
+            f"full-sky disc: expected {npix} pixels, got {len(pix)}"
+        )
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_all_returned_pixels_inside_disc(self, nside):
@@ -723,22 +760,26 @@ class TestQueryDiscNumba:
         """
         rng = np.random.default_rng(66)
         for _ in range(20):
-            th  = rng.uniform(0.1, math.pi - 0.1)
-            ph  = rng.uniform(0, 2 * math.pi)
-            r   = rng.uniform(0.05, 0.4)
+            th = rng.uniform(0.1, math.pi - 0.1)
+            ph = rng.uniform(0, 2 * math.pi)
+            r = rng.uniform(0.05, 0.4)
             vec = hp.ang2vec(th, ph)
             pix_nb = query_disc_numba(nside, vec, r, inclusive=False)
             if len(pix_nb) == 0:
                 continue
             th_p, ph_p = hp.pix2ang(nside, pix_nb, nest=False)
-            dist = np.arccos(np.clip(
-                np.sin(th) * np.sin(th_p) * np.cos(ph - ph_p)
-                + np.cos(th) * np.cos(th_p),
-                -1.0, 1.0,
-            ))
+            dist = np.arccos(
+                np.clip(
+                    np.sin(th) * np.sin(th_p) * np.cos(ph - ph_p)
+                    + np.cos(th) * np.cos(th_p),
+                    -1.0,
+                    1.0,
+                )
+            )
             # Allow a tiny tolerance for floating-point edge cases at the boundary.
             assert np.all(dist <= r + 1e-10), (
-                f"pixel outside disc: max dist={dist.max():.6f}, r={r:.6f}")
+                f"pixel outside disc: max dist={dist.max():.6f}, r={r:.6f}"
+            )
 
     # ── internal scalar kernel ────────────────────────────────────────────────
 
@@ -747,9 +788,9 @@ class TestQueryDiscNumba:
         """_query_disc_jit and query_disc_numba return identical sorted arrays."""
         rng = np.random.default_rng(67)
         for _ in range(15):
-            th  = rng.uniform(0.1, math.pi - 0.1)
-            ph  = rng.uniform(0, 2 * math.pi)
-            r   = rng.uniform(0.05, 0.3)
+            th = rng.uniform(0.1, math.pi - 0.1)
+            ph = rng.uniform(0, 2 * math.pi)
+            r = rng.uniform(0.05, 0.3)
             vec = hp.ang2vec(th, ph)
             pix_pub = np.sort(query_disc_numba(nside, vec, r, inclusive=True))
             pix_jit = np.sort(_query_disc_jit(nside, th, ph, r, True))
@@ -768,6 +809,7 @@ class TestQueryDiscNumba:
 # TestAng2PixRingJit
 # ===========================================================================
 
+
 class TestAng2PixRingJit:
     """
     Tests for _ang2pix_ring_jit — scalar RING-scheme nearest-pixel lookup.
@@ -784,8 +826,9 @@ class TestAng2PixRingJit:
 
     @staticmethod
     def _great_circle_dist(th1, ph1, th2, ph2):
-        cos_d = (math.sin(th1) * math.sin(th2) * math.cos(ph1 - ph2)
-                 + math.cos(th1) * math.cos(th2))
+        cos_d = math.sin(th1) * math.sin(th2) * math.cos(ph1 - ph2) + math.cos(
+            th1
+        ) * math.cos(th2)
         return math.acos(max(-1.0, min(1.0, cos_d)))
 
     # ── output contract ───────────────────────────────────────────────────────
@@ -794,11 +837,14 @@ class TestAng2PixRingJit:
     def test_output_in_valid_range(self, nside):
         """_ang2pix_ring_jit always returns a pixel in [0, npix)."""
         npix = hp.nside2npix(nside)
-        rng  = np.random.default_rng(100)
-        for th, ph in zip(rng.uniform(0.0, math.pi, 300),
-                          rng.uniform(0.0, 2 * math.pi, 300)):
+        rng = np.random.default_rng(100)
+        for th, ph in zip(
+            rng.uniform(0.0, math.pi, 300), rng.uniform(0.0, 2 * math.pi, 300)
+        ):
             p = _ang2pix_ring_jit(nside, float(th), float(ph))
-            assert 0 <= p < npix, f"pixel {p} out of [0, {npix}) for theta={th:.4f} phi={ph:.4f}"
+            assert 0 <= p < npix, (
+                f"pixel {p} out of [0, {npix}) for theta={th:.4f} phi={ph:.4f}"
+            )
 
     # ── geometric proximity ───────────────────────────────────────────────────
 
@@ -808,11 +854,12 @@ class TestAng2PixRingJit:
         The returned pixel centre is always within one pixel diameter of the
         query point (max angular distance < pixel resolution).
         """
-        pix_res = hp.nside2resol(nside)   # approx pixel radius [rad]
-        rng     = np.random.default_rng(101)
+        pix_res = hp.nside2resol(nside)  # approx pixel radius [rad]
+        rng = np.random.default_rng(101)
         max_dist = 0.0
-        for th, ph in zip(rng.uniform(0.0, math.pi, 500),
-                          rng.uniform(0.0, 2 * math.pi, 500)):
+        for th, ph in zip(
+            rng.uniform(0.0, math.pi, 500), rng.uniform(0.0, 2 * math.pi, 500)
+        ):
             p = _ang2pix_ring_jit(nside, float(th), float(ph))
             th_p, ph_p = _pix2ang_ring_jit(nside, p)
             d = self._great_circle_dist(th, ph, th_p, ph_p)
@@ -837,8 +884,8 @@ class TestAng2PixRingJit:
         # Restrict to equatorial belt (64 to 192 for nside=64 etc.)
         equatorial = (th_all > 0.4) & (th_all < math.pi - 0.4)
         pix_eq = all_pix[equatorial]
-        th_eq  = th_all[equatorial]
-        ph_eq  = ph_all[equatorial]
+        th_eq = th_all[equatorial]
+        ph_eq = ph_all[equatorial]
 
         mismatches = 0
         for p_ref, th, ph in zip(pix_eq, th_eq, ph_eq):
@@ -856,7 +903,9 @@ class TestAng2PixRingJit:
         all_pix = np.arange(hp.nside2npix(nside), dtype=np.int64)
         th_all, ph_all = hp.pix2ang(nside, all_pix)
         polar = (th_all < 0.4) | (th_all > math.pi - 0.4)
-        pix_p = all_pix[polar]; th_p = th_all[polar]; ph_p = ph_all[polar]
+        pix_p = all_pix[polar]
+        th_p = th_all[polar]
+        ph_p = ph_all[polar]
 
         mismatches = 0
         for p_ref, th, ph in zip(pix_p, th_p, ph_p):
@@ -901,8 +950,8 @@ class TestAng2PixRingJit:
         pixel of the last ring (npix-4*1 for nside≥2), not the very last
         pixel.  We verify against healpy directly.
         """
-        p      = _ang2pix_ring_jit(nside, math.pi - 1e-10, 0.0)
-        p_hp   = hp.ang2pix(nside, math.pi - 1e-10, 0.0)
+        p = _ang2pix_ring_jit(nside, math.pi - 1e-10, 0.0)
+        p_hp = hp.ang2pix(nside, math.pi - 1e-10, 0.0)
         assert p == p_hp, (
             f"nside={nside}: expected healpy pix {p_hp} near south pole, got {p}"
         )
@@ -913,4 +962,5 @@ class TestAng2PixRingJit:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import pytest
+
     sys.exit(pytest.main([__file__, "-v"]))

@@ -49,26 +49,27 @@ import tod_config as config
 # TestFmtTime
 # ===========================================================================
 
+
 class TestFmtTime:
     """Tests for tod_utils._fmt_time."""
 
     def test_below_60_seconds(self):
         """Values under 60 seconds render as '{x:.2f}s'."""
-        assert _fmt_time(0.0)   == "0.00s"
-        assert _fmt_time(1.5)   == "1.50s"
+        assert _fmt_time(0.0) == "0.00s"
+        assert _fmt_time(1.5) == "1.50s"
         assert _fmt_time(59.99) == "59.99s"
 
     def test_minutes_range(self):
         """Values in [60, 3600) render as '{x/60:.2f}m'."""
-        assert _fmt_time(60.0)   == f"{60.0/60:.2f}m"
-        assert _fmt_time(120.0)  == f"{120.0/60:.2f}m"
-        assert _fmt_time(3599.9) == f"{3599.9/60:.2f}m"
+        assert _fmt_time(60.0) == f"{60.0 / 60:.2f}m"
+        assert _fmt_time(120.0) == f"{120.0 / 60:.2f}m"
+        assert _fmt_time(3599.9) == f"{3599.9 / 60:.2f}m"
 
     def test_hours_range(self):
         """Values >= 3600 render as '{x/3600:.2f}h'."""
-        assert _fmt_time(3600.0)  == f"{3600.0/3600:.2f}h"
-        assert _fmt_time(7200.0)  == f"{7200.0/3600:.2f}h"
-        assert _fmt_time(36000.0) == f"{36000.0/3600:.2f}h"
+        assert _fmt_time(3600.0) == f"{3600.0 / 3600:.2f}h"
+        assert _fmt_time(7200.0) == f"{7200.0 / 3600:.2f}h"
+        assert _fmt_time(36000.0) == f"{36000.0 / 3600:.2f}h"
 
     def test_boundary_60_is_minutes(self):
         """Exact value 60 is formatted as minutes, not seconds."""
@@ -84,6 +85,7 @@ class TestFmtTime:
 # ===========================================================================
 # TestShouldPrintBatch
 # ===========================================================================
+
 
 class TestShouldPrintBatch:
     """Tests for tod_utils._should_print_batch."""
@@ -103,24 +105,25 @@ class TestShouldPrintBatch:
 
     def test_true_at_step_multiples(self):
         """Returns True at multiples of step = n_batches // max_prints."""
-        n_batches  = 1000
+        n_batches = 1000
         max_prints = 100
         step = n_batches // max_prints  # == 10
-        assert _should_print_batch(step,     n_batches, max_prints=max_prints) is True
+        assert _should_print_batch(step, n_batches, max_prints=max_prints) is True
         assert _should_print_batch(2 * step, n_batches, max_prints=max_prints) is True
 
     def test_false_at_non_step_non_boundary(self):
         """Returns False at indices that are not step multiples or boundaries."""
-        n_batches  = 1000
+        n_batches = 1000
         max_prints = 100
         step = n_batches // max_prints  # == 10
-        assert _should_print_batch(1,          n_batches, max_prints=max_prints) is False
-        assert _should_print_batch(step - 1,   n_batches, max_prints=max_prints) is False
+        assert _should_print_batch(1, n_batches, max_prints=max_prints) is False
+        assert _should_print_batch(step - 1, n_batches, max_prints=max_prints) is False
 
 
 # ===========================================================================
 # TestIsCluster
 # ===========================================================================
+
 
 class TestIsCluster:
     """Tests for tod_utils._is_cluster."""
@@ -152,6 +155,7 @@ class TestIsCluster:
 # TestGetMemoryPerProcess
 # ===========================================================================
 
+
 class TestGetMemoryPerProcess:
     """Tests for tod_utils._get_memory_per_process."""
 
@@ -163,7 +167,7 @@ class TestGetMemoryPerProcess:
     def test_local_path_no_hpc(self):
         """Local (non-cluster) path returns available_gb * 0.75 / n_processes."""
         available_gb = 16.0
-        n_processes  = 4
+        n_processes = 4
 
         mock_psutil = MagicMock()
         mock_psutil.virtual_memory.return_value.available = available_gb * 1e9
@@ -175,6 +179,7 @@ class TestGetMemoryPerProcess:
             with patch.dict(sys.modules, {"psutil": mock_psutil}):
                 import importlib
                 import tod_utils as _tu
+
                 importlib.reload(_tu)
                 result = _tu._get_memory_per_process(n_processes)
 
@@ -184,7 +189,7 @@ class TestGetMemoryPerProcess:
     def test_cluster_path(self):
         """Cluster path (SLURM_JOB_ID set) returns available_gb * 1.0 / n_processes."""
         available_gb = 16.0
-        n_processes  = 4
+        n_processes = 4
 
         mock_psutil = MagicMock()
         mock_psutil.virtual_memory.return_value.available = available_gb * 1e9
@@ -196,6 +201,7 @@ class TestGetMemoryPerProcess:
             with patch.dict(sys.modules, {"psutil": mock_psutil}):
                 import importlib
                 import tod_utils as _tu
+
                 importlib.reload(_tu)
                 result = _tu._get_memory_per_process(n_processes)
 
@@ -208,6 +214,7 @@ class TestGetMemoryPerProcess:
         with patch.dict(sys.modules, {"psutil": None}):
             import importlib
             import tod_utils as _tu
+
             importlib.reload(_tu)
             result = _tu._get_memory_per_process(n_processes)
 
@@ -217,6 +224,7 @@ class TestGetMemoryPerProcess:
 # ===========================================================================
 # TestGetNcpus
 # ===========================================================================
+
 
 class TestGetNcpus:
     """Tests for tod_utils._get_ncpus."""
@@ -228,12 +236,14 @@ class TestGetNcpus:
 
     def test_psutil_path(self):
         """psutil path returns min(affinity_cores // hyperthreads, config.n_processes)."""
-        logical_cpus  = 16
+        logical_cpus = 16
         physical_cpus = 8
-        affinity_set  = set(range(12))
+        affinity_set = set(range(12))
 
         mock_psutil = MagicMock()
-        mock_psutil.cpu_count.side_effect = lambda logical: logical_cpus if logical else physical_cpus
+        mock_psutil.cpu_count.side_effect = lambda logical: (
+            logical_cpus if logical else physical_cpus
+        )
 
         env_patch = self._clear_hpc_env()
         with patch.dict(os.environ, env_patch, clear=False):
@@ -242,20 +252,22 @@ class TestGetNcpus:
             with patch.dict(sys.modules, {"psutil": mock_psutil}):
                 import importlib
                 import tod_utils as _tu
+
                 importlib.reload(_tu)
-                with patch.object(_tu.os, "sched_getaffinity", return_value=affinity_set,
-                                  create=True):
+                with patch.object(
+                    _tu.os, "sched_getaffinity", return_value=affinity_set, create=True
+                ):
                     result = _tu._get_ncpus()
 
-        nthreads_per_core = logical_cpus // physical_cpus   # 2
-        ncores_available  = len(affinity_set) // nthreads_per_core  # 6
+        nthreads_per_core = logical_cpus // physical_cpus  # 2
+        ncores_available = len(affinity_set) // nthreads_per_core  # 6
         expected = min(ncores_available, config.n_processes)
         assert result == expected
 
     def test_slurm_path_no_psutil(self):
         """SLURM_CPUS_PER_TASK path (no psutil) returns the env var value as int."""
         slurm_cpus = 8
-        env_patch  = self._clear_hpc_env()
+        env_patch = self._clear_hpc_env()
         env_patch["SLURM_CPUS_PER_TASK"] = str(slurm_cpus)
 
         with patch.dict(os.environ, env_patch, clear=False):
@@ -265,6 +277,7 @@ class TestGetNcpus:
             with patch.dict(sys.modules, {"psutil": None}):
                 import importlib
                 import tod_utils as _tu
+
                 importlib.reload(_tu)
                 result = _tu._get_ncpus()
 
@@ -282,6 +295,7 @@ class TestGetNcpus:
             with patch.dict(sys.modules, {"psutil": None}):
                 import importlib
                 import tod_utils as _tu
+
                 importlib.reload(_tu)
                 result = _tu._get_ncpus()
 
@@ -293,4 +307,5 @@ class TestGetNcpus:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import pytest
+
     sys.exit(pytest.main([__file__, "-v"]))

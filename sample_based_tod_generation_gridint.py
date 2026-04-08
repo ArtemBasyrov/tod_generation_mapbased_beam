@@ -333,8 +333,6 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
                 theta_b,
                 psis_b,
                 interp_mode=interp_mode,
-                sigma_deg=interp_sigma_deg,
-                radius_deg=interp_radius_deg,
             )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals

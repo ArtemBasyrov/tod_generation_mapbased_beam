@@ -4,6 +4,7 @@ CPU / process count and memory detection for HPC and local environments.
 Falls back to `n_processes` / `max_memory_per_process` from config if SLURM
 or psutil are unavailable.
 """
+
 import os
 import multiprocessing
 import tod_config as config
@@ -29,8 +30,10 @@ def _cpu_ceiling():
 
     try:
         import psutil
-        nthreads_per_core = (psutil.cpu_count(logical=True)
-                             // psutil.cpu_count(logical=False))
+
+        nthreads_per_core = psutil.cpu_count(logical=True) // psutil.cpu_count(
+            logical=False
+        )
         return len(os.sched_getaffinity(0)) // nthreads_per_core
     except Exception:
         pass
@@ -53,14 +56,18 @@ def _get_ncpus():
         int: Maximum number of CPUs available to this job.
     """
     cluster = _is_cluster()
-    n_cpu   = _cpu_ceiling()
+    n_cpu = _cpu_ceiling()
 
     if cluster:
-        print(f"[cpu] Cluster — {n_cpu} CPUs available (scheduler/psutil); "
-              f"optimal worker count determined by calibration")
+        print(
+            f"[cpu] Cluster — {n_cpu} CPUs available (scheduler/psutil); "
+            f"optimal worker count determined by calibration"
+        )
     else:
         n_cpu = min(n_cpu, config.n_processes)
-        print(f"[cpu] Local — {n_cpu} CPUs (capped at config.n_processes={config.n_processes})")
+        print(
+            f"[cpu] Local — {n_cpu} CPUs (capped at config.n_processes={config.n_processes})"
+        )
 
     return n_cpu
 
@@ -70,8 +77,13 @@ def _get_ncpus():
 _LOCAL_RAM_FRACTION = 0.75
 
 # HPC scheduler env vars whose presence indicates a batch/cluster job.
-_CLUSTER_ENV_VARS = ("SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID",
-                     "SLURM_CPUS_PER_TASK")
+_CLUSTER_ENV_VARS = (
+    "SLURM_JOB_ID",
+    "PBS_JOBID",
+    "LSB_JOBID",
+    "SGE_TASK_ID",
+    "SLURM_CPUS_PER_TASK",
+)
 
 
 def _is_cluster():
@@ -101,13 +113,16 @@ def _get_memory_per_process(n_processes):
     """
     try:
         import psutil
+
         available_gb = psutil.virtual_memory().available / 1e9
-        cluster      = _is_cluster()
-        fraction     = 1.0 if cluster else _LOCAL_RAM_FRACTION
-        env_label    = "cluster" if cluster else f"local (×{fraction})"
-        memory_gb    = available_gb * fraction / n_processes
-        print(f"[mem] {available_gb:.1f} GB available  fraction={fraction}  "
-              f"{n_processes} processes  → {memory_gb:.2f} GB/process  ({env_label})")
+        cluster = _is_cluster()
+        fraction = 1.0 if cluster else _LOCAL_RAM_FRACTION
+        env_label = "cluster" if cluster else f"local (×{fraction})"
+        memory_gb = available_gb * fraction / n_processes
+        print(
+            f"[mem] {available_gb:.1f} GB available  fraction={fraction}  "
+            f"{n_processes} processes  → {memory_gb:.2f} GB/process  ({env_label})"
+        )
         return memory_gb
     except Exception:
         pass
@@ -121,10 +136,10 @@ def _fmt_time(seconds):
     if seconds < 60:
         return f"{seconds:.2f}s"
     elif seconds < 3600:
-        return f"{seconds/60:.2f}m"
+        return f"{seconds / 60:.2f}m"
     else:
-        return f"{seconds/3600:.2f}h"
-    
+        return f"{seconds / 3600:.2f}h"
+
 
 def _should_print_batch(batch_idx, n_batches, max_prints=100):
     """
@@ -140,11 +155,9 @@ def _should_print_batch(batch_idx, n_batches, max_prints=100):
     return batch_idx % step == 0
 
 
-def compute_bell(ra, dec, pixel_map,
-                 lmax=1000,
-                 power_cut=0.99,
-                 normalise=True,
-                 verbose=True):
+def compute_bell(
+    ra, dec, pixel_map, lmax=1000, power_cut=0.99, normalise=True, verbose=True
+):
     """Compute the effective beam transfer function B_ell from a pixelised beam.
 
     Evaluates
@@ -182,9 +195,9 @@ def compute_bell(ra, dec, pixel_map,
             - **bell** – float64 array of B_ell values, length ``lmax + 1``
     """
     pixel_map = np.asarray(pixel_map, dtype=np.float64)
-    ra        = np.asarray(ra,  dtype=np.float64).ravel()
-    dec       = np.asarray(dec, dtype=np.float64).ravel()
-    flat      = pixel_map.ravel()
+    ra = np.asarray(ra, dtype=np.float64).ravel()
+    dec = np.asarray(dec, dtype=np.float64).ravel()
+    flat = pixel_map.ravel()
 
     # ── 1. Pixel selection ────────────────────────────────────────────────────
     if power_cut >= 1.0:
@@ -193,21 +206,25 @@ def compute_bell(ra, dec, pixel_map,
         if verbose:
             print(f"  power_cut=1.0: selecting all {len(flat)} pixels")
     else:
-        dB_cut  = _compute_dB_threshold_from_power(flat, power_cut)
+        dB_cut = _compute_dB_threshold_from_power(flat, power_cut)
         log_map = 10.0 * np.log10(np.abs(flat) + 1e-30)
-        sel     = (log_map > dB_cut)
+        sel = log_map > dB_cut
         if verbose:
-            print(f"  power_cut={power_cut}: "
-                  f"{np.sum(sel)}/{len(flat)} pixels selected "
-                  f"(dB_cut={dB_cut:.2f})")
+            print(
+                f"  power_cut={power_cut}: "
+                f"{np.sum(sel)}/{len(flat)} pixels selected "
+                f"(dB_cut={dB_cut:.2f})"
+            )
 
     if not np.any(sel):
-        raise ValueError("No pixels survive the power-cut selection. "
-                         "Check that pixel_map is in linear (not dB) units.")
+        raise ValueError(
+            "No pixels survive the power-cut selection. "
+            "Check that pixel_map is in linear (not dB) units."
+        )
 
     beam_vals = flat[sel]
-    ra_sel    = ra[sel]
-    dec_sel   = dec[sel]
+    ra_sel = ra[sel]
+    dec_sel = dec[sel]
 
     # ── 2. Normalise ──────────────────────────────────────────────────────────
     norm = beam_vals.sum()
@@ -220,19 +237,19 @@ def compute_bell(ra, dec, pixel_map,
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
 
     # ── 4. Legendre recurrence ────────────────────────────────────────────────
-    N    = len(cos_theta)
+    N = len(cos_theta)
     bell = np.empty(lmax + 1, dtype=np.float64)
 
-    P_prev2 = np.ones(N,  dtype=np.float64)   # P_0 = 1
-    P_prev1 = cos_theta.copy()                 # P_1 = x
+    P_prev2 = np.ones(N, dtype=np.float64)  # P_0 = 1
+    P_prev1 = cos_theta.copy()  # P_1 = x
 
     bell[0] = np.dot(beam_vals, P_prev2)
     if lmax >= 1:
         bell[1] = np.dot(beam_vals, P_prev1)
 
     for ell_idx in range(1, lmax):
-        l       = float(ell_idx)
-        P_curr  = ((2.0*l + 1.0) * cos_theta * P_prev1 - l * P_prev2) / (l + 1.0)
+        l = float(ell_idx)
+        P_curr = ((2.0 * l + 1.0) * cos_theta * P_prev1 - l * P_prev2) / (l + 1.0)
         bell[ell_idx + 1] = np.dot(beam_vals, P_curr)
         P_prev2 = P_prev1
         P_prev1 = P_curr
@@ -264,27 +281,27 @@ def _compute_dB_threshold_from_power(beam_vals, power_cut):
     """
     # Flatten and ensure array
     prof = np.asarray(beam_vals).flatten()
-    
+
     # Calculate target power
     target_power = np.sum(prof) * power_cut
-    
+
     # Convert to dB
     prof_dB = 10 * np.log10(prof)
-    
+
     # Sort by dB values and get corresponding linear values
     sort_idx = np.argsort(prof_dB)
     sorted_dB = prof_dB[sort_idx]
     sorted_prof = prof[sort_idx]
-    
+
     # Calculate cumulative sum from highest to lowest (reverse order)
     # This gives the sum of all pixels with dB >= threshold
     cumulative_sums = np.cumsum(sorted_prof[::-1])[::-1]
-    
+
     # Find last index where retained power >= target_power.
     # cumulative_sums is decreasing; flip to ascending for searchsorted.
     # searchsorted returns the first position in the reversed array where
     # cumulative_sums >= target_power; convert back to original index.
-    rev_idx = np.searchsorted(cumulative_sums[::-1], target_power, side='left')
+    rev_idx = np.searchsorted(cumulative_sums[::-1], target_power, side="left")
     idx = max(0, len(cumulative_sums) - 1 - rev_idx)
 
     # Return the threshold value
