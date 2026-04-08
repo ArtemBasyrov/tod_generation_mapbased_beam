@@ -44,9 +44,9 @@ beam_cache_n_psi = _cfg.get("beam_cache_n_psi", 720)
 #                                  HEALPix is an irregular grid and the negative Keys lobes
 #                                  amplify disc-boundary discontinuities.  Not recommended
 #                                  for polarisation analysis.
-#                     'gaussian' → isotropic Gaussian kernel (slower, no grid artefacts)
+# (gaussian is available on the 'gaussian' git branch)
 _interp_method_raw = _cfg.get("beam_interp_method", "bilinear")
-_VALID_INTERP = {"nearest", "bilinear", "bicubic", "gaussian"}
+_VALID_INTERP = {"nearest", "bilinear", "bicubic"}
 if _interp_method_raw not in _VALID_INTERP:
     raise ValueError(
         f"beam_interp_method must be one of {sorted(_VALID_INTERP)!r}, "
