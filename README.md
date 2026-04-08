@@ -127,17 +127,18 @@ directory produced by `precompute_beam_cache.py`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `beam_interp_method` | `str` | `'bilinear'` | Interpolation strategy. See table below. |
-| `beam_interp_sigma_deg` | `float \| null` | `null` | Gaussian kernel width in degrees (`'gaussian'` only). Defaults to one HEALPix pixel resolution. |
-| `beam_interp_radius_deg` | `float \| null` | `null` | Neighbour search radius in degrees (`'gaussian'` only). Defaults to `3 × sigma`. |
+| `beam_interp_method` | `str` | `'bilinear'` | Interpolation strategy. Available values depend on the active git branch (see table below). |
+| `beam_interp_sigma_deg` | `float \| null` | `null` | **`gaussian` branch only.** Gaussian kernel width in degrees. Defaults to one HEALPix pixel resolution. |
+| `beam_interp_radius_deg` | `float \| null` | `null` | **`gaussian` branch only.** Neighbour search radius in degrees. Defaults to `3 × sigma`. |
 
 **Interpolation methods:**
 
-| Value | Description | Speed |
-|---|---|---|
-| `'nearest'` | Single nearest-pixel lookup. No blending between pixels. | Fastest |
-| `'bilinear'` | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy for most beams. **This is the recommended method.** | Fast |
-| `'gaussian'` | Isotropic Gaussian kernel over all pixels within `radius_deg`. Avoids grid-aligned interpolation artefacts; best for wide or asymmetric beams. | Slow |
+| Value | Branch | Description | Speed |
+|---|---|---|---|
+| `'nearest'` | `main` | Single nearest-pixel lookup. No blending between pixels. Rotationally unstable — not recommended for polarisation analysis. | Fastest |
+| `'bilinear'` | `main` | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy. **Recommended default.** | Fast |
+| `'bicubic'` | `bicubic` | Keys/Catmull-Rom kernel via gnomonic projection (~30–50 pixels). ~10× more rotationally stable than bilinear. | Slower |
+| `'gaussian'` | `gaussian` | Isotropic Gaussian kernel over all pixels within `radius_deg`. Avoids grid artefacts; requires `beam_interp_sigma_deg`. | Slow |
 
 ### Beam pixel clustering
 
@@ -230,9 +231,7 @@ error measurement:
   beam_cache_dir: "/data/beam_cache/"
   beam_cache_n_psi: 720
 
-  beam_interp_method: 'bilinear'
-  beam_interp_sigma_deg: null
-  beam_interp_radius_deg: null
+  beam_interp_method: 'bilinear'   # or 'nearest'; use 'bicubic'/'gaussian' on those branches
 
   n_beam_clusters: null
   beam_cluster_tail_fraction: null
@@ -374,12 +373,34 @@ memory-constrained nodes is often fewer than the total allocated CPUs.
 
 ---
 
+## Branch Structure
+
+Experimental interpolation methods live on dedicated branches to keep `main`
+clean. Switch branches to enable a different interpolation kernel:
+
+| Branch | Extra module | Adds |
+|--------|-------------|------|
+| `main` | — | `nearest` + `bilinear` (production) |
+| `gaussian` | `tod_gaussian.py` | `gaussian` kernel |
+| `bicubic` | `tod_bicubic.py` | `bicubic` kernel |
+
+```bash
+git checkout gaussian   # enables beam_interp_method: gaussian
+git checkout bicubic    # enables beam_interp_method: bicubic
+git checkout main       # production default
+```
+
+Passing an unsupported `beam_interp_method` on any branch raises a `ValueError`
+pointing to the correct branch.
+
 ## Repository Structure
 
 ```
 .
 ├── sample_based_tod_generation_gridint.py  # Main entry point
-├── tod_core.py                             # Core Numba JIT kernels
+├── tod_core.py                             # Core Numba JIT kernels + interpolation dispatch
+├── tod_gaussian.py                         # [gaussian branch] Gaussian kernel
+├── tod_bicubic.py                          # [bicubic branch]  Keys/Catmull-Rom kernel
 ├── tod_io.py                               # File I/O (beam, scan, output)
 ├── tod_config.py                           # Config loader
 ├── tod_calibrate.py                        # Batch-size / process-count / clustering calibration
@@ -391,7 +412,8 @@ memory-constrained nodes is often fewer than the total allocated CPUs.
 └── tests/                                  # pytest test suite
     ├── test_tod_core.py
     ├── test_numba_healpy.py
-    ├── test_gaussian_interp.py
+    ├── test_gaussian_interp.py             # [gaussian branch only]
+    ├── test_bicubic_interp.py              # [bicubic branch only]
     ├── test_precompute_beam_cache.py
     ├── test_tod_calibrate.py
     ├── test_beam_cluster.py
