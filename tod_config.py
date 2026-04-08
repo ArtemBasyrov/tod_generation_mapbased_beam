@@ -39,14 +39,10 @@ beam_cache_n_psi = _cfg.get("beam_cache_n_psi", 720)
 # Beam grid interpolation method
 # beam_interp_method: 'nearest'  → single nearest-pixel lookup (fastest)
 #                     'bilinear' → 4-pixel bilinear HEALPix (default, fast Numba kernel)
-#                     'bicubic'  → Keys/Catmull-Rom via gnomonic projection (~30–50 pixels);
-#                                  NOTE: rotationally ~150× less stable than bilinear because
-#                                  HEALPix is an irregular grid and the negative Keys lobes
-#                                  amplify disc-boundary discontinuities.  Not recommended
-#                                  for polarisation analysis.
 #                     'gaussian' → isotropic Gaussian kernel (slower, no grid artefacts)
+# (bicubic is available on the 'bicubic' git branch)
 _interp_method_raw = _cfg.get("beam_interp_method", "bilinear")
-_VALID_INTERP = {"nearest", "bilinear", "bicubic", "gaussian"}
+_VALID_INTERP = {"nearest", "bilinear", "gaussian"}
 if _interp_method_raw not in _VALID_INTERP:
     raise ValueError(
         f"beam_interp_method must be one of {sorted(_VALID_INTERP)!r}, "
