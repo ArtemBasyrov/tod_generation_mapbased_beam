@@ -177,55 +177,71 @@ class TestTotalconvolveInterpolator:
         )
 
     def test_polar_accuracy_comparable_to_equator(self):
-        """Q/U interpolation near the poles is not substantially worse than at equator.
+        """Q/U spin-2 interpolation near the poles is not substantially worse than at equator.
 
-        This validates the core scientific motivation: the spin-2 frame
-        rotation issue that degrades bilinear interpolation near the poles
-        should not appear with the harmonic-space method.  Both polar and
-        equatorial RMS errors (relative to map std) are checked against the
-        same 100 × epsilon bound, and the polar error must not exceed 5× the
-        equatorial error.
+        Uses a bandlimited spin-2 field (Q/U synthesised from known alm_E,
+        alm_B).  The reference at each evaluation point is exact spin-2
+        synthesis from the *recovered* alms (same alms the interpolator holds
+        internally), so the comparison isolates NUFFT accuracy from
+        map2alm_spin discretisation noise and the 100×epsilon bound applies
+        cleanly.  The key scientific assertion is that the polar error does
+        not exceed 5× the equatorial error.
         """
         nside = 64
-        lmax = 128
+        lmax = 64
         rng = np.random.default_rng(2)
+        nalm = hp.Alm.getsize(lmax)
 
-        alm = (
-            rng.standard_normal(hp.Alm.getsize(lmax))
-            + 1j * rng.standard_normal(hp.Alm.getsize(lmax))
+        # Bandlimited spin-2 field: l=0,1 must be zero for spin-2.
+        alm_E = (rng.standard_normal(nalm) + 1j * rng.standard_normal(nalm)).astype(
+            np.complex128
         ) * 0.5
-        q_map = hp.alm2map(alm.astype(np.complex128), nside=nside).astype(np.float32)
-        alm_recovered = hp.map2alm(q_map.astype(np.float64), lmax=lmax, iter=3)
+        alm_B = (rng.standard_normal(nalm) + 1j * rng.standard_normal(nalm)).astype(
+            np.complex128
+        ) * 0.5
+        for ell in range(2):
+            for m in range(ell + 1):
+                idx = hp.Alm.getidx(lmax, ell, m)
+                alm_E[idx] = 0.0
+                alm_B[idx] = 0.0
 
-        epsilon = 1e-6
+        alm_T_zero = np.zeros(nalm, dtype=np.complex128)
+        _, q_map, u_map = hp.alm2map([alm_T_zero, alm_E, alm_B], nside=nside)
+
+        epsilon = 1e-8
+        t_map = np.zeros(hp.nside2npix(nside), dtype=np.float32)
         interp = TotalconvolveInterpolator(
-            [q_map, q_map, q_map], lmax=lmax, epsilon=epsilon, nthreads=1
+            [t_map, q_map.astype(np.float32), u_map.astype(np.float32)],
+            lmax=lmax,
+            epsilon=epsilon,
+            nthreads=1,
         )
 
         n_pts = 50
 
-        def _rms_vs_exact(theta, phi, comp):
+        def _rms_vs_recovered(theta, phi, comp, qu_idx):
+            """NUFFT error vs exact synthesis from the same recovered alms."""
             vals = interp.sample(theta, phi, comp_indices=[comp])[0]
             loc = np.column_stack([theta, phi])
             ref = _dsht.synthesis_general(
-                alm=alm_recovered.reshape(1, -1),
-                spin=0,
+                alm=interp._alm_QU,  # same alms as the interpolator
+                spin=2,
                 lmax=lmax,
                 loc=loc,
                 epsilon=1e-12,
                 nthreads=1,
-            )[0]
+            )[qu_idx]  # 0 = Q, 1 = U
             return float(np.sqrt(np.mean((vals - ref) ** 2)))
 
         # Equatorial band: θ ∈ [80°, 100°]
         theta_eq = np.linspace(np.radians(80), np.radians(100), n_pts)
         phi_eq = np.linspace(0.0, 2 * np.pi, n_pts, endpoint=False)
-        rms_eq = _rms_vs_exact(theta_eq, phi_eq, comp=1)
+        rms_eq = _rms_vs_recovered(theta_eq, phi_eq, comp=1, qu_idx=0)
 
         # Polar cap: θ ∈ [2°, 10°]
         theta_pol = np.linspace(np.radians(2), np.radians(10), n_pts)
         phi_pol = np.linspace(0.0, 2 * np.pi, n_pts, endpoint=False)
-        rms_pol = _rms_vs_exact(theta_pol, phi_pol, comp=1)
+        rms_pol = _rms_vs_recovered(theta_pol, phi_pol, comp=1, qu_idx=0)
 
         map_std = float(np.std(q_map))
         rms_eq_rel = rms_eq / map_std
@@ -236,6 +252,85 @@ class TestTotalconvolveInterpolator:
         assert rms_pol_rel < 5 * rms_eq_rel + 1e-12, (
             f"Polar RMS ({rms_pol_rel:.2e}) is >5× equatorial ({rms_eq_rel:.2e})"
         )
+
+    def test_spin2_roundtrip_at_pixel_centers(self):
+        """Convention check: map2alm_spin + synthesis_general(spin=2) round-trip.
+
+        Builds a Q/U map from known spin-2 alms, constructs the interpolator,
+        and samples at every HEALPix pixel center (including polar rings).
+        The recovered values must match the original map to within 1%.
+
+        A sign or phase convention mismatch between healpy.map2alm_spin and
+        ducc0.synthesis_general(spin=2) would produce O(1) relative errors,
+        so even this loose tolerance cleanly catches incorrect conventions.
+        Polar pixels are included because that is where the local reference
+        frame rotates most rapidly.
+        """
+        nside = 32
+        lmax = 16  # lmax = nside/2: well below Nyquist, map2alm_spin very accurate
+        rng = np.random.default_rng(7)
+        nalm = hp.Alm.getsize(lmax)
+
+        alm_E = (rng.standard_normal(nalm) + 1j * rng.standard_normal(nalm)).astype(
+            np.complex128
+        )
+        alm_B = (rng.standard_normal(nalm) + 1j * rng.standard_normal(nalm)).astype(
+            np.complex128
+        )
+        for ell in range(2):
+            for m in range(ell + 1):
+                idx = hp.Alm.getidx(lmax, ell, m)
+                alm_E[idx] = 0.0
+                alm_B[idx] = 0.0
+
+        alm_T_zero = np.zeros(nalm, dtype=np.complex128)
+        _, q_map, u_map = hp.alm2map([alm_T_zero, alm_E, alm_B], nside=nside)
+
+        t_map = np.zeros(hp.nside2npix(nside), dtype=np.float32)
+        interp = TotalconvolveInterpolator(
+            [t_map, q_map.astype(np.float32), u_map.astype(np.float32)],
+            lmax=lmax,
+            epsilon=1e-9,
+            nthreads=1,
+        )
+
+        npix = hp.nside2npix(nside)
+        theta, phi = hp.pix2ang(nside, np.arange(npix))
+        vals = interp.sample(theta, phi, comp_indices=[1, 2])
+
+        q_rms = float(np.sqrt(np.mean((vals[0] - q_map) ** 2)))
+        u_rms = float(np.sqrt(np.mean((vals[1] - u_map) ** 2)))
+        q_std = float(np.std(q_map))
+        u_std = float(np.std(u_map))
+
+        assert q_rms / q_std < 0.01, f"Q round-trip RMS {q_rms / q_std:.3e} > 1%"
+        assert u_rms / u_std < 0.01, f"U round-trip RMS {u_rms / u_std:.3e} > 1%"
+
+    def test_qu_synthesized_jointly(self):
+        """Requesting Q alone, U alone, or both together gives the same values.
+
+        Q and U are synthesised in a single spin-2 call; requesting a subset
+        must not change the returned values.  Near-polar positions are
+        included to exercise the spin-2 code path fully.
+        """
+        interp = _build_interp()
+        N = 30
+        rng = np.random.default_rng(11)
+        # Mix equatorial and near-polar positions
+        theta = np.concatenate(
+            [
+                rng.uniform(0.05, 0.3, N // 2),  # near north pole
+                rng.uniform(np.pi - 0.3, np.pi - 0.05, N // 2),  # near south pole
+            ]
+        )
+        phi = rng.uniform(0.0, 2 * np.pi, N)
+
+        vals_Q_only = interp.sample(theta, phi, comp_indices=[1])[0]
+        vals_U_only = interp.sample(theta, phi, comp_indices=[2])[0]
+        vals_QU = interp.sample(theta, phi, comp_indices=[1, 2])
+
+        npt.assert_array_equal(vals_QU[0], vals_Q_only)
+        npt.assert_array_equal(vals_QU[1], vals_U_only)
 
     def test_single_position(self):
         """sample() works for a single position (N=1)."""

@@ -9,9 +9,11 @@ methods.
 Design
 ------
 At startup (once per worker process):
-  - T, Q, U maps are converted to alm via healpy.map2alm and stored as a
-    single (n_comp, nalm) array.  No Interpolator object is built, avoiding
-    the O(σ·lmax³) grid-construction cost of ducc0.totalconvolve.
+  - T is converted to spin-0 alm via healpy.map2alm.
+  - Q and U are decomposed jointly into spin-2 alm via healpy.map2alm_spin,
+    preserving the local-frame reference needed for correct polar behaviour.
+  - No Interpolator object is built, avoiding the O(σ·lmax³) grid-construction
+    cost of ducc0.totalconvolve.
 
 At runtime (per batch):
   - The full double-Rodrigues rotation is applied to obtain sky unit vectors.
@@ -49,10 +51,13 @@ class TotalconvolveInterpolator:
     Build once per process via the worker initialiser or the single-process
     path in ``main()``.  Call :meth:`sample` repeatedly.
 
-    T, Q, U are treated as independent scalar fields (spin=0).  The alm are
-    computed once at startup; :func:`ducc0.sht.experimental.synthesis_general`
-    evaluates them at arbitrary positions on each call, with all Stokes
-    components batched into a single NUFFT execution.
+    T is treated as a spin-0 scalar field.  Q and U are treated as a spin-2
+    pair: they are decomposed jointly via ``healpy.map2alm_spin`` into
+    gradient/curl alm coefficients, and synthesised via
+    ``synthesis_general(spin=2)``, which applies the parallactic-angle
+    rotation factor e^{±2iα} at each evaluation point.  This eliminates the
+    polar frame-rotation error that arises when Q/U are interpolated as
+    independent scalars.
 
     Args:
         mp (list of array-like): ``[T, Q, U]`` HEALPix maps in RING ordering.
@@ -63,7 +68,8 @@ class TotalconvolveInterpolator:
         nthreads (int): ducc0 thread count.  Set to ``1`` in multiprocessing
             workers to avoid over-subscription; ``0`` uses all available cores.
         map2alm_iter (int): Number of Jacobi iterations for
-            ``healpy.map2alm``. ``3`` is the healpy default.
+            ``healpy.map2alm`` (T only). ``3`` is the healpy default.
+            ``healpy.map2alm_spin`` does not support iterative refinement.
     """
 
     def __init__(self, mp, lmax=None, epsilon=1e-6, nthreads=1, map2alm_iter=3):
@@ -76,36 +82,42 @@ class TotalconvolveInterpolator:
         self.nthreads = nthreads
         self.n_comp = len(mp)
 
-        nalm = (lmax + 1) * (lmax + 2) // 2
-
         print(
             f"  [totalconvolve] Computing alm for {len(mp)} components: "
             f"nside={nside}, lmax={lmax}, epsilon={epsilon}"
         )
-        # Store all components as a single (n_comp, nalm) array so that
-        # synthesis_general can batch them in one NUFFT call.
-        self._alm = np.empty((len(mp), nalm), dtype=np.complex128)
-        for i, m in enumerate(mp):
-            self._alm[i] = hp.map2alm(
-                np.asarray(m, dtype=np.float64),
-                lmax=lmax,
-                iter=map2alm_iter,
-            )
+
+        # T: scalar field (spin-0).
+        self._alm_T = hp.map2alm(
+            np.asarray(mp[0], dtype=np.float64),
+            lmax=lmax,
+            iter=map2alm_iter,
+        )
+
+        # Q, U: spin-2 pair — decomposed jointly so that synthesis_general
+        # can apply the local-frame rotation at each evaluation point.
+        alm_g, alm_c = hp.map2alm_spin(
+            [np.asarray(mp[1], dtype=np.float64), np.asarray(mp[2], dtype=np.float64)],
+            spin=2,
+            lmax=lmax,
+        )
+        self._alm_QU = np.array([alm_g, alm_c])  # (2, nalm) complex128
+
         print("  [totalconvolve] Ready.")
 
     def sample(self, theta, phi, comp_indices=None):
         """Evaluate Stokes components at arbitrary sky positions.
 
-        All requested components are evaluated in a single
-        ``synthesis_general`` call — the NUFFT point-grid is shared across
-        components, so batching has essentially zero extra cost.
+        T (comp 0) uses a spin-0 synthesis call.  Q (comp 1) and U (comp 2)
+        are synthesised together in a single spin-2 call — the NUFFT point-
+        grid is shared, and the result is cached so requesting both Q and U
+        costs no more than requesting one.
 
         Args:
             theta (numpy.ndarray): Colatitude [rad], shape ``(N,)``.
             phi (numpy.ndarray): Longitude [rad] in ``[0, 2π)``, shape ``(N,)``.
             comp_indices (list of int, optional): Which components to evaluate
-                (indices into the ``mp`` list passed at construction).
-                ``None`` evaluates all components.
+                (0=T, 1=Q, 2=U).  ``None`` evaluates all components.
 
         Returns:
             numpy.ndarray: Interpolated values, shape ``(C, N)`` float64.
@@ -121,22 +133,36 @@ class TotalconvolveInterpolator:
         loc[:, 0] = theta
         loc[:, 1] = phi
 
-        # synthesis_general with spin=0 accepts exactly one alm component per
-        # call.  Loop over requested components; each call shares the same loc
-        # array and NUFFT grid parameters.
-        return np.array(
-            [
-                _synthesis_general(
-                    alm=self._alm[i : i + 1],  # (1, nalm)
-                    loc=loc,
-                    spin=0,
-                    lmax=self.lmax,
-                    epsilon=self.epsilon,
-                    nthreads=self.nthreads,
-                )[0]  # (N,)
-                for i in comp_indices
-            ]
-        )
+        # T: spin-0 synthesis, evaluated only if requested.
+        t_synth = None
+        if 0 in comp_indices:
+            t_synth = _synthesis_general(
+                alm=self._alm_T[np.newaxis],  # (1, nalm)
+                loc=loc,
+                spin=0,
+                lmax=self.lmax,
+                epsilon=self.epsilon,
+                nthreads=self.nthreads,
+            )[0]  # (N,)
+
+        # Q and U: always synthesised together in one spin-2 call.
+        qu_synth = None
+        if 1 in comp_indices or 2 in comp_indices:
+            qu_synth = _synthesis_general(
+                alm=self._alm_QU,  # (2, nalm)
+                loc=loc,
+                spin=2,
+                lmax=self.lmax,
+                epsilon=self.epsilon,
+                nthreads=self.nthreads,
+            )  # (2, N): [Q_local, U_local]
+
+        lookup = {
+            0: t_synth,
+            1: qu_synth[0] if qu_synth is not None else None,
+            2: qu_synth[1] if qu_synth is not None else None,
+        }
+        return np.array([lookup[i] for i in comp_indices])
 
 
 def _gather_accum_totalconvolve(vec_rot, beam_vals, comp_indices, interp, tod):
