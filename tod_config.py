@@ -41,7 +41,7 @@ beam_cache_n_psi = _cfg.get("beam_cache_n_psi", 720)
 #                     'bilinear' → 4-pixel bilinear HEALPix (default, fast Numba kernel)
 # ('bicubic' branch adds Keys/Catmull-Rom; 'gaussian' branch adds isotropic Gaussian kernel)
 _interp_method_raw = _cfg.get("beam_interp_method", "bilinear")
-_VALID_INTERP = {"nearest", "bilinear"}
+_VALID_INTERP = {"nearest", "bilinear", "totalconvolve"}
 if _interp_method_raw not in _VALID_INTERP:
     raise ValueError(
         f"beam_interp_method must be one of {sorted(_VALID_INTERP)!r}, "
@@ -52,6 +52,14 @@ beam_interp_sigma_deg = _cfg.get(
     "beam_interp_sigma_deg", None
 )  # None → pixel resolution
 beam_interp_radius_deg = _cfg.get("beam_interp_radius_deg", None)  # None → 3 × sigma
+
+# ducc0 totalconvolve interpolation parameters (only used when beam_interp_method='totalconvolve')
+# totalconvolve_lmax    : harmonic band limit for map2alm + Interpolator setup.
+#                         None → 2 × nside (safe default).
+# totalconvolve_epsilon : NUFFT accuracy target.  1e-6 → ~6 digits (~0.0001% RMS).
+#                         Lower values are more accurate but slower and use more RAM.
+totalconvolve_lmax = _cfg.get("totalconvolve_lmax", None)
+totalconvolve_epsilon = _cfg.get("totalconvolve_epsilon", 1e-6)
 
 # Beam pixel clustering (k-means on the unit sphere before TOD generation).
 #

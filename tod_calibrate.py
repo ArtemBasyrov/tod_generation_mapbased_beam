@@ -35,6 +35,7 @@ _BYTES_PER_SAMPLE_PER_BEAM = {
     "bilinear": 64,  # 4 neighbors (4×index + 4×weight + rotation buffer)
     "bicubic": 400,  # ~40 gnomonic neighbors
     "gaussian": 400,  # disc query, comparable to bicubic
+    "totalconvolve": 110,  # float64 intermediates: vf+r_xy+theta+phi+ptg+vals ≈ 108 B
 }
 _BYTES_PER_SAMPLE_PER_BEAM_DEFAULT = 100  # fallback for unknown methods
 _MEMORY_SAFETY_FACTOR = 1.5
@@ -93,6 +94,7 @@ def _calibrate_batch_size(
     n_repeats=3,
     prefix="",
     interp_mode="bilinear",
+    totalconvolve_interp=None,
 ):
     """Find the batch size that maximises sustained throughput on this hardware.
 
@@ -127,6 +129,17 @@ def _calibrate_batch_size(
 
     max_memory_gb = _get_memory_per_process(n_processes)
     mem_cap = _memory_cap(max_memory_gb, max_beam_sel, interp_mode=interp_mode)
+
+    # totalconvolve: NUFFT throughput is strictly monotone in batch size — more
+    # B×S always amortises the per-call overhead.  Running timing probes adds no
+    # information; just return mem_cap immediately.
+    if interp_mode == "totalconvolve":
+        print(
+            prefix
+            + f"[calibrate] totalconvolve: skipping probe, using mem_cap={mem_cap}"
+        )
+        return mem_cap, [(mem_cap, float("inf"))]
+
     candidates = _candidate_batch_sizes(
         mem_cap, max_memory_per_process_gb=max_memory_gb
     )
@@ -163,6 +176,7 @@ def _calibrate_batch_size(
                     theta_b,
                     psis_b,
                     interp_mode=interp_mode,
+                    totalconvolve_interp=totalconvolve_interp,
                 )
         return time.perf_counter() - t0
 
@@ -205,6 +219,7 @@ def _calibrate_n_processes(
     n_repeats=3,
     prefix="",
     interp_mode="bilinear",
+    totalconvolve_interp=None,
 ):
     """Find the optimal number of worker processes for maximum total throughput.
 
@@ -243,6 +258,18 @@ def _calibrate_n_processes(
     """
     max_beam_sel = max(d["n_sel"] for d in beam_data.values())
 
+    # totalconvolve: throughput is strictly monotone — more processes and larger
+    # batches are always better.  Use all CPUs with the per-process mem_cap.
+    if interp_mode == "totalconvolve":
+        total_memory_gb = _get_memory_per_process(1)
+        mem_per_proc = total_memory_gb / n_cpu_ceiling
+        batch_size = _memory_cap(mem_per_proc, max_beam_sel, interp_mode=interp_mode)
+        print(
+            prefix + f"[n_proc] totalconvolve: skipping probe, "
+            f"n_optimal={n_cpu_ceiling}, batch_size={batch_size}"
+        )
+        return n_cpu_ceiling, batch_size
+
     # Total usable memory: _get_memory_per_process(1) = available × fraction / 1
     total_memory_gb = _get_memory_per_process(1)
 
@@ -260,6 +287,7 @@ def _calibrate_n_processes(
         n_repeats=n_repeats,
         prefix=prefix,
         interp_mode=interp_mode,
+        totalconvolve_interp=totalconvolve_interp,
     )
     # results: list of (batch_size, throughput_samp_per_s), ordered by batch_size
     results_dict = dict(results)

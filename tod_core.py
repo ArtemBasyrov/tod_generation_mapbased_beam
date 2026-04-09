@@ -932,6 +932,7 @@ def beam_tod_batch(
     theta_b,
     psis_b,
     interp_mode="bilinear",
+    totalconvolve_interp=None,
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
 
@@ -979,7 +980,13 @@ def beam_tod_batch(
               interpolation via the fused Numba kernel.
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
+            * ``'totalconvolve'`` — ducc0 NUFFT-based interpolation via a
+              delta-function beam; requires ``totalconvolve_interp`` to be set.
+              Eliminates the flat noise floor; correct for Q/U near poles.
             (``'gaussian'`` and ``'bicubic'`` are available on their respective branches.)
+        totalconvolve_interp : TotalconvolveInterpolator, optional
+            Pre-built interpolator from :mod:`tod_totalconvolve`.  Required
+            when ``interp_mode='totalconvolve'``; ignored otherwise.
 
     Returns:
         dict[int, numpy.ndarray]: Mapping from Stokes component index to a
@@ -1014,11 +1021,46 @@ def beam_tod_batch(
         use_flatsky = False
         use_cache = False
     use_nearest = interp_mode == "nearest"
-    if interp_mode not in ("nearest", "bilinear"):
+    if interp_mode not in ("nearest", "bilinear", "totalconvolve"):
         raise ValueError(
             f"interp_mode {interp_mode!r} not available on main branch; "
             "switch to the 'gaussian' or 'bicubic' branch"
         )
+
+    # ── totalconvolve path ────────────────────────────────────────────────────
+    # Full double-Rodrigues rotation (all S beam pixels at once, no L2 tiling)
+    # followed by a single ducc0 interpol() call for all B×S positions.
+    # No mp_stacked or beam-cache paths apply here.
+    if interp_mode == "totalconvolve":
+        if totalconvolve_interp is None:
+            raise RuntimeError(
+                "interp_mode='totalconvolve' requires totalconvolve_interp to be set. "
+                "Ensure TotalconvolveInterpolator is built before processing."
+            )
+        from tod_totalconvolve import _gather_accum_totalconvolve
+
+        tod = {comp: np.zeros(B, dtype=np.float32) for comp in comp_indices}
+        axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
+            rot_vecs, phi_b, theta_b, psis_b
+        )
+        # Rotate all S beam pixels in one shot.  No L2-cache tiling is needed
+        # here because the gather step is a single batch interpol() call whose
+        # efficiency comes from large N, not from small working sets.
+        vec_rot = np.empty((B, S, 3), dtype=np.float32)
+        _rodrigues_jit(
+            np.asarray(vec_orig, dtype=np.float32),
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            vec_rot,
+        )
+        _gather_accum_totalconvolve(
+            vec_rot, beam_vals, comp_indices, totalconvolve_interp, tod
+        )
+        return tod
 
     # Lower bound from L2 target; upper bound from _MAX_TILES cap.
     # The max() ensures we never produce more than _MAX_TILES tiles even when

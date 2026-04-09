@@ -28,14 +28,21 @@
   beam_cache_dir: null
   beam_cache_n_psi: 720
   # beam grid interpolation method — choose one of:
-  #   'nearest'  — single nearest-pixel lookup (fastest, no mixing between pixels)
-  #   'bilinear' — 4-pixel bilinear HEALPix interpolation (default, fast Numba kernel)
-  #   'gaussian' — isotropic Gaussian kernel (slowest, avoids grid-aligned artefacts)
+  #   'nearest'        — single nearest-pixel lookup (fastest, no mixing between pixels)
+  #   'bilinear'       — 4-pixel bilinear HEALPix interpolation (default, fast Numba kernel)
+  #   'totalconvolve'  — ducc0 NUFFT interpolation (totalconvolve branch only)
+  #                      eliminates the flat noise floor; correct Q/U near poles
+  #   'gaussian'       — isotropic Gaussian kernel (gaussian branch only)
   # sigma and radius are only used for 'gaussian' and default to 1× and 3× the
   # HEALPix pixel resolution respectively.
   beam_interp_method: 'bilinear'
   beam_interp_sigma_deg: null
   beam_interp_radius_deg: null
+  # ducc0 totalconvolve parameters (only used when beam_interp_method: 'totalconvolve')
+  #   totalconvolve_lmax    : harmonic band limit for alm setup. null → 2 × nside.
+  #   totalconvolve_epsilon : NUFFT accuracy. 1e-6 → ~6 digits; lower = more accurate + slower.
+  totalconvolve_lmax: null
+  totalconvolve_epsilon: 1.0e-6
   # beam pixel clustering — k-means on the unit sphere to reduce pixel count
   # before TOD generation.  Only the low-power tail is clustered; the main
   # lobe is kept pixel-exact.

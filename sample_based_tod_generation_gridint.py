@@ -41,6 +41,7 @@ interp_radius_deg = config.beam_interp_radius_deg
 _g_mp = None  # list of 3 float32 arrays (views into shared memory)
 _g_beam_data = None  # beam_data dict with mp_stacked from shared memory
 _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
+_g_interp = None  # TotalconvolveInterpolator (built per-worker when needed)
 
 
 # ── Pool initialiser ─────────────────────────────────────────────────────────
@@ -94,6 +95,22 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
             )
 
         _g_beam_data[bf] = entry
+
+    # Build totalconvolve interpolator once per worker from the shared-memory maps.
+    # TotalconvolveInterpolator holds alm arrays which are not shared with the
+    # parent — must be constructed inside each worker.
+    if interp_mode == "totalconvolve":
+        global _g_interp
+        from tod_totalconvolve import TotalconvolveInterpolator
+
+        nside = hp.npix2nside(len(_g_mp[0]))
+        lmax = config.totalconvolve_lmax or 2 * nside
+        _g_interp = TotalconvolveInterpolator(
+            _g_mp,
+            lmax=lmax,
+            epsilon=config.totalconvolve_epsilon,
+            nthreads=1,  # 1 per worker — parallelism is across days, not within
+        )
 
 
 # ── Beam preparation ──────────────────────────────────────────────────────────
@@ -333,6 +350,7 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
                 theta_b,
                 psis_b,
                 interp_mode=interp_mode,
+                totalconvolve_interp=_g_interp,
             )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
@@ -491,6 +509,21 @@ def main(n_cpu_ceiling):
             np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
         )
 
+    # For totalconvolve, build the interpolator before calibration so it can be
+    # passed to _calibrate_n_processes (calibration calls beam_tod_batch internally).
+    _calib_interp = None
+    if interp_mode == "totalconvolve":
+        from tod_totalconvolve import TotalconvolveInterpolator
+
+        nside = hp.get_nside(MP[0])
+        lmax = config.totalconvolve_lmax or 2 * nside
+        _calib_interp = TotalconvolveInterpolator(
+            MP,
+            lmax=lmax,
+            epsilon=config.totalconvolve_epsilon,
+            nthreads=0,  # single process during calibration — use all cores
+        )
+
     use_cached = not config.calibration_enabled or (
         config.calibration_n_processes is not None
         and config.calibration_batch_size is not None
@@ -508,6 +541,7 @@ def main(n_cpu_ceiling):
             mp=MP,
             n_cpu_ceiling=n_cpu_ceiling,
             interp_mode=interp_mode,
+            totalconvolve_interp=_calib_interp,
         )
         _save_calibration(ncpus, batch_size)
     print(f"Processing days {start}–{end - 1}  ({len(days)} days,  {ncpus} workers)")
@@ -588,6 +622,26 @@ def main(n_cpu_ceiling):
         for day, _, err in failed:
             print(f"  Day {day} failed: {err}")
     else:
+        # Single-process path: _worker_init is never called, so the
+        # totalconvolve interpolator must be set before the processing loop.
+        # Reuse _calib_interp if it was already built above (avoids a second
+        # map2alm + Interpolator construction when calibration was enabled).
+        if interp_mode == "totalconvolve":
+            global _g_interp
+            if _calib_interp is not None:
+                _g_interp = _calib_interp
+            else:
+                from tod_totalconvolve import TotalconvolveInterpolator
+
+                nside = hp.get_nside(MP[0])
+                lmax = config.totalconvolve_lmax or 2 * nside
+                _g_interp = TotalconvolveInterpolator(
+                    MP,
+                    lmax=lmax,
+                    epsilon=config.totalconvolve_epsilon,
+                    nthreads=0,  # single process — use all available cores
+                )
+
         for day_index in days:
             tod_day = tod_exact_gen_batched(
                 beam_data, day_index, MP, batch_size, process_name="main"
