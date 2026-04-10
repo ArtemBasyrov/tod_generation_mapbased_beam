@@ -714,3 +714,145 @@ def query_disc_numba(nside, vec, radius_rad, inclusive=True, nest=False):
     theta_q = math.acos(z)
     phi_q = math.atan2(float(v[1]), float(v[0])) % _TWO_PI
     return _query_disc_jit(nside, theta_q, phi_q, float(radius_rad), bool(inclusive))
+
+
+# ── Spin-2 (Q/U) frame rotation helpers ──────────────────────────────────────
+#
+# HEALPix Q and U are defined relative to the local meridian at each pixel.
+# When bilinearly interpolating Q/U from 4 neighbours to a query point q,
+# each neighbour's frame is rotated relative to q's frame.  These functions
+# compute the parallel-transport angle δ needed to rotate a neighbour's
+# (Q_i, U_i) into q's frame before interpolation:
+#
+#   Q_i^(q) =  Q_i cos(2δ) + U_i sin(2δ)
+#   U_i^(q) = -Q_i sin(2δ) + U_i cos(2δ)
+#
+# Both functions are nopython-safe and can be called from prange bodies.
+
+
+@numba.jit(nopython=True, cache=True)
+def _spin2_delta_approx_jit(cos_theta_q, phi_q, phi_i):
+    """
+    Leading-order Q/U frame rotation angle between sky positions.
+
+    Approximates the parallel transport angle δ for moving from the local
+    HEALPix frame at pixel i (longitude φ_i) to the frame at query point q
+    (colatitude θ_q, longitude φ_q) as:
+
+        δ ≈ cos(θ_q) · (φ_i − φ_q)
+
+    This is the dominant term near the poles where cos(θ_q) → 1.  Near the
+    equator cos(θ_q) ≈ 0 so the correction vanishes, matching the fact that
+    meridians are nearly parallel there.
+
+    Cost: O(1) — just one multiplication (cos(θ_q) is already in scope as z
+    inside the fused gather kernel).
+
+    Parameters
+    ----------
+    cos_theta_q : float   cos(θ) at the query point
+    phi_q       : float   longitude of the query point [rad]
+    phi_i       : float   longitude of neighbour pixel i [rad]
+
+    Returns
+    -------
+    delta : float   frame rotation angle [rad], wrapped to (−π, π]
+    """
+    dphi = phi_i - phi_q
+    if dphi > math.pi:
+        dphi -= _TWO_PI
+    elif dphi < -math.pi:
+        dphi += _TWO_PI
+    return cos_theta_q * dphi
+
+
+@numba.jit(nopython=True, cache=True)
+def _spin2_delta_exact_jit(theta_q, phi_q, theta_i, phi_i):
+    """
+    Exact Q/U frame rotation angle via parallel transport on the sphere.
+
+    Computes the angle δ by which the HEALPix local-north direction at pixel i
+    rotates when parallel-transported along the geodesic to query point q.
+    Uses the Rodrigues rotation formula in 3-D:
+
+        R   = Rodrigues(r̂_i → r̂_q)          rotation mapping pos. vec. i to q
+        t   = R · ê_θ(i)                      transported north from i to q
+        cos δ = t · ê_θ(q)
+        sin δ = (ê_θ(q) × t) · r̂_q
+        δ   = atan2(sin δ, cos δ)
+
+    Matches the leading-order approximation _spin2_delta_approx_jit to first
+    order in the angular separation, but remains accurate for larger separations
+    (e.g. near-pole bilinear stencils where Δφ can be significant).
+
+    Cost: ~20 FLOPs + 1 atan2 + several trig calls per neighbour.
+
+    Parameters
+    ----------
+    theta_q, phi_q : float   colatitude / longitude of query point [rad]
+    theta_i, phi_i : float   colatitude / longitude of neighbour pixel [rad]
+
+    Returns
+    -------
+    delta : float   frame rotation angle [rad], in (−π, π]
+    """
+    stq = math.sin(theta_q)
+    ctq = math.cos(theta_q)
+    sti = math.sin(theta_i)
+    cti = math.cos(theta_i)
+    cpq = math.cos(phi_q)
+    spq = math.sin(phi_q)
+    cpi = math.cos(phi_i)
+    spi = math.sin(phi_i)
+
+    # Position unit vectors: r̂ = (sin θ cos φ, sin θ sin φ, cos θ)
+    rq_x = stq * cpq
+    rq_y = stq * spq
+    rq_z = ctq
+    ri_x = sti * cpi
+    ri_y = sti * spi
+    ri_z = cti
+
+    # North direction ê_θ = (cos θ cos φ, cos θ sin φ, −sin θ)
+    ni_x = cti * cpi
+    ni_y = cti * spi
+    ni_z = -sti  # north at i
+    nq_x = ctq * cpq
+    nq_y = ctq * spq
+    nq_z = -stq  # north at q
+
+    # Rodrigues rotation: r̂_i → r̂_q
+    c = ri_x * rq_x + ri_y * rq_y + ri_z * rq_z  # cos(angular separation)
+    vx = ri_y * rq_z - ri_z * rq_y  # r̂_i × r̂_q
+    vy = ri_z * rq_x - ri_x * rq_z
+    vz = ri_x * rq_y - ri_y * rq_x
+    s = math.sqrt(vx * vx + vy * vy + vz * vz)  # sin(angular separation)
+
+    if s < 1.0e-15:  # coincident points → no rotation
+        return 0.0
+
+    kx = vx / s
+    ky = vy / s
+    kz = vz / s  # unit rotation axis
+
+    kdn = kx * ni_x + ky * ni_y + kz * ni_z  # k · ê_θ(i)
+
+    # k × ê_θ(i)
+    kxni_x = ky * ni_z - kz * ni_y
+    kxni_y = kz * ni_x - kx * ni_z
+    kxni_z = kx * ni_y - ky * ni_x
+
+    # Transported north: t = c·ê_θ(i) + (1−c)·(k·ê_θ(i))·k + s·(k×ê_θ(i))
+    tx = c * ni_x + (1.0 - c) * kdn * kx + s * kxni_x
+    ty = c * ni_y + (1.0 - c) * kdn * ky + s * kxni_y
+    tz = c * ni_z + (1.0 - c) * kdn * kz + s * kxni_z
+
+    cos_d = tx * nq_x + ty * nq_y + tz * nq_z  # t · ê_θ(q)
+    # sin δ = (ê_θ(q) × t) · r̂_q  (right-hand sign convention)
+    sin_d = (
+        (nq_y * tz - nq_z * ty) * rq_x
+        + (nq_z * tx - nq_x * tz) * rq_y
+        + (nq_x * ty - nq_y * tx) * rq_z
+    )
+
+    return math.atan2(sin_d, cos_d)

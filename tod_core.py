@@ -50,6 +50,8 @@ from numba_healpy import (
     _ring_info_jit,
     _ring_z_jit,
     get_interp_weights_numba,
+    _spin2_delta_approx_jit,
+    _spin2_delta_exact_jit,
 )
 
 # Target working-set size for the (B × Sc × 3 × float32) vec_rot intermediate.
@@ -198,7 +200,18 @@ def _gather_accum_jit(pixels, weights, beam_vals, mp_stacked, B, Sc, tod):
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
-def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
+def _gather_accum_fused_jit(
+    vec_rot,
+    nside,
+    mp_stacked,
+    beam_vals,
+    B,
+    Sc,
+    tod,
+    spin2_corr=0,
+    c_q=-1,
+    c_u=-1,
+):
     """
     Fully fused vec2ang + HEALPix bilinear interpolation + beam accumulation.
 
@@ -218,6 +231,11 @@ def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
     beam_vals  : (Sc,)        float32   beam weights for this tile
     B, Sc      : int
     tod        : (C, B)       float64   accumulated in place
+    spin2_corr : int          0 = no correction (default)
+                              1 = approx  δ ≈ cos(θ_q)·Δφ
+                              2 = exact   3-D Rodrigues parallel transport
+    c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)
+    c_u        : int          index of U within C-dim of mp_stacked (−1 = absent)
     """
     C = mp_stacked.shape[0]
     npix_total = 12 * nside * nside
@@ -235,6 +253,15 @@ def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
                 phi += _TWO_PI
 
             # ── step 2: HEALPix RING bilinear interpolation (inline) ──────────
+            # Neighbour phi/theta — populated in each branch; used by spin-2
+            # correction in step 3 (ignored when spin2_corr == 0).
+            phi_p0 = 0.0
+            phi_p1 = 0.0
+            phi_p2 = 0.0
+            phi_p3 = 0.0
+            theta_r_above = 0.0
+            theta_r_below = 0.0
+
             z = math.cos(theta)
             az = abs(z)
             if az > _TWO_THIRDS:  # polar cap
@@ -272,6 +299,13 @@ def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
                 w1 = nf
                 w2 = (1.0 - frac) * wt + nf
                 w3 = frac * wt + nf
+                # Neighbour phis (all in ring 1) and theta for spin-2 correction
+                phi_p0 = (phi0a1 + float((ip + 2) % na1) * dphia1) % _TWO_PI
+                phi_p1 = (phi0a1 + float((ip2 + 2) % na1) * dphia1) % _TWO_PI
+                phi_p2 = (phi0a1 + float(ip) * dphia1) % _TWO_PI
+                phi_p3 = (phi0a1 + float(ip2) * dphia1) % _TWO_PI
+                theta_r_above = ta1
+                theta_r_below = ta1
 
             elif ir_below == 4 * nside:
                 # ── South-pole boundary ───────────────────────────────────────
@@ -299,6 +333,13 @@ def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
                 w1 = frac * (1.0 - wts) + sf
                 w2 = sf
                 w3 = sf
+                # Neighbour phis (all in last ring) and theta for spin-2 correction
+                phi_p0 = (phi0a_l + float(ip) * dphia_l) % _TWO_PI
+                phi_p1 = (phi0a_l + float(ip2) * dphia_l) % _TWO_PI
+                phi_p2 = (phi0a_l + float((ip + 2) % na_l) * dphia_l) % _TWO_PI
+                phi_p3 = (phi0a_l + float((ip2 + 2) % na_l) * dphia_l) % _TWO_PI
+                theta_r_above = ta_l
+                theta_r_below = ta_l
 
             else:
                 # ── Normal case ───────────────────────────────────────────────
@@ -372,16 +413,83 @@ def _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod):
                 p3 = fpb + (iphib + 1) % nb
                 w2 = w_below * (1.0 - fphib)
                 w3 = w_below * fphib
+                # Neighbour phis and thetas for spin-2 correction
+                phi_p0 = phi0a + float(iphia) * dphia
+                phi_p1 = phi0a + float(iphia) * dphia + dphia
+                if phi_p1 >= _TWO_PI:
+                    phi_p1 -= _TWO_PI
+                phi_p2 = phi0b + float(iphib) * dphib
+                phi_p3 = phi0b + float(iphib) * dphib + dphib
+                if phi_p3 >= _TWO_PI:
+                    phi_p3 -= _TWO_PI
+                theta_r_above = ta
+                theta_r_below = tb
 
             # ── step 3: gather + beam-weighted accumulation ───────────────────
             bv = float(beam_vals[s])
-            for c in range(C):
-                tod[c, b] += (
-                    mp_stacked[c, p0] * w0
-                    + mp_stacked[c, p1] * w1
-                    + mp_stacked[c, p2] * w2
-                    + mp_stacked[c, p3] * w3
+            if spin2_corr == 0 or c_q < 0 or c_u < 0:
+                # No frame correction: scalar interpolation for all channels
+                for c in range(C):
+                    tod[c, b] += (
+                        mp_stacked[c, p0] * w0
+                        + mp_stacked[c, p1] * w1
+                        + mp_stacked[c, p2] * w2
+                        + mp_stacked[c, p3] * w3
+                    ) * bv
+            else:
+                # Spin-2 frame correction for Q/U channels
+                if spin2_corr == 1:  # approx: δ ≈ cos(θ_q) · Δφ
+                    d0 = _spin2_delta_approx_jit(z, phi, phi_p0)
+                    d1 = _spin2_delta_approx_jit(z, phi, phi_p1)
+                    d2 = _spin2_delta_approx_jit(z, phi, phi_p2)
+                    d3 = _spin2_delta_approx_jit(z, phi, phi_p3)
+                else:  # exact: Rodrigues parallel transport
+                    d0 = _spin2_delta_exact_jit(theta, phi, theta_r_above, phi_p0)
+                    d1 = _spin2_delta_exact_jit(theta, phi, theta_r_above, phi_p1)
+                    d2 = _spin2_delta_exact_jit(theta, phi, theta_r_below, phi_p2)
+                    d3 = _spin2_delta_exact_jit(theta, phi, theta_r_below, phi_p3)
+
+                # Per-neighbour spin-2 rotation: Q' = Q cos2δ + U sin2δ
+                Q0 = float(mp_stacked[c_q, p0])
+                U0 = float(mp_stacked[c_u, p0])
+                Q1 = float(mp_stacked[c_q, p1])
+                U1 = float(mp_stacked[c_u, p1])
+                Q2 = float(mp_stacked[c_q, p2])
+                U2 = float(mp_stacked[c_u, p2])
+                Q3 = float(mp_stacked[c_q, p3])
+                U3 = float(mp_stacked[c_u, p3])
+
+                c2d0 = math.cos(2.0 * d0)
+                s2d0 = math.sin(2.0 * d0)
+                c2d1 = math.cos(2.0 * d1)
+                s2d1 = math.sin(2.0 * d1)
+                c2d2 = math.cos(2.0 * d2)
+                s2d2 = math.sin(2.0 * d2)
+                c2d3 = math.cos(2.0 * d3)
+                s2d3 = math.sin(2.0 * d3)
+
+                tod[c_q, b] += (
+                    (Q0 * c2d0 + U0 * s2d0) * w0
+                    + (Q1 * c2d1 + U1 * s2d1) * w1
+                    + (Q2 * c2d2 + U2 * s2d2) * w2
+                    + (Q3 * c2d3 + U3 * s2d3) * w3
                 ) * bv
+                tod[c_u, b] += (
+                    (-Q0 * s2d0 + U0 * c2d0) * w0
+                    + (-Q1 * s2d1 + U1 * c2d1) * w1
+                    + (-Q2 * s2d2 + U2 * c2d2) * w2
+                    + (-Q3 * s2d3 + U3 * c2d3) * w3
+                ) * bv
+
+                # Remaining channels (T, etc.): scalar interpolation
+                for c in range(C):
+                    if c != c_q and c != c_u:
+                        tod[c, b] += (
+                            mp_stacked[c, p0] * w0
+                            + mp_stacked[c, p1] * w1
+                            + mp_stacked[c, p2] * w2
+                            + mp_stacked[c, p3] * w3
+                        ) * bv
 
 
 # ── Flat-sky fused kernel ─────────────────────────────────────────────────────
@@ -932,6 +1040,7 @@ def beam_tod_batch(
     theta_b,
     psis_b,
     interp_mode="bilinear",
+    spin2_corr=0,
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
 
@@ -980,6 +1089,10 @@ def beam_tod_batch(
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
             (``'gaussian'`` and ``'bicubic'`` are available on their respective branches.)
+        spin2_corr (int): Spin-2 Q/U frame correction for bilinear
+            interpolation. 0 = none (default), 1 = approx, 2 = exact.
+            See :func:`numba_healpy._spin2_delta_approx_jit` and
+            :func:`numba_healpy._spin2_delta_exact_jit`.
 
     Returns:
         dict[int, numpy.ndarray]: Mapping from Stokes component index to a
@@ -993,6 +1106,15 @@ def beam_tod_batch(
     comp_indices = data["comp_indices"]
     C = len(comp_indices)
     mp_stacked = data.get("mp_stacked")  # (C, N) float32, or None
+
+    # Q and U channel positions within the C-dim of mp_stacked
+    c_q = -1
+    c_u = -1
+    for _ci, _comp in enumerate(comp_indices):
+        if _comp == 1:
+            c_q = _ci
+        elif _comp == 2:
+            c_u = _ci
     vec_rolled = data.get("vec_rolled")  # (N_psi, S, 3) float32, or None
     psi_grid = data.get("psi_grid")  # (N_psi,) float32, or None
     dtheta = data.get("dtheta")  # (N_psi, S) float32, or None
@@ -1100,7 +1222,16 @@ def beam_tod_batch(
                     )
                 else:
                     _gather_accum_fused_jit(
-                        vec_rot, nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr
+                        vec_rot,
+                        nside,
+                        mp_stacked,
+                        bv_chunk,
+                        B,
+                        s1 - s0,
+                        tod_arr,
+                        spin2_corr,
+                        c_q,
+                        c_u,
                     )
                 for i, comp in enumerate(comp_indices):
                     tod[comp] += tod_arr[i].astype(np.float32)
@@ -1129,7 +1260,16 @@ def beam_tod_batch(
                     )
                 else:
                     _gather_accum_fused_jit(
-                        vec_rot, nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr
+                        vec_rot,
+                        nside,
+                        mp_stacked,
+                        bv_chunk,
+                        B,
+                        s1 - s0,
+                        tod_arr,
+                        spin2_corr,
+                        c_q,
+                        c_u,
                     )
                 for i, comp in enumerate(comp_indices):
                     tod[comp] += tod_arr[i].astype(np.float32)

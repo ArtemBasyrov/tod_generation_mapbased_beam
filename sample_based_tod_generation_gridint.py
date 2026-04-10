@@ -34,6 +34,7 @@ end_day = config.end_day
 interp_mode = config.beam_interp_method
 interp_sigma_deg = config.beam_interp_sigma_deg
 interp_radius_deg = config.beam_interp_radius_deg
+spin2_corr = config.bilinear_spin2_correction
 
 # ── Worker-global state (populated by _worker_init in each spawned process) ───
 # MP is loaded in the parent, placed in shared memory, and attached here
@@ -333,6 +334,7 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
                 theta_b,
                 psis_b,
                 interp_mode=interp_mode,
+                spin2_corr=spin2_corr,
             )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
