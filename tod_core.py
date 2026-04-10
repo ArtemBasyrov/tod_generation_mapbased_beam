@@ -494,10 +494,14 @@ def _gather_accum_fused_jit(
                     U2 = float(mp_stacked[c_u, p2])
                     Q3 = float(mp_stacked[c_q, p3])
                     U3 = float(mp_stacked[c_u, p3])
-                    c2d0 = math.cos(2.0 * d0); s2d0 = math.sin(2.0 * d0)
-                    c2d1 = math.cos(2.0 * d1); s2d1 = math.sin(2.0 * d1)
-                    c2d2 = math.cos(2.0 * d2); s2d2 = math.sin(2.0 * d2)
-                    c2d3 = math.cos(2.0 * d3); s2d3 = math.sin(2.0 * d3)
+                    c2d0 = math.cos(2.0 * d0)
+                    s2d0 = math.sin(2.0 * d0)
+                    c2d1 = math.cos(2.0 * d1)
+                    s2d1 = math.sin(2.0 * d1)
+                    c2d2 = math.cos(2.0 * d2)
+                    s2d2 = math.sin(2.0 * d2)
+                    c2d3 = math.cos(2.0 * d3)
+                    s2d3 = math.sin(2.0 * d3)
                     Q_interp = (
                         (Q0 * c2d0 + U0 * s2d0) * w0
                         + (Q1 * c2d1 + U1 * s2d1) * w1
