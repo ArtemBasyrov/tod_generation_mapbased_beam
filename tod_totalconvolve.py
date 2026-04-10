@@ -165,7 +165,9 @@ class TotalconvolveInterpolator:
         return np.array([lookup[i] for i in comp_indices])
 
 
-def _gather_accum_totalconvolve(vec_rot, beam_vals, comp_indices, interp, tod, ax_pts=None):
+def _gather_accum_totalconvolve(
+    vec_rot, beam_vals, comp_indices, interp, tod, ax_pts=None
+):
     """Replace HEALPix gather + accumulate using ducc0 NUFFT synthesis.
 
     Converts rotated beam-pixel unit vectors to ``(θ, φ)``, calls
