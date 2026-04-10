@@ -165,13 +165,21 @@ class TotalconvolveInterpolator:
         return np.array([lookup[i] for i in comp_indices])
 
 
-def _gather_accum_totalconvolve(vec_rot, beam_vals, comp_indices, interp, tod):
+def _gather_accum_totalconvolve(vec_rot, beam_vals, comp_indices, interp, tod, ax_pts=None):
     """Replace HEALPix gather + accumulate using ducc0 NUFFT synthesis.
 
     Converts rotated beam-pixel unit vectors to ``(θ, φ)``, calls
     :meth:`TotalconvolveInterpolator.sample` once with all B×S positions
-    for all Stokes components, then multiplies by beam weights and
-    accumulates into ``tod``.
+    for all Stokes components, applies the spin-2 parallactic-angle rotation
+    to Q/U before accumulation, then multiplies by beam weights.
+
+    The parallactic angle γ at each sky position (θ_s, φ_s) is the angle
+    between local North there and the direction toward the boresight.
+    ``synthesis_general(spin=2)`` returns Q+iU in the local sky frame at
+    each evaluation point; rotating by ``e^{−2iγ}`` expresses it in the
+    boresight frame before beam-weighted summation, matching what
+    ``healpy.smoothing(pol=True)`` computes via the harmonic spin-2
+    addition theorem.
 
     Args:
         vec_rot (numpy.ndarray): Rotated beam-pixel unit vectors in the sky
@@ -181,6 +189,9 @@ def _gather_accum_totalconvolve(vec_rot, beam_vals, comp_indices, interp, tod):
         comp_indices (list of int): Stokes component indices to accumulate.
         interp (TotalconvolveInterpolator): Pre-built interpolator.
         tod (dict): Mapping ``{comp_idx: (B,) float32}`` updated in place.
+        ax_pts (numpy.ndarray or None): Boresight unit vectors, shape
+            ``(B, 3)``, dtype float32.  When provided, the parallactic-angle
+            correction is applied to Q (comp 1) and U (comp 2).
     """
     B, S = vec_rot.shape[:2]
 
@@ -190,9 +201,50 @@ def _gather_accum_totalconvolve(vec_rot, beam_vals, comp_indices, interp, tod):
     phi_sky = np.arctan2(vf[:, 1], vf[:, 0])  # [-π, π]
     phi_sky += (phi_sky < 0.0) * _TWO_PI  # wrap to [0, 2π)
 
-    # Single call for all components — (C, B*S) float64.
-    vals = interp.sample(theta_sky, phi_sky, comp_indices)
+    # Parallactic-angle correction requires both Q and U even if only one
+    # was requested, so extend the sample list when necessary.
+    need_pol = ax_pts is not None and (1 in comp_indices or 2 in comp_indices)
+    if need_pol and not (1 in comp_indices and 2 in comp_indices):
+        extra = [c for c in (1, 2) if c not in comp_indices]
+        sample_indices = list(comp_indices) + extra
+    else:
+        sample_indices = comp_indices
+
+    raw = interp.sample(theta_sky, phi_sky, sample_indices)
+    vals = {ci: raw[i] for i, ci in enumerate(sample_indices)}
+
+    if need_pol:
+        # Boresight unit vectors for each (b, s) pair: repeat each row S times.
+        ab = np.repeat(ax_pts.astype(np.float64), S, axis=0)  # (B*S, 3)
+
+        # Tangent component of north pole (0,0,1) at each sky position n_s.
+        z_s = vf[:, 2]
+        nt_x = -vf[:, 0] * z_s
+        nt_y = -vf[:, 1] * z_s
+        nt_z = 1.0 - z_s * z_s
+
+        # Tangent component of boresight direction at each sky position.
+        nb_dot = (ab * vf).sum(axis=-1)
+        nb_x = ab[:, 0] - nb_dot * vf[:, 0]
+        nb_y = ab[:, 1] - nb_dot * vf[:, 1]
+        nb_z = ab[:, 2] - nb_dot * vf[:, 2]
+
+        # γ = atan2( (nt × nb) · n_s,  nt · nb )
+        cx = nt_y * nb_z - nt_z * nb_y
+        cy = nt_z * nb_x - nt_x * nb_z
+        cz = nt_x * nb_y - nt_y * nb_x
+        sin_g = cx * vf[:, 0] + cy * vf[:, 1] + cz * vf[:, 2]
+        cos_g = nt_x * nb_x + nt_y * nb_y + nt_z * nb_z
+        gamma = np.arctan2(sin_g, cos_g)
+
+        cos2g = np.cos(2.0 * gamma)
+        sin2g = np.sin(2.0 * gamma)
+
+        Q = vals[1].copy()
+        U = vals[2].copy()
+        vals[1] = Q * cos2g - U * sin2g
+        vals[2] = Q * sin2g + U * cos2g
 
     bv = beam_vals.astype(np.float64)
-    for i, comp in enumerate(comp_indices):
-        tod[comp] += (vals[i].reshape(B, S) @ bv).astype(np.float32)
+    for comp in comp_indices:
+        tod[comp] += (vals[comp].reshape(B, S) @ bv).astype(np.float32)

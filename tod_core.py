@@ -1058,7 +1058,7 @@ def beam_tod_batch(
             vec_rot,
         )
         _gather_accum_totalconvolve(
-            vec_rot, beam_vals, comp_indices, totalconvolve_interp, tod
+            vec_rot, beam_vals, comp_indices, totalconvolve_interp, tod, ax_pts=ax_pts
         )
         return tod
 
