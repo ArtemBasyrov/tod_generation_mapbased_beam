@@ -208,6 +208,7 @@ def _gather_accum_fused_jit(
     B,
     Sc,
     tod,
+    ax_pts,
     spin2_corr=0,
     c_q=-1,
     c_u=-1,
@@ -223,6 +224,18 @@ def _gather_accum_fused_jit(
     Inlines the HEALPix RING get_interpol algorithm so that Numba can see the
     complete computation and apply cross-step optimisations.
 
+    Two independent spin-2 corrections are applied when c_q >= 0 and c_u >= 0:
+
+    1. Neighbour-frame alignment (spin2_corr 1 or 2): rotates each of the 4
+       bilinear neighbours into the query-point local frame before interpolating,
+       so the interpolated Q/U is in the sky-local frame at (θ_s, φ_s).
+
+    2. Parallactic-angle rotation (always on when c_q/c_u present): rotates the
+       interpolated Q/U from the sky-local frame at the beam-pixel sky position
+       into the boresight frame (ax_pts[b]), matching what healpy.smoothing
+       computes via the harmonic spin-2 addition theorem.  This is the dominant
+       polar correction.
+
     Parameters
     ----------
     vec_rot    : (B, Sc, 3)   float32   rotated beam unit vectors
@@ -231,7 +244,8 @@ def _gather_accum_fused_jit(
     beam_vals  : (Sc,)        float32   beam weights for this tile
     B, Sc      : int
     tod        : (C, B)       float64   accumulated in place
-    spin2_corr : int          0 = no correction (default)
+    ax_pts     : (B, 3)       float32   boresight unit vectors per sample
+    spin2_corr : int          0 = no neighbour-frame correction (default)
                               1 = approx  δ ≈ cos(θ_q)·Δφ
                               2 = exact   3-D Rodrigues parallel transport
     c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)
@@ -427,8 +441,8 @@ def _gather_accum_fused_jit(
 
             # ── step 3: gather + beam-weighted accumulation ───────────────────
             bv = float(beam_vals[s])
-            if spin2_corr == 0 or c_q < 0 or c_u < 0:
-                # No frame correction: scalar interpolation for all channels
+            if c_q < 0 or c_u < 0:
+                # No Q/U present: scalar interpolation for all channels.
                 for c in range(C):
                     tod[c, b] += (
                         mp_stacked[c, p0] * w0
@@ -437,51 +451,7 @@ def _gather_accum_fused_jit(
                         + mp_stacked[c, p3] * w3
                     ) * bv
             else:
-                # Spin-2 frame correction for Q/U channels
-                if spin2_corr == 1:  # approx: δ ≈ cos(θ_q) · Δφ
-                    d0 = _spin2_delta_approx_jit(z, phi, phi_p0)
-                    d1 = _spin2_delta_approx_jit(z, phi, phi_p1)
-                    d2 = _spin2_delta_approx_jit(z, phi, phi_p2)
-                    d3 = _spin2_delta_approx_jit(z, phi, phi_p3)
-                else:  # exact: Rodrigues parallel transport
-                    d0 = _spin2_delta_exact_jit(theta, phi, theta_r_above, phi_p0)
-                    d1 = _spin2_delta_exact_jit(theta, phi, theta_r_above, phi_p1)
-                    d2 = _spin2_delta_exact_jit(theta, phi, theta_r_below, phi_p2)
-                    d3 = _spin2_delta_exact_jit(theta, phi, theta_r_below, phi_p3)
-
-                # Per-neighbour spin-2 rotation: Q' = Q cos2δ + U sin2δ
-                Q0 = float(mp_stacked[c_q, p0])
-                U0 = float(mp_stacked[c_u, p0])
-                Q1 = float(mp_stacked[c_q, p1])
-                U1 = float(mp_stacked[c_u, p1])
-                Q2 = float(mp_stacked[c_q, p2])
-                U2 = float(mp_stacked[c_u, p2])
-                Q3 = float(mp_stacked[c_q, p3])
-                U3 = float(mp_stacked[c_u, p3])
-
-                c2d0 = math.cos(2.0 * d0)
-                s2d0 = math.sin(2.0 * d0)
-                c2d1 = math.cos(2.0 * d1)
-                s2d1 = math.sin(2.0 * d1)
-                c2d2 = math.cos(2.0 * d2)
-                s2d2 = math.sin(2.0 * d2)
-                c2d3 = math.cos(2.0 * d3)
-                s2d3 = math.sin(2.0 * d3)
-
-                tod[c_q, b] += (
-                    (Q0 * c2d0 + U0 * s2d0) * w0
-                    + (Q1 * c2d1 + U1 * s2d1) * w1
-                    + (Q2 * c2d2 + U2 * s2d2) * w2
-                    + (Q3 * c2d3 + U3 * s2d3) * w3
-                ) * bv
-                tod[c_u, b] += (
-                    (-Q0 * s2d0 + U0 * c2d0) * w0
-                    + (-Q1 * s2d1 + U1 * c2d1) * w1
-                    + (-Q2 * s2d2 + U2 * c2d2) * w2
-                    + (-Q3 * s2d3 + U3 * c2d3) * w3
-                ) * bv
-
-                # Remaining channels (T, etc.): scalar interpolation
+                # ── Accumulate non-Q/U channels (T etc.) as scalars ──────────
                 for c in range(C):
                     if c != c_q and c != c_u:
                         tod[c, b] += (
@@ -490,6 +460,86 @@ def _gather_accum_fused_jit(
                             + mp_stacked[c, p2] * w2
                             + mp_stacked[c, p3] * w3
                         ) * bv
+
+                # ── Interpolate Q/U (correction 1: neighbour-frame alignment) ─
+                if spin2_corr == 0:
+                    Q_interp = (
+                        mp_stacked[c_q, p0] * w0
+                        + mp_stacked[c_q, p1] * w1
+                        + mp_stacked[c_q, p2] * w2
+                        + mp_stacked[c_q, p3] * w3
+                    )
+                    U_interp = (
+                        mp_stacked[c_u, p0] * w0
+                        + mp_stacked[c_u, p1] * w1
+                        + mp_stacked[c_u, p2] * w2
+                        + mp_stacked[c_u, p3] * w3
+                    )
+                else:
+                    if spin2_corr == 1:  # approx: δ ≈ cos(θ_q) · Δφ
+                        d0 = _spin2_delta_approx_jit(z, phi, phi_p0)
+                        d1 = _spin2_delta_approx_jit(z, phi, phi_p1)
+                        d2 = _spin2_delta_approx_jit(z, phi, phi_p2)
+                        d3 = _spin2_delta_approx_jit(z, phi, phi_p3)
+                    else:  # exact: Rodrigues parallel transport
+                        d0 = _spin2_delta_exact_jit(theta, phi, theta_r_above, phi_p0)
+                        d1 = _spin2_delta_exact_jit(theta, phi, theta_r_above, phi_p1)
+                        d2 = _spin2_delta_exact_jit(theta, phi, theta_r_below, phi_p2)
+                        d3 = _spin2_delta_exact_jit(theta, phi, theta_r_below, phi_p3)
+                    Q0 = float(mp_stacked[c_q, p0])
+                    U0 = float(mp_stacked[c_u, p0])
+                    Q1 = float(mp_stacked[c_q, p1])
+                    U1 = float(mp_stacked[c_u, p1])
+                    Q2 = float(mp_stacked[c_q, p2])
+                    U2 = float(mp_stacked[c_u, p2])
+                    Q3 = float(mp_stacked[c_q, p3])
+                    U3 = float(mp_stacked[c_u, p3])
+                    c2d0 = math.cos(2.0 * d0); s2d0 = math.sin(2.0 * d0)
+                    c2d1 = math.cos(2.0 * d1); s2d1 = math.sin(2.0 * d1)
+                    c2d2 = math.cos(2.0 * d2); s2d2 = math.sin(2.0 * d2)
+                    c2d3 = math.cos(2.0 * d3); s2d3 = math.sin(2.0 * d3)
+                    Q_interp = (
+                        (Q0 * c2d0 + U0 * s2d0) * w0
+                        + (Q1 * c2d1 + U1 * s2d1) * w1
+                        + (Q2 * c2d2 + U2 * s2d2) * w2
+                        + (Q3 * c2d3 + U3 * s2d3) * w3
+                    )
+                    U_interp = (
+                        (-Q0 * s2d0 + U0 * c2d0) * w0
+                        + (-Q1 * s2d1 + U1 * c2d1) * w1
+                        + (-Q2 * s2d2 + U2 * c2d2) * w2
+                        + (-Q3 * s2d3 + U3 * c2d3) * w3
+                    )
+
+                # ── Correction 2: parallactic-angle rotation ──────────────────
+                # Rotate Q+iU from the sky-local frame at (vx,vy,vz) into the
+                # boresight frame (ax_pts[b]).
+                # γ = atan2( (north_tang × boresight_tang) · n_s,
+                #             north_tang · boresight_tang )
+                bx_ = float(ax_pts[b, 0])
+                by_ = float(ax_pts[b, 1])
+                bz_ = float(ax_pts[b, 2])
+                # Tangent of north pole (0,0,1) at sky position n_s
+                nt_x = -vx * vz
+                nt_y = -vy * vz
+                nt_z = 1.0 - vz * vz
+                # Tangent of boresight direction at sky position n_s
+                nb_dot = bx_ * vx + by_ * vy + bz_ * vz
+                nb_x = bx_ - nb_dot * vx
+                nb_y = by_ - nb_dot * vy
+                nb_z = bz_ - nb_dot * vz
+                # Cross product and dot product for atan2
+                cx_ = nt_y * nb_z - nt_z * nb_y
+                cy_ = nt_z * nb_x - nt_x * nb_z
+                cz_ = nt_x * nb_y - nt_y * nb_x
+                sin_g = cx_ * vx + cy_ * vy + cz_ * vz
+                cos_g = nt_x * nb_x + nt_y * nb_y + nt_z * nb_z
+                gamma = math.atan2(sin_g, cos_g)
+                cos2g = math.cos(2.0 * gamma)
+                sin2g = math.sin(2.0 * gamma)
+
+                tod[c_q, b] += (Q_interp * cos2g - U_interp * sin2g) * bv
+                tod[c_u, b] += (Q_interp * sin2g + U_interp * cos2g) * bv
 
 
 # ── Flat-sky fused kernel ─────────────────────────────────────────────────────
@@ -1229,6 +1279,7 @@ def beam_tod_batch(
                         B,
                         s1 - s0,
                         tod_arr,
+                        ax_pts,
                         spin2_corr,
                         c_q,
                         c_u,
@@ -1267,6 +1318,7 @@ def beam_tod_batch(
                         B,
                         s1 - s0,
                         tod_arr,
+                        ax_pts,
                         spin2_corr,
                         c_q,
                         c_u,
