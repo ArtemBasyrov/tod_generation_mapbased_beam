@@ -23,6 +23,14 @@ query_disc_numba        — public wrapper; drop-in for hp.query_disc(nest=False
 _gather_ring_stencil_jit — fast Keys/Catmull-Rom stencil gather via ring walk.
                            Replaces _query_disc_into_jit in the bicubic hot loop,
                            eliminating the ~9 acos calls per (b,s) element.
+
+_spin2_delta_approx_jit  — leading-order Q/U frame rotation between two sky positions
+                           (neighbour-frame alignment during bilinear interpolation).
+_spin2_delta_exact_jit   — exact Q/U frame rotation via Rodrigues parallel transport
+                           (neighbour-frame alignment during bilinear interpolation).
+_parallactic_angle_jit   — parallactic angle γ at a sky position relative to the
+                           boresight direction.  Used for the boresight-frame correction
+                           (correction 2) in all interpolation methods.
 """
 
 import math
@@ -856,3 +864,57 @@ def _spin2_delta_exact_jit(theta_q, phi_q, theta_i, phi_i):
     )
 
     return math.atan2(sin_d, cos_d)
+
+
+@numba.jit(nopython=True, cache=True)
+def _parallactic_angle_jit(vx, vy, vz, bx, by, bz):
+    """
+    Parallactic angle γ at sky position n_s relative to boresight direction n_b.
+
+    γ is the angle between local North (direction toward the north pole, projected
+    onto the tangent plane at n_s) and the direction toward the boresight n_b
+    (also projected onto the tangent plane at n_s).  Rotating Q+iU by e^{-2iγ}
+    transforms the sky-local Q/U at n_s into the boresight reference frame.
+
+    This is the "correction 2" rotation applied after interpolation in every
+    beam-accumulation kernel.  Correction 1 (neighbour-frame alignment) is
+    handled separately by _spin2_delta_approx_jit / _spin2_delta_exact_jit.
+
+    Formula (tangent-plane cross-product):
+
+        north_tang = (0,0,1) − (n_s · ẑ) n_s      # ẑ projected to tangent plane at n_s
+        nb_tang    = n_b − (n_b · n_s) n_s          # n_b projected to tangent plane at n_s
+        γ = atan2( (north_tang × nb_tang) · n_s,    north_tang · nb_tang )
+
+    Special cases:
+    - n_s at a geographic pole (sin θ → 0, north_tang → 0): atan2(0, 0) = 0.
+    - n_s = n_b (boresight pixel): nb_tang → 0, atan2(0, 0) = 0 — correct, no rotation.
+
+    Parameters
+    ----------
+    vx, vy, vz : float   Components of the sky-position unit vector n_s.
+    bx, by, bz : float   Components of the boresight unit vector n_b (ax_pts[b]).
+
+    Returns
+    -------
+    gamma : float   Parallactic angle [rad], in (−π, π].
+    """
+    # Tangent component of north pole (0,0,1) at n_s
+    nt_x = -vx * vz
+    nt_y = -vy * vz
+    nt_z = 1.0 - vz * vz
+
+    # Tangent component of boresight at n_s
+    nb_dot = bx * vx + by * vy + bz * vz
+    nb_x = bx - nb_dot * vx
+    nb_y = by - nb_dot * vy
+    nb_z = bz - nb_dot * vz
+
+    # γ = atan2( (north_tang × nb_tang) · n_s,  north_tang · nb_tang )
+    cx = nt_y * nb_z - nt_z * nb_y
+    cy = nt_z * nb_x - nt_x * nb_z
+    cz = nt_x * nb_y - nt_y * nb_x
+    sin_g = cx * vx + cy * vy + cz * vz
+    cos_g = nt_x * nb_x + nt_y * nb_y + nt_z * nb_z
+
+    return math.atan2(sin_g, cos_g)
