@@ -52,7 +52,6 @@ from numba_healpy import (
     get_interp_weights_numba,
     _spin2_delta_approx_jit,
     _spin2_delta_exact_jit,
-    _parallactic_angle_jit,
 )
 
 # Target working-set size for the (B × Sc × 3 × float32) vec_rot intermediate.
@@ -225,17 +224,19 @@ def _gather_accum_fused_jit(
     Inlines the HEALPix RING get_interpol algorithm so that Numba can see the
     complete computation and apply cross-step optimisations.
 
-    Two independent spin-2 corrections are applied when c_q >= 0 and c_u >= 0:
+    One optional spin-2 correction is applied when c_q >= 0 and c_u >= 0 and
+    spin2_corr > 0:
 
-    1. Neighbour-frame alignment (spin2_corr 1 or 2): rotates each of the 4
-       bilinear neighbours into the query-point local frame before interpolating,
-       so the interpolated Q/U is in the sky-local frame at (θ_s, φ_s).
+    Neighbour-frame alignment (spin2_corr 1 or 2): rotates each of the 4
+    bilinear neighbours into the query-point local frame before interpolating,
+    so the interpolated Q/U is in the sky-local frame at (θ_s, φ_s).
 
-    2. Parallactic-angle rotation (always on when c_q/c_u present): rotates the
-       interpolated Q/U from the sky-local frame at the beam-pixel sky position
-       into the boresight frame (ax_pts[b]), matching what healpy.smoothing
-       computes via the harmonic spin-2 addition theorem.  This is the dominant
-       polar correction.
+    Note: a parallactic-angle boresight-frame rotation (e^{-2iγ}) is NOT applied
+    here.  For a symmetric Gaussian beam the spin-2 and scalar convolutions are
+    equivalent at the precision of the bilinear interpolation (the azimuthal
+    symmetry of the beam causes the e^{-2iγ} correction to integrate to zero).
+    Applying it would cancel nearly all off-axis beam pixel contributions, leaving
+    only the centre-pixel weight (~0.4% of beam power), suppressing the signal.
 
     Parameters
     ----------
@@ -245,7 +246,8 @@ def _gather_accum_fused_jit(
     beam_vals  : (Sc,)        float32   beam weights for this tile
     B, Sc      : int
     tod        : (C, B)       float64   accumulated in place
-    ax_pts     : (B, 3)       float32   boresight unit vectors per sample
+    ax_pts     : (B, 3)       float32   boresight unit vectors (passed for API
+                              consistency with _rodrigues_jit; not used here)
     spin2_corr : int          0 = no neighbour-frame correction (default)
                               1 = approx  δ ≈ cos(θ_q)·Δφ
                               2 = exact   3-D Rodrigues parallel transport
@@ -516,18 +518,8 @@ def _gather_accum_fused_jit(
                         + (-Q3 * s2d3 + U3 * c2d3) * w3
                     )
 
-                # ── Correction 2: parallactic-angle rotation ──────────────────
-                # Rotate Q+iU from the sky-local frame at (vx,vy,vz) into the
-                # boresight frame (ax_pts[b]).
-                gamma = _parallactic_angle_jit(
-                    vx, vy, vz,
-                    float(ax_pts[b, 0]), float(ax_pts[b, 1]), float(ax_pts[b, 2]),
-                )
-                cos2g = math.cos(2.0 * gamma)
-                sin2g = math.sin(2.0 * gamma)
-
-                tod[c_q, b] += (Q_interp * cos2g - U_interp * sin2g) * bv
-                tod[c_u, b] += (Q_interp * sin2g + U_interp * cos2g) * bv
+                tod[c_q, b] += Q_interp * bv
+                tod[c_u, b] += U_interp * bv
 
 
 # ── Flat-sky fused kernel ─────────────────────────────────────────────────────
@@ -746,17 +738,15 @@ def _gather_accum_flatsky_jit(
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
-def _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod,
-                               ax_pts, c_q=-1, c_u=-1):
+def _gather_accum_nearest_jit(
+    vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, c_q=-1, c_u=-1
+):
     """
     Fully fused vec2ang + HEALPix nearest-pixel lookup + beam accumulation.
 
     For each rotated beam vector the single nearest RING-scheme pixel is found
     via the inline ang2pix algorithm (_ang2pix_ring_jit inlined) and its
     sky-map value is accumulated with the beam weight.  Parallelised over B.
-
-    When c_q >= 0 and c_u >= 0, the parallactic-angle correction (correction 2)
-    is applied to Q/U before accumulation, matching _gather_accum_fused_jit.
 
     Parameters
     ----------
@@ -766,7 +756,8 @@ def _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod,
     beam_vals  : (Sc,)        float32   beam weights for this tile
     B, Sc      : int
     tod        : (C, B)       float64   accumulated in place
-    ax_pts     : (B, 3)       float32   boresight unit vectors per sample
+    ax_pts     : (B, 3)       float32   boresight unit vectors (API consistency;
+                              not used for Q/U frame correction — see bilinear note)
     c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)
     c_u        : int          index of U within C-dim of mp_stacked (−1 = absent)
     """
@@ -821,16 +812,8 @@ def _gather_accum_nearest_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod,
                 for c in range(C):
                     if c != c_q and c != c_u:
                         tod[c, b] += mp_stacked[c, best_pix] * bv
-                gamma = _parallactic_angle_jit(
-                    vx, vy, vz,
-                    float(ax_pts[b, 0]), float(ax_pts[b, 1]), float(ax_pts[b, 2]),
-                )
-                cos2g = math.cos(2.0 * gamma)
-                sin2g = math.sin(2.0 * gamma)
-                Q_val = float(mp_stacked[c_q, best_pix])
-                U_val = float(mp_stacked[c_u, best_pix])
-                tod[c_q, b] += (Q_val * cos2g - U_val * sin2g) * bv
-                tod[c_u, b] += (Q_val * sin2g + U_val * cos2g) * bv
+                tod[c_q, b] += float(mp_stacked[c_q, best_pix]) * bv
+                tod[c_u, b] += float(mp_stacked[c_u, best_pix]) * bv
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
@@ -1278,8 +1261,16 @@ def beam_tod_batch(
                 tod_arr = np.zeros((C, B), dtype=np.float64)
                 if use_nearest:
                     _gather_accum_nearest_jit(
-                        vec_rot, nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr,
-                        ax_pts, c_q, c_u,
+                        vec_rot,
+                        nside,
+                        mp_stacked,
+                        bv_chunk,
+                        B,
+                        s1 - s0,
+                        tod_arr,
+                        ax_pts,
+                        c_q,
+                        c_u,
                     )
                 else:
                     _gather_accum_fused_jit(
@@ -1318,8 +1309,16 @@ def beam_tod_batch(
                 tod_arr = np.zeros((C, B), dtype=np.float64)
                 if use_nearest:
                     _gather_accum_nearest_jit(
-                        vec_rot, nside, mp_stacked, bv_chunk, B, s1 - s0, tod_arr,
-                        ax_pts, c_q, c_u,
+                        vec_rot,
+                        nside,
+                        mp_stacked,
+                        bv_chunk,
+                        B,
+                        s1 - s0,
+                        tod_arr,
+                        ax_pts,
+                        c_q,
+                        c_u,
                     )
                 else:
                     _gather_accum_fused_jit(
