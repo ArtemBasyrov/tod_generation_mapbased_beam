@@ -421,8 +421,6 @@ class TestRunClusteringProbe:
                 theta_b,
                 psis_b,
                 interp_mode="bilinear",
-                sigma_deg=None,
-                radius_deg=None,
             )
         assert result.shape == (3, self._B)
 
@@ -441,8 +439,6 @@ class TestRunClusteringProbe:
                 theta_b,
                 psis_b,
                 interp_mode="bilinear",
-                sigma_deg=None,
-                radius_deg=None,
             )
         assert result.dtype == np.float64
 
@@ -464,8 +460,6 @@ class TestRunClusteringProbe:
                 theta_b,
                 psis_b,
                 interp_mode="bilinear",
-                sigma_deg=None,
-                radius_deg=None,
             )
         # Each entry returns ones → accumulated total = n_entries
         np.testing.assert_allclose(result, np.full((3, B), float(n_entries)))
@@ -485,8 +479,6 @@ class TestRunClusteringProbe:
             theta_b,
             psis_b,
             interp_mode="bilinear",
-            sigma_deg=None,
-            radius_deg=None,
         )
         assert result.shape == (3, B)
         np.testing.assert_array_equal(result, 0)
@@ -510,13 +502,11 @@ class TestRunClusteringProbe:
                 theta_b,
                 psis_b,
                 interp_mode="bilinear",
-                sigma_deg=None,
-                radius_deg=None,
             )
         assert mock_btb.call_count == n_entries
 
     def test_interp_kwargs_forwarded(self):
-        """interp_mode, sigma_deg, radius_deg are forwarded as kwargs to beam_tod_batch."""
+        """interp_mode is forwarded as kwargs to beam_tod_batch."""
         phi_b, theta_b, psis_b = self._phi_theta_psi()
         rot_vecs = self._rot_vecs()
         mp = _fake_mp()
@@ -532,13 +522,9 @@ class TestRunClusteringProbe:
                 theta_b,
                 psis_b,
                 interp_mode="nearest",
-                sigma_deg=0.5,
-                radius_deg=1.5,
             )
         kw = mock_btb.call_args[1]
         assert kw.get("interp_mode") == "nearest"
-        assert kw.get("sigma_deg") == 0.5
-        assert kw.get("radius_deg") == 1.5
 
 
 # ===========================================================================

@@ -50,8 +50,6 @@ from numba_healpy import (
     _ring_info_jit,
     _ring_z_jit,
     get_interp_weights_numba,
-    _spin2_delta_approx_jit,
-    _spin2_delta_exact_jit,
 )
 from tod_nearest import (
     _gather_accum_nearest_jit,
@@ -537,7 +535,6 @@ def beam_tod_batch(
                         B,
                         s1 - s0,
                         tod_arr,
-                        ax_pts,
                         spin2_corr,
                         c_q,
                         c_u,
@@ -585,7 +582,6 @@ def beam_tod_batch(
                         B,
                         s1 - s0,
                         tod_arr,
-                        ax_pts,
                         spin2_corr,
                         c_q,
                         c_u,

@@ -310,8 +310,6 @@ def _run_clustering_probe(
     theta_b,
     psis_b,
     interp_mode,
-    sigma_deg,
-    radius_deg,
 ):
     """Run beam_tod_batch for all entries and accumulate into a (3, B) array."""
     B = len(phi_b)
