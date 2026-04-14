@@ -323,7 +323,6 @@ def _run_clustering_probe(
             theta_b,
             psis_b,
             interp_mode=interp_mode,
-            spin2_corr=0,
         )
         for comp, vals in contrib.items():
             tod[comp] += vals
