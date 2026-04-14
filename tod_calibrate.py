@@ -149,7 +149,7 @@ def _calibrate_batch_size(
         for b in range(n_batches):
             s, e = b * bs, min((b + 1) * bs, probe_n)
             phi_b, theta_b, psi_b = phi_p[s:e], theta_p[s:e], psi_p[s:e]
-            rot_vecs, betas = precompute_rotation_vector_batch(
+            rot_vecs, betas, n_target = precompute_rotation_vector_batch(
                 ra0, dec0, phi_b, theta_b
             )
             psis_b = -betas + psi_b
@@ -162,6 +162,7 @@ def _calibrate_batch_size(
                     phi_b,
                     theta_b,
                     psis_b,
+                    n_target,
                     interp_mode=interp_mode,
                 )
         return time.perf_counter() - t0

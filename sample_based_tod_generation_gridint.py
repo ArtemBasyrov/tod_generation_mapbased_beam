@@ -265,7 +265,9 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
         theta_b = np.array(theta_mmap[bs:be], dtype=np.float32)
         phi_b = np.array(phi_mmap[bs:be], dtype=np.float32)
         psi_b = np.array(psi_mmap[bs:be], dtype=np.float32)
-        rot_vecs, betas = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
+        rot_vecs, betas, n_target = precompute_rotation_vector_batch(
+            ra0, dec0, phi_b, theta_b
+        )
         psis_b = -betas + psi_b
 
         tod_batch = np.zeros((3, be - bs))
@@ -278,6 +280,7 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
                 phi_b,
                 theta_b,
                 psis_b,
+                n_target,
                 interp_mode=interp_mode,
             )
             for comp, vals in contrib.items():

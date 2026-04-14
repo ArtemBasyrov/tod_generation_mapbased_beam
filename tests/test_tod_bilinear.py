@@ -145,6 +145,19 @@ class TestGatherAccumFusedJit:
         return v.astype(np.float32)
 
     @staticmethod
+    def _dummy_rot_targets(B):
+        """Zero (B, 3) float32 stand-ins for ax_pts / n_target.
+
+        The fused kernel reads these only when the Q/U spin-2 correction is
+        active (c_q >= 0 and c_u >= 0); the scalar-only tests in this class
+        pass the defaults c_q = c_u = -1 and never touch the buffers.
+        """
+        return (
+            np.zeros((B, 3), dtype=np.float32),
+            np.zeros((B, 3), dtype=np.float32),
+        )
+
+    @staticmethod
     def _split_call_reference(vec_rot, nside, mp_stacked, beam_vals, B, Sc):
         """
         Reference pipeline that matches the vec2ang formula used by the fused kernel.
@@ -180,7 +193,10 @@ class TestGatherAccumFusedJit:
         mp_stacked = np.ones((C, hp.nside2npix(nside)), dtype=np.float32)
         beam_vals = np.ones(Sc, dtype=np.float32) / Sc
         tod = np.zeros((C, B), dtype=np.float64)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod)
+        ax_pts, n_target = self._dummy_rot_targets(B)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        )
         assert tod.shape == (C, B)
 
     def test_zero_beam_vals_no_contribution(self):
@@ -191,7 +207,10 @@ class TestGatherAccumFusedJit:
         mp_stacked = rng.standard_normal((C, hp.nside2npix(nside))).astype(np.float32)
         beam_vals = np.zeros(Sc, dtype=np.float32)
         tod = np.zeros((C, B), dtype=np.float64)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod)
+        ax_pts, n_target = self._dummy_rot_targets(B)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        )
         npt.assert_array_equal(tod, np.zeros((C, B)))
 
     def test_constant_map_normalised_beam(self):
@@ -203,7 +222,10 @@ class TestGatherAccumFusedJit:
         mp_stacked = np.full((C, hp.nside2npix(nside)), map_val, dtype=np.float32)
         beam_vals = np.full(Sc, 1.0 / Sc, dtype=np.float32)
         tod = np.zeros((C, B), dtype=np.float64)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod)
+        ax_pts, n_target = self._dummy_rot_targets(B)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        )
         npt.assert_allclose(tod, np.full((C, B), map_val), atol=1e-4)
 
     def test_inplace_accumulation(self):
@@ -214,9 +236,14 @@ class TestGatherAccumFusedJit:
         mp_stacked = np.ones((C, hp.nside2npix(nside)), dtype=np.float32)
         beam_vals = np.ones(Sc, dtype=np.float32)
         tod = np.zeros((C, B), dtype=np.float64)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod)
+        ax_pts, n_target = self._dummy_rot_targets(B)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        )
         first = tod.copy()
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        )
         npt.assert_allclose(tod, 2.0 * first, atol=1e-14)
 
     def test_deterministic(self):
@@ -228,8 +255,13 @@ class TestGatherAccumFusedJit:
         beam_vals = np.ones(Sc, dtype=np.float32) / Sc
         tod1 = np.zeros((C, B), dtype=np.float64)
         tod2 = np.zeros((C, B), dtype=np.float64)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod1)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod2)
+        ax_pts, n_target = self._dummy_rot_targets(B)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod1, ax_pts, n_target
+        )
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod2, ax_pts, n_target
+        )
         npt.assert_array_equal(tod1, tod2)
 
     # ── agreement with reference pipeline ────────────────────────────────────
@@ -261,7 +293,10 @@ class TestGatherAccumFusedJit:
             vec_rot, nside, mp_stacked, beam_vals, B, Sc
         )
         tod_fused = np.zeros((C, B), dtype=np.float64)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod_fused)
+        ax_pts, n_target = self._dummy_rot_targets(B)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod_fused, ax_pts, n_target
+        )
 
         npt.assert_allclose(
             tod_fused,
@@ -302,7 +337,10 @@ class TestGatherAccumFusedJit:
         )
 
         tod_fused = np.zeros((C, B), dtype=np.float64)
-        _gather_accum_fused_jit(vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod_fused)
+        ax_pts, n_target = self._dummy_rot_targets(B)
+        _gather_accum_fused_jit(
+            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod_fused, ax_pts, n_target
+        )
 
         npt.assert_allclose(
             tod_fused,
@@ -344,8 +382,9 @@ class TestGatherAccumFusedJit:
                 vec_bs, nside, mp_stacked, beam_vals, B, 1
             )
             tod_fused = np.zeros((C, B), dtype=np.float64)
+            ax_pts, n_target = self._dummy_rot_targets(B)
             _gather_accum_fused_jit(
-                vec_bs, nside, mp_stacked, beam_vals, B, 1, tod_fused
+                vec_bs, nside, mp_stacked, beam_vals, B, 1, tod_fused, ax_pts, n_target
             )
 
             npt.assert_allclose(

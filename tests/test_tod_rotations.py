@@ -347,11 +347,12 @@ class TestPrecomputeRotationVectorBatch:
         B = 5
         phi_batch = np.linspace(0, np.pi / 4, B)
         theta_batch = np.linspace(np.pi / 4, np.pi / 2, B)
-        rot_vector, beta = precompute_rotation_vector_batch(
+        rot_vector, beta, n_target = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         assert rot_vector.shape == (B, 3)
         assert beta.shape == (B,)
+        assert n_target.shape == (B, 3)
 
     def test_beta_in_zero_to_2pi(self):
         """All beta values are in [0, 2pi)."""
@@ -361,7 +362,7 @@ class TestPrecomputeRotationVectorBatch:
         B = 20
         phi_batch = rng.uniform(0, np.pi / 6, B)
         theta_batch = rng.uniform(np.pi / 3, 2 * np.pi / 3, B)
-        _, beta = precompute_rotation_vector_batch(
+        _, beta, _ = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         assert np.all(beta >= 0.0), "Some beta values are negative"
@@ -374,7 +375,7 @@ class TestPrecomputeRotationVectorBatch:
         # centre_idx=(N//2, N//2)=(100,100), ra=0, dec=0 -> phi=0, theta=pi/2
         phi_batch = np.array([0.0])
         theta_batch = np.array([np.pi / 2])
-        rot_vector, _ = precompute_rotation_vector_batch(
+        rot_vector, _, _ = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         npt.assert_array_less(np.linalg.norm(rot_vector, axis=-1), 1e-10)
@@ -387,7 +388,7 @@ class TestPrecomputeRotationVectorBatch:
         # Point 90 degrees away in phi: phi=pi/2, theta=pi/2
         phi_batch = np.array([np.pi / 2])
         theta_batch = np.array([np.pi / 2])
-        rot_vector, _ = precompute_rotation_vector_batch(
+        rot_vector, _, _ = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         npt.assert_allclose(np.linalg.norm(rot_vector, axis=-1), np.pi / 2, atol=1e-6)
@@ -398,7 +399,7 @@ class TestPrecomputeRotationVectorBatch:
         ra, dec = self._make_grid(N)
         phi_batch = np.array([0.1])
         theta_batch = np.array([np.pi / 2])
-        rot_vector, _ = precompute_rotation_vector_batch(
+        rot_vector, _, _ = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         assert rot_vector.dtype == np.float64
@@ -423,10 +424,18 @@ class TestSpin2RodrigueosCos2dSin2d:
         """Coincident neighbour and query → cos(2δ)=1, sin(2δ)=0."""
         # ri = rq = (0, 0, 1) (north pole)
         c2d, s2d = _spin2_rodrigues_cos2d_sin2d(
-            0.0, 0.0, 1.0,  # ri
-            1.0, 0.0, 0.0,  # ni (arbitrary at pole)
-            0.0, 0.0, 1.0,  # rq = ri
-            1.0, 0.0, 0.0,  # nq
+            0.0,
+            0.0,
+            1.0,  # ri
+            1.0,
+            0.0,
+            0.0,  # ni (arbitrary at pole)
+            0.0,
+            0.0,
+            1.0,  # rq = ri
+            1.0,
+            0.0,
+            0.0,  # nq
         )
         npt.assert_allclose(c2d, 1.0, atol=1e-12)
         npt.assert_allclose(s2d, 0.0, atol=1e-12)
@@ -453,8 +462,18 @@ class TestSpin2RodrigueosCos2dSin2d:
         nq_x, nq_y, nq_z = _north_dir(theta_q, phi)
 
         c2d, s2d = _spin2_rodrigues_cos2d_sin2d(
-            ri_x, ri_y, ri_z, ni_x, ni_y, ni_z,
-            rq_x, rq_y, rq_z, nq_x, nq_y, nq_z,
+            ri_x,
+            ri_y,
+            ri_z,
+            ni_x,
+            ni_y,
+            ni_z,
+            rq_x,
+            rq_y,
+            rq_z,
+            nq_x,
+            nq_y,
+            nq_z,
         )
         npt.assert_allclose(c2d, 1.0, atol=1e-10)
         npt.assert_allclose(s2d, 0.0, atol=1e-10)
@@ -481,8 +500,18 @@ class TestSpin2RodrigueosCos2dSin2d:
             nq_x, nq_y, nq_z = _north_dir(theta_q, phi_q)
 
             c2d, s2d = _spin2_rodrigues_cos2d_sin2d(
-                ri_x, ri_y, ri_z, ni_x, ni_y, ni_z,
-                rq_x, rq_y, rq_z, nq_x, nq_y, nq_z,
+                ri_x,
+                ri_y,
+                ri_z,
+                ni_x,
+                ni_y,
+                ni_z,
+                rq_x,
+                rq_y,
+                rq_z,
+                nq_x,
+                nq_y,
+                nq_z,
             )
             npt.assert_allclose(c2d**2 + s2d**2, 1.0, atol=1e-10)
 
@@ -502,8 +531,18 @@ class TestSpin2RodrigueosCos2dSin2d:
         nq_x, nq_y, nq_z = 0.0, 0.0, -1.0  # ê_θ at equator = −ẑ
 
         c2d, s2d = _spin2_rodrigues_cos2d_sin2d(
-            ri_x, ri_y, ri_z, ni_x, ni_y, ni_z,
-            rq_x, rq_y, rq_z, nq_x, nq_y, nq_z,
+            ri_x,
+            ri_y,
+            ri_z,
+            ni_x,
+            ni_y,
+            ni_z,
+            rq_x,
+            rq_y,
+            rq_z,
+            nq_x,
+            nq_y,
+            nq_z,
         )
         # δ = 0 here (both points at equator, north stays aligned along the great circle)
         # verify the identity cos²+sin²=1 and sign consistency
@@ -532,8 +571,18 @@ class TestSpin2RodrigueosCos2dSin2d:
         nq_x, nq_y, nq_z = _north_dir(theta_q, phi_q)
 
         c2d, s2d = _spin2_rodrigues_cos2d_sin2d(
-            ri_x, ri_y, ri_z, ni_x, ni_y, ni_z,
-            rq_x, rq_y, rq_z, nq_x, nq_y, nq_z,
+            ri_x,
+            ri_y,
+            ri_z,
+            ni_x,
+            ni_y,
+            ni_z,
+            rq_x,
+            rq_y,
+            rq_z,
+            nq_x,
+            nq_y,
+            nq_z,
         )
         # The parallel transport is undefined for antipodes; the function returns identity.
         npt.assert_allclose(c2d, 1.0, atol=1e-12)
@@ -560,8 +609,18 @@ class TestSpin2RodrigueosCos2dSin2d:
             nq_x, nq_y, nq_z = _north_dir(theta_q, phi_q)
 
             c2d, s2d = _spin2_rodrigues_cos2d_sin2d(
-                ri_x, ri_y, ri_z, ni_x, ni_y, ni_z,
-                rq_x, rq_y, rq_z, nq_x, nq_y, nq_z,
+                ri_x,
+                ri_y,
+                ri_z,
+                ni_x,
+                ni_y,
+                ni_z,
+                rq_x,
+                rq_y,
+                rq_z,
+                nq_x,
+                nq_y,
+                nq_z,
             )
             # Values should be finite and satisfy cos² + sin² ≈ 1
             assert np.isfinite(c2d) and np.isfinite(s2d)
@@ -587,12 +646,32 @@ class TestSpin2RodrigueosCos2dSin2d:
             nq_x, nq_y, nq_z = _north_dir(theta_q, phi_q)
 
             c2d_fwd, s2d_fwd = _spin2_rodrigues_cos2d_sin2d(
-                ri_x, ri_y, ri_z, ni_x, ni_y, ni_z,
-                rq_x, rq_y, rq_z, nq_x, nq_y, nq_z,
+                ri_x,
+                ri_y,
+                ri_z,
+                ni_x,
+                ni_y,
+                ni_z,
+                rq_x,
+                rq_y,
+                rq_z,
+                nq_x,
+                nq_y,
+                nq_z,
             )
             c2d_rev, s2d_rev = _spin2_rodrigues_cos2d_sin2d(
-                rq_x, rq_y, rq_z, nq_x, nq_y, nq_z,
-                ri_x, ri_y, ri_z, ni_x, ni_y, ni_z,
+                rq_x,
+                rq_y,
+                rq_z,
+                nq_x,
+                nq_y,
+                nq_z,
+                ri_x,
+                ri_y,
+                ri_z,
+                ni_x,
+                ni_y,
+                ni_z,
             )
             # Parallel transport along the reverse geodesic gives opposite rotation angle.
             npt.assert_allclose(c2d_fwd, c2d_rev, atol=1e-10)

@@ -63,6 +63,7 @@ def beam_tod_batch(
     phi_b,
     theta_b,
     psis_b,
+    n_target=None,
     interp_mode="bilinear",
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
@@ -93,6 +94,11 @@ def beam_tod_batch(
         theta_b (numpy.ndarray): Boresight colatitude [rad], shape ``(B,)``.
         psis_b (numpy.ndarray): Combined rotation angle ``psi_b - beta`` [rad],
             shape ``(B,)``.
+        n_target (numpy.ndarray | None): Boresight-frame local north unit
+            vector ``(B, 3)``, as returned by
+            :func:`precompute_rotation_vector_batch`. Used as the Q/U spin-2
+            rotation target on the bilinear path. If ``None``, derived from
+            ``phi_b, theta_b``.
         interp_mode (str): Sky-map interpolation strategy. One of:
 
             * ``'bilinear'`` *(default)* — 4-pixel bilinear HEALPix
@@ -122,7 +128,7 @@ def beam_tod_batch(
             c_q = _ci
         elif _comp == 2:
             c_u = _ci
-    
+
     use_nearest = interp_mode == "nearest"
     if interp_mode not in ("nearest", "bilinear"):
         raise ValueError(
@@ -142,6 +148,20 @@ def beam_tod_batch(
     axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
         rot_vecs, phi_b, theta_b, psis_b
     )
+
+    # Boresight-frame local north for spin-2 Q/U correction.  Reused from
+    # precompute_rotation_vector_batch when caller provides it, otherwise
+    # derived here from (phi_b, theta_b).
+    if n_target is None:
+        phi_f32 = np.asarray(phi_b, dtype=np.float32)
+        theta_f32 = np.asarray(theta_b, dtype=np.float32)
+        ct = np.cos(theta_f32)
+        st = np.sin(theta_f32)
+        cp = np.cos(phi_f32)
+        sp = np.sin(phi_f32)
+        n_target_f32 = np.stack([ct * cp, ct * sp, -st], axis=-1)
+    else:
+        n_target_f32 = np.ascontiguousarray(n_target, dtype=np.float32)
 
     tod = {comp: np.zeros(B, dtype=np.float32) for comp in comp_indices}
 
@@ -178,15 +198,15 @@ def beam_tod_batch(
                     B,
                     s1 - s0,
                     tod_arr,
+                    ax_pts,
+                    n_target_f32,
                     c_q,
                     c_u,
                 )
             for i, comp in enumerate(comp_indices):
                 tod[comp] += tod_arr[i].astype(np.float32)
         else:
-            theta_flat, phi_flat = hp.vec2ang(
-                vec_rot.reshape(-1, 3).astype(np.float64)
-            )
+            theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
             pixels, weights = get_interp_weights_numba(nside, theta_flat, phi_flat)
             mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
             mp_flat = np.einsum("ckn,kn->cn", mp_gathered, weights)
