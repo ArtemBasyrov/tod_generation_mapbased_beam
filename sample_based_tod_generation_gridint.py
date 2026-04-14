@@ -32,9 +32,6 @@ start_day = config.start_day
 end_day = config.end_day
 
 interp_mode = config.beam_interp_method
-interp_sigma_deg = config.beam_interp_sigma_deg
-interp_radius_deg = config.beam_interp_radius_deg
-spin2_corr = config.bilinear_spin2_correction
 
 # ── Worker-global state (populated by _worker_init in each spawned process) ───
 # MP is loaded in the parent, placed in shared memory, and attached here
@@ -334,7 +331,6 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
                 theta_b,
                 psis_b,
                 interp_mode=interp_mode,
-                spin2_corr=spin2_corr,
             )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
@@ -466,8 +462,6 @@ def main(n_cpu_ceiling):
             mp=MP,
             error_threshold=config.clustering_error_threshold,
             interp_mode=interp_mode,
-            interp_sigma_deg=interp_sigma_deg,
-            interp_radius_deg=interp_radius_deg,
         )
         _save_clustering_calibration(best_tf, best_K)
         # Update in-memory config so clustering is applied this run too

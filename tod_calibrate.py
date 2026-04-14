@@ -339,8 +339,6 @@ def calibrate_beam_clustering(
     error_threshold=1e-3,
     bell_lmax=None,
     interp_mode="bilinear",
-    interp_sigma_deg=None,
-    interp_radius_deg=None,
 ):
     """Find the (tail_fraction, n_clusters) pair that maximises speedup while
     keeping the B_ell divergence from the analytical beam below
@@ -373,8 +371,6 @@ def calibrate_beam_clustering(
             ``2 × nside`` of the sky map ``mp``.  If ``mp`` is also
             ``None``, falls back to 500.
         interp_mode (str): Unused. Kept for backward compatibility.
-        interp_sigma_deg (float | None): Unused. Kept for backward compatibility.
-        interp_radius_deg (float | None): Unused. Kept for backward compatibility.
 
     Returns:
         tuple[float, int]: (best_tail_fraction, best_n_clusters)

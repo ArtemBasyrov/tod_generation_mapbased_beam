@@ -34,13 +34,6 @@
   # sigma and radius are only used for 'gaussian' and default to 1× and 3× the
   # HEALPix pixel resolution respectively.
   beam_interp_method: 'bilinear'
-  beam_interp_sigma_deg: null
-  beam_interp_radius_deg: null
-  # Spin-2 (Q/U) frame correction for bilinear interpolation.
-  # 'none'   — no correction (default, matches legacy behaviour)
-  # 'approx' — leading-order: δ ≈ cos(θ_q)·Δφ  (cheap, good near poles)
-  # 'exact'  — full 3-D parallel transport via Rodrigues (most accurate)
-  bilinear_spin2_correction: 'none'
   # beam pixel clustering — k-means on the unit sphere to reduce pixel count
   # before TOD generation.  Only the low-power tail is clustered; the main
   # lobe is kept pixel-exact.

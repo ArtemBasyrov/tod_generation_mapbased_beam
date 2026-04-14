@@ -72,7 +72,6 @@ def _gather_accum_fused_jit(
     B,
     Sc,
     tod,
-    spin2_corr=0,
     c_q=-1,
     c_u=-1,
 ):
@@ -87,10 +86,9 @@ def _gather_accum_fused_jit(
     Inlines the HEALPix RING get_interpol algorithm so that Numba can see the
     complete computation and apply cross-step optimisations.
 
-    One optional spin-2 correction is applied when c_q >= 0 and c_u >= 0 and
-    spin2_corr > 0:
+    One spin-2 correction is applied when c_q >= 0 and c_u >= 0:
 
-    Neighbour-frame alignment (spin2_corr 1 or 2): rotates each of the 4
+    Neighbour-frame alignment: rotates each of the 4
     bilinear neighbours into the query-point local frame before interpolating,
     so the interpolated Q/U is in the sky-local frame at (θ_s, φ_s).
 
@@ -109,7 +107,6 @@ def _gather_accum_fused_jit(
     beam_vals  : (Sc,)        float32   beam weights for this tile
     B, Sc      : int
     tod        : (C, B)       float64   accumulated in place
-    spin2_corr : int          spin-2 correction mode (0 = none, 1 = approx, 2 = exact)
     c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)
     c_u        : int          index of U within C-dim of mp_stacked (−1 = absent)
     """
@@ -227,7 +224,7 @@ def _gather_accum_fused_jit(
 
             bv = float(beam_vals[s])
 
-            if spin2_corr > 0 and c_q >= 0 and c_u >= 0:
+            if c_q >= 0 and c_u >= 0:
                 # ── Per-neighbour cos(2δ), sin(2δ) for spin-2 frame rotation ──
                 # δ_j = parallel-transport angle from neighbour j's local
                 # frame to the query point's local frame.
@@ -235,129 +232,91 @@ def _gather_accum_fused_jit(
                 # Q_j^(q) =  Q_j cos(2δ_j) + U_j sin(2δ_j)
                 # U_j^(q) = -Q_j sin(2δ_j) + U_j cos(2δ_j)
 
-                if spin2_corr == 1:
-                    # Approximate: δ_j ≈ cos(θ_q) · (φ_j − φ_q)
-                    dphi = phi_c0 - phi_w
-                    if dphi > math.pi:
-                        dphi -= _TWO_PI
-                    elif dphi < -math.pi:
-                        dphi += _TWO_PI
-                    a = 2.0 * z * dphi
-                    c2d_0 = math.cos(a)
-                    s2d_0 = math.sin(a)
-
-                    dphi = phi_c1 - phi_w
-                    if dphi > math.pi:
-                        dphi -= _TWO_PI
-                    elif dphi < -math.pi:
-                        dphi += _TWO_PI
-                    a = 2.0 * z * dphi
-                    c2d_1 = math.cos(a)
-                    s2d_1 = math.sin(a)
-
-                    dphi = phi_c2 - phi_w
-                    if dphi > math.pi:
-                        dphi -= _TWO_PI
-                    elif dphi < -math.pi:
-                        dphi += _TWO_PI
-                    a = 2.0 * z * dphi
-                    c2d_2 = math.cos(a)
-                    s2d_2 = math.sin(a)
-
-                    dphi = phi_c3 - phi_w
-                    if dphi > math.pi:
-                        dphi -= _TWO_PI
-                    elif dphi < -math.pi:
-                        dphi += _TWO_PI
-                    a = 2.0 * z * dphi
-                    c2d_3 = math.cos(a)
-                    s2d_3 = math.sin(a)
-
+                
+                # Exact: inlined Rodrigues parallel transport + double-angle
+                # Query-point north direction (0 trig — derived from vec)
+                st_q = math.sqrt(vx * vx + vy * vy)
+                if st_q > 1.0e-15:
+                    inv_st = 1.0 / st_q
+                    nq_x = z * vx * inv_st
+                    nq_y = z * vy * inv_st
+                    nq_z = -st_q
                 else:
-                    # Exact: inlined Rodrigues parallel transport + double-angle
-                    # Query-point north direction (0 trig — derived from vec)
-                    st_q = math.sqrt(vx * vx + vy * vy)
-                    if st_q > 1.0e-15:
-                        inv_st = 1.0 / st_q
-                        nq_x = z * vx * inv_st
-                        nq_y = z * vy * inv_st
-                        nq_z = -st_q
-                    else:
-                        # At pole, north undefined; arbitrary tangent direction
-                        nq_x = 1.0
-                        nq_y = 0.0
-                        nq_z = 0.0
+                    # At pole, north undefined; arbitrary tangent direction
+                    nq_x = 1.0
+                    nq_y = 0.0
+                    nq_z = 0.0
 
-                    # cos/sin of each neighbour phi — computed independently so
-                    # that pixels 0,1 (ring above, za/sin_z_ca) and pixels 2,3
-                    # (ring below, zb/sin_z_cb) use the correct ring geometry.
-                    cp0 = math.cos(phi_c0)
-                    sp0 = math.sin(phi_c0)
-                    cp1 = math.cos(phi_c1)
-                    sp1 = math.sin(phi_c1)
-                    cp2 = math.cos(phi_c2)
-                    sp2 = math.sin(phi_c2)
-                    cp3 = math.cos(phi_c3)
-                    sp3 = math.sin(phi_c3)
+                # cos/sin of each neighbour phi — computed independently so
+                # that pixels 0,1 (ring above, za/sin_z_ca) and pixels 2,3
+                # (ring below, zb/sin_z_cb) use the correct ring geometry.
+                cp0 = math.cos(phi_c0)
+                sp0 = math.sin(phi_c0)
+                cp1 = math.cos(phi_c1)
+                sp1 = math.sin(phi_c1)
+                cp2 = math.cos(phi_c2)
+                sp2 = math.sin(phi_c2)
+                cp3 = math.cos(phi_c3)
+                sp3 = math.sin(phi_c3)
 
-                    # ip0, ip1 come from ring above (za, sin_z_ca)
-                    c2d_0, s2d_0 = _spin2_rodrigues_cos2d_sin2d(
-                        sin_z_ca * cp0,
-                        sin_z_ca * sp0,
-                        za,
-                        za * cp0,
-                        za * sp0,
-                        -sin_z_ca,
-                        vx,
-                        vy,
-                        vz,
-                        nq_x,
-                        nq_y,
-                        nq_z,
-                    )
-                    c2d_1, s2d_1 = _spin2_rodrigues_cos2d_sin2d(
-                        sin_z_ca * cp1,
-                        sin_z_ca * sp1,
-                        za,
-                        za * cp1,
-                        za * sp1,
-                        -sin_z_ca,
-                        vx,
-                        vy,
-                        vz,
-                        nq_x,
-                        nq_y,
-                        nq_z,
-                    )
-                    # ip2, ip3 come from ring below (zb, sin_z_cb)
-                    c2d_2, s2d_2 = _spin2_rodrigues_cos2d_sin2d(
-                        sin_z_cb * cp2,
-                        sin_z_cb * sp2,
-                        zb,
-                        zb * cp2,
-                        zb * sp2,
-                        -sin_z_cb,
-                        vx,
-                        vy,
-                        vz,
-                        nq_x,
-                        nq_y,
-                        nq_z,
-                    )
-                    c2d_3, s2d_3 = _spin2_rodrigues_cos2d_sin2d(
-                        sin_z_cb * cp3,
-                        sin_z_cb * sp3,
-                        zb,
-                        zb * cp3,
-                        zb * sp3,
-                        -sin_z_cb,
-                        vx,
-                        vy,
-                        vz,
-                        nq_x,
-                        nq_y,
-                        nq_z,
-                    )
+                # ip0, ip1 come from ring above (za, sin_z_ca)
+                c2d_0, s2d_0 = _spin2_rodrigues_cos2d_sin2d(
+                    sin_z_ca * cp0,
+                    sin_z_ca * sp0,
+                    za,
+                    za * cp0,
+                    za * sp0,
+                    -sin_z_ca,
+                    vx,
+                    vy,
+                    vz,
+                    nq_x,
+                    nq_y,
+                    nq_z,
+                )
+                c2d_1, s2d_1 = _spin2_rodrigues_cos2d_sin2d(
+                    sin_z_ca * cp1,
+                    sin_z_ca * sp1,
+                    za,
+                    za * cp1,
+                    za * sp1,
+                    -sin_z_ca,
+                    vx,
+                    vy,
+                    vz,
+                    nq_x,
+                    nq_y,
+                    nq_z,
+                )
+                # ip2, ip3 come from ring below (zb, sin_z_cb)
+                c2d_2, s2d_2 = _spin2_rodrigues_cos2d_sin2d(
+                    sin_z_cb * cp2,
+                    sin_z_cb * sp2,
+                    zb,
+                    zb * cp2,
+                    zb * sp2,
+                    -sin_z_cb,
+                    vx,
+                    vy,
+                    vz,
+                    nq_x,
+                    nq_y,
+                    nq_z,
+                )
+                c2d_3, s2d_3 = _spin2_rodrigues_cos2d_sin2d(
+                    sin_z_cb * cp3,
+                    sin_z_cb * sp3,
+                    zb,
+                    zb * cp3,
+                    zb * sp3,
+                    -sin_z_cb,
+                    vx,
+                    vy,
+                    vz,
+                    nq_x,
+                    nq_y,
+                    nq_z,
+                )
 
                 # ── Read Q/U from all 4 neighbours ──
                 q0 = float(mp_stacked[c_q, ip0])

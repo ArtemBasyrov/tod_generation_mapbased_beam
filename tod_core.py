@@ -70,7 +70,6 @@ def beam_tod_batch(
     theta_b,
     psis_b,
     interp_mode="bilinear",
-    spin2_corr=0,
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
 
@@ -119,10 +118,6 @@ def beam_tod_batch(
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
             (``'gaussian'`` and ``'bicubic'`` are available on their respective branches.)
-        spin2_corr (int): Spin-2 Q/U frame correction for bilinear
-            interpolation. 0 = none (default), 1 = approx, 2 = exact.
-            See :func:`numba_healpy._spin2_delta_approx_jit` and
-            :func:`numba_healpy._spin2_delta_exact_jit`.
 
     Returns:
         dict[int, numpy.ndarray]: Mapping from Stokes component index to a
@@ -268,7 +263,6 @@ def beam_tod_batch(
                         B,
                         s1 - s0,
                         tod_arr,
-                        spin2_corr,
                         c_q,
                         c_u,
                     )
@@ -315,7 +309,6 @@ def beam_tod_batch(
                         B,
                         s1 - s0,
                         tod_arr,
-                        spin2_corr,
                         c_q,
                         c_u,
                     )

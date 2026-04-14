@@ -48,28 +48,6 @@ if _interp_method_raw not in _VALID_INTERP:
         f"got {_interp_method_raw!r}"
     )
 beam_interp_method = _interp_method_raw
-beam_interp_sigma_deg = _cfg.get(
-    "beam_interp_sigma_deg", None
-)  # None → pixel resolution
-beam_interp_radius_deg = _cfg.get("beam_interp_radius_deg", None)  # None → 3 × sigma
-
-# Spin-2 (Q/U) frame correction for bilinear interpolation.
-# Bilinear interpolation naively treats Q and U as scalars, ignoring that
-# adjacent HEALPix pixels express Q/U in different local frames.  This flag
-# enables a correction that parallel-transports each neighbour's frame to the
-# query point before combining bilinear weights.
-#
-# 'none'   — no correction (default; preserves legacy behaviour)
-# 'approx' — leading-order: δ ≈ cos(θ_q)·(φ_i−φ_q)  (~5 FLOPs/neighbour)
-# 'exact'  — full 3-D parallel transport via Rodrigues rotation (~20 FLOPs/neighbour)
-_spin2_raw = _cfg.get("bilinear_spin2_correction", "none")
-_VALID_SPIN2 = {"none": 0, "approx": 1, "exact": 2}
-if _spin2_raw not in _VALID_SPIN2:
-    raise ValueError(
-        f"bilinear_spin2_correction must be one of {sorted(_VALID_SPIN2)!r}, "
-        f"got {_spin2_raw!r}"
-    )
-bilinear_spin2_correction = _VALID_SPIN2[_spin2_raw]  # integer: 0 / 1 / 2
 
 # Beam pixel clustering (k-means on the unit sphere before TOD generation).
 #
