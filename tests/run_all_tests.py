@@ -11,6 +11,8 @@ Individual modules can also be run independently:
     pytest tests/test_tod_calibrate.py -v
     pytest tests/test_tod_core.py -v
     pytest tests/test_numba_healpy.py -v
+    pytest tests/test_tod_rotations.py -v
+    pytest tests/test_tod_bilinear.py -v
 """
 
 import sys

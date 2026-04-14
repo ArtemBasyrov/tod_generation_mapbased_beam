@@ -6,10 +6,6 @@ Numba JIT kernels
 _rodrigues_jit              — fused double Rodrigues rotation (recenter + pol. roll).
                               Writes directly into a pre-allocated (B, S, 3) buffer.
 
-_rodrigues1_from_rolled_jit — single Rodrigues rotation (recenter only) applied to
-                              per-sample pre-rolled (B, Sc, 3) beam vectors loaded
-                              from the beam cache.
-
 _spin2_rodrigues_cos2d_sin2d — cos(2δ) and sin(2δ) for spin-2 frame rotation via
                                inlined Rodrigues parallel transport.
 
@@ -77,42 +73,6 @@ def _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out):
             out[b, s, 0] = rx * cp_ + (py * rz - pz * ry) * sp_ + px * dpr * omp
             out[b, s, 1] = ry * cp_ + (pz * rx - px * rz) * sp_ + py * dpr * omp
             out[b, s, 2] = rz * cp_ + (px * ry - py * rx) * sp_ + pz * dpr * omp
-
-
-@numba.jit(nopython=True, cache=True)
-def _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out):
-    """
-    Apply only Rodrigues 1 (recentering) to pre-rolled beam pixel vectors.
-
-    Used when vec_rolled is loaded from the beam cache — the psi-roll
-    (Rodrigues 2) is already baked in, so only the recentering rotation
-    to the current pointing direction is needed.
-
-    Parameters
-    ----------
-    vec_rolled_b : (B, Sc, 3)  float32  — per-sample pre-rolled vectors
-    axes         : (B, 3)      float32  — Rodrigues rotation axes
-    cos_a        : (B,)        float32
-    sin_a        : (B,)        float32
-    out          : (B, Sc, 3)  float32  — written in place
-    """
-    B = axes.shape[0]
-    Sc = vec_rolled_b.shape[1]
-    for b in range(B):
-        kx = axes[b, 0]
-        ky = axes[b, 1]
-        kz = axes[b, 2]
-        ca = cos_a[b]
-        sa = sin_a[b]
-        oma = 1.0 - ca
-        for s in range(Sc):
-            vx = vec_rolled_b[b, s, 0]
-            vy = vec_rolled_b[b, s, 1]
-            vz = vec_rolled_b[b, s, 2]
-            dkv = kx * vx + ky * vy + kz * vz
-            out[b, s, 0] = vx * ca + (ky * vz - kz * vy) * sa + kx * dkv * oma
-            out[b, s, 1] = vy * ca + (kz * vx - kx * vz) * sa + ky * dkv * oma
-            out[b, s, 2] = vz * ca + (kx * vy - ky * vx) * sa + kz * dkv * oma
 
 
 @numba.jit(nopython=True, cache=True)

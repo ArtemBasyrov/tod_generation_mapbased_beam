@@ -17,7 +17,6 @@ from tod_utils import (
     _should_print_batch,
     _compute_dB_threshold_from_power,
 )
-from precompute_beam_cache import _cache_filename, _load_cache
 from beam_cluster import cluster_beam_pixels, cluster_cached_arrays
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -44,7 +43,7 @@ _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
 # ── Pool initialiser ─────────────────────────────────────────────────────────
 
 
-def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
+def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
     """
     Called once in each spawned worker process.
 
@@ -61,9 +60,6 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
     mp_desc          : dict  — {'name', 'shape', 'dtype'} for the stacked MP block
     beam_shm_descs   : dict  — {beam_filename: {'name', 'shape', 'dtype'}}
                                for mp_stacked
-    cache_shm_descs  : dict  — {beam_filename: {array_key: {'name','shape','dtype'}}}
-                               for vec_rolled, dtheta, dphi (present only when
-                               beam cache was loaded)
     """
     global _g_mp, _g_beam_data, _g_shm_handles
 
@@ -73,8 +69,7 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
     mp_full = np.ndarray(mp_desc["shape"], dtype=mp_desc["dtype"], buffer=shm_mp.buf)
     _g_mp = [mp_full[i] for i in range(mp_desc["shape"][0])]  # list of 3 views
 
-    # Attach to each beam entry's mp_stacked block, then attach any
-    # beam-cache arrays (vec_rolled, dtheta, dphi) from their own blocks.
+    # Attach to each beam entry's mp_stacked block
     _g_beam_data = {}
     for bf, static in beam_data_static.items():
         desc = beam_shm_descs[bf]
@@ -83,41 +78,23 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs):
         ms = np.ndarray(desc["shape"], dtype=desc["dtype"], buffer=shm.buf)
         entry = dict(static)
         entry["mp_stacked"] = ms
-
-        for key, cdesc in cache_shm_descs.get(bf, {}).items():
-            cshm = SharedMemory(name=cdesc["name"])
-            _g_shm_handles.append(cshm)
-            entry[key] = np.ndarray(
-                cdesc["shape"], dtype=cdesc["dtype"], buffer=cshm.buf
-            )
-
         _g_beam_data[bf] = entry
 
 
 # ── Beam preparation ──────────────────────────────────────────────────────────
 
 
-def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
+def prepare_beam_data(beam_filenames):
     """Load and preprocess all unique beam files into a beam-data dictionary.
 
     For each unique beam filename, loads the FITS map, selects pixels by power
-    threshold, normalises beam weights, and precomputes unit vectors. If
-    ``cache_dir`` is given, attempts to load a precomputed rotation cache
-    (``.npz``) produced by :mod:`precompute_beam_cache`. When a cache is found
-    the runtime path in :func:`~tod_core.beam_tod_batch` skips the psi-roll
-    (single-Rodrigues) or both rotations (flat-sky). Falls back silently to the
-    full double-Rodrigues path when no cache file exists.
+    threshold, normalises beam weights, and precomputes unit vectors.
 
     Args:
         beam_filenames (list[str]): List of beam filenames (one per Stokes
             component, in the order ``[I, Q, U]``). Duplicate filenames are
             de-duplicated; the corresponding ``comp_indices`` lists which Stokes
             components share a given beam file.
-        cache_dir (str | None): Path to the directory containing ``.npz``
-            cache files. ``None`` disables caching.
-        cache_n_psi (int): Number of psi bins to look for in the cache
-            filenames. Must match the ``--n_psi`` value used when generating
-            the cache. Defaults to ``720``.
 
     Returns:
         dict[str, dict]: Beam-data dictionary keyed by beam filename. Each
@@ -131,14 +108,6 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
               beam (e.g. ``[0]`` for I-only, ``[1, 2]`` if Q and U share a map)
             - ``'n_sel'`` – Number of selected pixels ``S``
             - ``'vec_orig'`` – Beam-pixel unit vectors, shape ``(S, 3)``
-            - ``'vec_rolled'`` *(optional)* – Pre-rolled vectors from cache,
-              shape ``(N_psi, S, 3)``
-            - ``'psi_grid'`` *(optional)* – psi bin centres [rad] from cache,
-              shape ``(N_psi,)``
-            - ``'dtheta'`` *(optional)* – Flat-sky colatitude offsets from
-              cache, shape ``(N_psi, S)``
-            - ``'dphi'`` *(optional)* – Flat-sky phi offsets from cache,
-              shape ``(N_psi, S)``
     """
     beam_groups = {}
     for i, bf in enumerate(beam_filenames):
@@ -181,27 +150,6 @@ def prepare_beam_data(beam_filenames, cache_dir=None, cache_n_psi=720):
             "vec_orig": vec_orig,
         }
         print(f"  Beam {bf}: {sel.sum()} selected pixels")
-
-        if cache_dir is not None:
-            cache_path = _cache_filename(bf, cache_dir, cache_n_psi)
-            if os.path.exists(cache_path):
-                cache = _load_cache(cache_path)
-                beam_data[bf]["vec_rolled"] = cache["vec_rolled"]  # (N_psi, S, 3)
-                beam_data[bf]["psi_grid"] = cache["psi_grid"]  # (N_psi,)
-                mode = "single-Rodrigues"
-                if "dtheta" in cache and "dphi" in cache:
-                    beam_data[bf]["dtheta"] = cache["dtheta"]  # (N_psi, S)
-                    beam_data[bf]["dphi"] = cache["dphi"]  # (N_psi, S)
-                    mode = "flat-sky (both rotations skipped)"
-                print(
-                    f"    Beam cache loaded: {cache_path}  "
-                    f"(N_psi={len(cache['psi_grid'])}, S={cache['vec_rolled'].shape[1]}, "
-                    f"mode={mode})"
-                )
-            else:
-                print(
-                    f"    [warn] Beam cache not found: {cache_path} — using exact double Rodrigues"
-                )
 
     return beam_data
 
@@ -443,11 +391,7 @@ def main(n_cpu_ceiling):
 
     # ── Load exact beam data (clustering applied separately below) ─────────────
     print("Loading beam data...")
-    beam_data = prepare_beam_data(
-        beam_files,
-        cache_dir=config.beam_cache_dir,
-        cache_n_psi=config.beam_cache_n_psi,
-    )
+    beam_data = prepare_beam_data(beam_files)
 
     # ── Beam pixel clustering ──────────────────────────────────────────────────
     # Calibration: sweep (tail_fraction, K) grid on a probe batch to find the
@@ -531,29 +475,9 @@ def main(n_cpu_ceiling):
                 "dtype": ms.dtype,
             }
 
-        # Beam-cache arrays (vec_rolled, dtheta, dphi) — potentially large
-        # (N_psi × S × 3) and previously pickled to every worker. Move them
-        # into shared memory so workers attach zero-copy views instead.
-        _CACHE_KEYS = ("vec_rolled", "dtheta", "dphi")
-        cache_shms = {bf: {} for bf in beam_data}
-        cache_shm_descs = {bf: {} for bf in beam_data}
-        for bf, data in beam_data.items():
-            for key in _CACHE_KEYS:
-                if key not in data:
-                    continue
-                arr = np.ascontiguousarray(data[key])
-                shm = SharedMemory(create=True, size=arr.nbytes)
-                np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)[:] = arr
-                cache_shms[bf][key] = shm
-                cache_shm_descs[bf][key] = {
-                    "name": shm.name,
-                    "shape": arr.shape,
-                    "dtype": arr.dtype,
-                }
-
         # Only small arrays remain in the pickle payload: beam_vals, vec_orig,
         # psi_grid, sel, ra, dec, comp_indices, n_sel.
-        _SHARED_KEYS = {"mp_stacked"} | set(_CACHE_KEYS)
+        _SHARED_KEYS = {"mp_stacked"}
         beam_data_static = {
             bf: {k: v for k, v in data.items() if k not in _SHARED_KEYS}
             for bf, data in beam_data.items()
@@ -564,7 +488,7 @@ def main(n_cpu_ceiling):
             with multiprocessing.Pool(
                 processes=ncpus,
                 initializer=_worker_init,
-                initargs=(beam_data_static, mp_desc, beam_shm_descs, cache_shm_descs),
+                initargs=(beam_data_static, mp_desc, beam_shm_descs),
             ) as pool:
                 results = pool.map(worker, days)
         finally:
@@ -574,10 +498,6 @@ def main(n_cpu_ceiling):
             for shm in beam_shms.values():
                 shm.close()
                 shm.unlink()
-            for per_beam in cache_shms.values():
-                for shm in per_beam.values():
-                    shm.close()
-                    shm.unlink()
 
         failed = [r for r in results if not r[1]]
         print(f"\nDone — {len(results) - len(failed)}/{len(results)} days OK")

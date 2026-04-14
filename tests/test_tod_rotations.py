@@ -1,7 +1,7 @@
 """
 Tests for the tod_rotations module.
 
-Covers: _rotation_params, _rodrigues_jit, _rodrigues1_from_rolled_jit,
+Covers: _rotation_params, _rodrigues_jit,
         _recenter_and_rotate, precompute_rotation_vector_batch,
         _spin2_rodrigues_cos2d_sin2d.
 
@@ -37,7 +37,6 @@ import pytest
 from tod_rotations import (
     _rotation_params,
     _rodrigues_jit,
-    _rodrigues1_from_rolled_jit,
     _recenter_and_rotate,
     precompute_rotation_vector_batch,
     _spin2_rodrigues_cos2d_sin2d,
@@ -259,109 +258,6 @@ class TestRodriguesJit:
         _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out)
         norms = np.linalg.norm(out.astype(np.float64), axis=-1)
         npt.assert_allclose(norms, np.ones((B, S)), atol=1e-4)
-
-
-# ===========================================================================
-# TestRodrigues1FromRolledJit
-# ===========================================================================
-
-
-class TestRodrigues1FromRolledJit:
-    """Tests for tod_rotations._rodrigues1_from_rolled_jit Numba kernel."""
-
-    def test_identity_rotation(self):
-        """Identity rotation (cos_a=1, sin_a=0) leaves vectors unchanged."""
-        rng = np.random.default_rng(60)
-        B, Sc = 3, 5
-        vec_rolled_b = rng.standard_normal((B, Sc, 3)).astype(np.float32)
-        vec_rolled_b /= np.linalg.norm(vec_rolled_b, axis=-1, keepdims=True)
-        axes = np.zeros((B, 3), dtype=np.float32)
-        cos_a = np.ones(B, dtype=np.float32)
-        sin_a = np.zeros(B, dtype=np.float32)
-        out = np.empty((B, Sc, 3), dtype=np.float32)
-        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
-        npt.assert_allclose(out, vec_rolled_b, atol=1e-5)
-
-    def test_output_shape(self):
-        """Output buffer has shape (B, Sc, 3) after the kernel call."""
-        B, Sc = 4, 7
-        vec_rolled_b = np.zeros((B, Sc, 3), dtype=np.float32)
-        axes = np.zeros((B, 3), dtype=np.float32)
-        cos_a = np.ones(B, dtype=np.float32)
-        sin_a = np.zeros(B, dtype=np.float32)
-        out = np.empty((B, Sc, 3), dtype=np.float32)
-        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
-        assert out.shape == (B, Sc, 3)
-
-    def test_unit_vector_norms_preserved(self):
-        """Rodrigues rotation preserves unit vector norms."""
-        rng = np.random.default_rng(61)
-        B, Sc = 4, 6
-        vec_rolled_b = rng.standard_normal((B, Sc, 3)).astype(np.float32)
-        vec_rolled_b /= np.linalg.norm(vec_rolled_b, axis=-1, keepdims=True)
-        rot_vecs = rng.standard_normal((B, 3)) * 0.5
-        angles = np.linalg.norm(rot_vecs, axis=-1)
-        axes = (rot_vecs / np.where(angles > 1e-10, angles, 1.0)[:, None]).astype(
-            np.float32
-        )
-        cos_a = np.cos(angles).astype(np.float32)
-        sin_a = np.sin(angles).astype(np.float32)
-        out = np.empty((B, Sc, 3), dtype=np.float32)
-        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
-        norms = np.linalg.norm(out.astype(np.float64), axis=-1)
-        npt.assert_allclose(norms, np.ones((B, Sc)), atol=1e-4)
-
-    def test_matches_numpy_reference(self):
-        """Matches a pure-numpy single Rodrigues rotation to tolerance 1e-5."""
-        rng = np.random.default_rng(62)
-        B, Sc = 5, 8
-        vec_rolled_b = rng.standard_normal((B, Sc, 3)).astype(np.float32)
-        vec_rolled_b /= np.linalg.norm(vec_rolled_b, axis=-1, keepdims=True)
-        rot_vecs = rng.standard_normal((B, 3)) * 0.4
-        angles = np.linalg.norm(rot_vecs, axis=-1)
-        axes_f64 = rot_vecs / np.where(angles > 1e-10, angles, 1.0)[:, None]
-        cos_a = np.cos(angles).astype(np.float32)
-        sin_a = np.sin(angles).astype(np.float32)
-        axes = axes_f64.astype(np.float32)
-
-        out = np.empty((B, Sc, 3), dtype=np.float32)
-        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
-
-        # Pure-numpy reference: single Rodrigues rotation per (b, s)
-        ref = np.empty_like(out, dtype=np.float64)
-        for b in range(B):
-            k = axes_f64[b]
-            ca, sa, oma = float(cos_a[b]), float(sin_a[b]), 1.0 - float(cos_a[b])
-            for s in range(Sc):
-                v = vec_rolled_b[b, s].astype(np.float64)
-                dkv = np.dot(k, v)
-                ref[b, s] = v * ca + np.cross(k, v) * sa + k * dkv * oma
-
-        npt.assert_allclose(out.astype(np.float64), ref, atol=1e-5)
-
-    def test_90deg_rotation_around_z(self):
-        """90-degree rotation around z maps [1,0,0] to [0,1,0] for all B samples."""
-        B, Sc = 3, 1
-        vec_rolled_b = np.tile([[1.0, 0.0, 0.0]], (B, Sc, 1)).astype(np.float32)
-        axes = np.tile([0.0, 0.0, 1.0], (B, 1)).astype(np.float32)
-        angle = np.float32(np.pi / 2)
-        cos_a = np.full(B, np.cos(angle), dtype=np.float32)
-        sin_a = np.full(B, np.sin(angle), dtype=np.float32)
-        out = np.empty((B, Sc, 3), dtype=np.float32)
-        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
-        for b in range(B):
-            npt.assert_allclose(out[b, 0], [0.0, 1.0, 0.0], atol=1e-5)
-
-    def test_output_dtype_float32(self):
-        """Output buffer dtype is float32 (written in-place by the kernel)."""
-        B, Sc = 2, 4
-        vec_rolled_b = _random_unit_vectors(B * Sc).reshape(B, Sc, 3).astype(np.float32)
-        axes = np.zeros((B, 3), dtype=np.float32)
-        cos_a = np.ones(B, dtype=np.float32)
-        sin_a = np.zeros(B, dtype=np.float32)
-        out = np.empty((B, Sc, 3), dtype=np.float32)
-        _rodrigues1_from_rolled_jit(vec_rolled_b, axes, cos_a, sin_a, out)
-        assert out.dtype == np.float32
 
 
 # ===========================================================================

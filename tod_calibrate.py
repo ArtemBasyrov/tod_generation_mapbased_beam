@@ -163,7 +163,6 @@ def _calibrate_batch_size(
                     theta_b,
                     psis_b,
                     interp_mode=interp_mode,
-                    spin2_corr=0,
                 )
         return time.perf_counter() - t0
 
