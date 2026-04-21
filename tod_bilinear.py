@@ -63,7 +63,7 @@ def _gather_accum_jit(pixels, weights, beam_vals, mp_stacked, B, Sc, tod):
 
 
 @numba.jit(nopython=True, cache=True)
-def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
+def _spin2_cos2d_sin2d_precise_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
     """Compute cos(2δ) and sin(2δ) for the spin-2 frame rotation.
 
     δ = alpha - gamma, where alpha is the bearing from the HEALPix pixel toward
@@ -94,32 +94,151 @@ def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
     if sin_beta < 1e-12:
         return 1.0, 0.0
 
-    #isb = 1.0 / sin_beta
+    # isb = 1.0 / sin_beta
 
     # Bearing at pixel toward boresight (alpha)
-    sa = sth_pts * sd / sin_beta #* isb
-    ca = (sth_pts * z_pix * cd - z_pts * sth_pix) / sin_beta #* isb
-    #ca = max(-1.0, min(1.0, ca))
+    sa = sth_pts * sd / sin_beta  # * isb
+    ca = (sth_pts * z_pix * cd - z_pts * sth_pix) / sin_beta  # * isb
+    # ca = max(-1.0, min(1.0, ca))
     a = math.atan2(sa, ca)
 
     # Bearing at boresight toward pixel (gamma)
-    sg = sth_pix * sd / sin_beta #* isb
-    cg = -(sth_pix * z_pts * cd - z_pix * sth_pts) / sin_beta #* isb
-    #cg = max(-1.0, min(1.0, cg))
+    sg = sth_pix * sd / sin_beta  # * isb
+    cg = -(sth_pix * z_pts * cd - z_pix * sth_pts) / sin_beta  # * isb
+    # cg = max(-1.0, min(1.0, cg))
     g = math.atan2(sg, cg)
 
     # delta = alpha - gamma  →  cos/sin via subtraction formula
-    #cos_d = ca * cg + sa * sg
-    #sin_d = sa * cg - ca * sg
+    # cos_d = ca * cg + sa * sg
+    # sin_d = sa * cg - ca * sg
 
     d = a - g
     cos_2d = math.cos(2.0 * d)
     sin_2d = math.sin(2.0 * d)
 
-    #cos_2d = cos_d * cos_d - sin_d * sin_d
-    #sin_2d = 2.0 * cos_d * sin_d
-    #cos_2d = max(-1.0, min(1.0, cos_2d))
-    #sin_2d = max(-1.0, min(1.0, sin_2d))
+    # cos_2d = cos_d * cos_d - sin_d * sin_d
+    # sin_2d = 2.0 * cos_d * sin_d
+    # cos_2d = max(-1.0, min(1.0, cos_2d))
+    # sin_2d = max(-1.0, min(1.0, sin_2d))
+
+    return cos_2d, sin_2d
+
+
+@numba.jit(nopython=True, cache=True)
+def _spin2_cos2d_sin2d_old_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
+    """Compute cos(2δ) and sin(2δ) for the spin-2 frame rotation.
+
+    δ = alpha - gamma, where alpha is the bearing from the HEALPix pixel toward
+    the boresight and gamma is the bearing from the boresight back toward the
+    pixel, both measured from their respective local meridians.
+
+    Uses the spherical triangle bearing formulas; avoids atan2 by working
+    directly with (cos α, sin α) and (cos γ, sin γ) and applying the
+    double-angle identities.
+
+    Parameters
+    ----------
+    z_pix, sth_pix, phi_pix : float   cos θ, sin θ, φ of the HEALPix pixel
+    z_pts, sth_pts, phi_pts : float   cos θ, sin θ, φ of the boresight
+
+    Returns
+    -------
+    cos_2d, sin_2d : float
+    """
+    dphi = phi_pts - phi_pix
+    cd = math.cos(dphi)
+    sd = math.sin(dphi)
+
+    cos_beta = sth_pix * sth_pts * cd + z_pix * z_pts
+    cos_beta = max(-1.0, min(1.0, cos_beta))
+    sin_beta = math.sqrt(max(0.0, 1.0 - cos_beta * cos_beta))
+
+    if sin_beta < 1e-12:
+        return 1.0, 0.0
+
+    isb = 1.0 / sin_beta
+
+    # Bearing at pixel toward boresight (alpha)
+    sa = sth_pts * sd * isb
+    ca = (sth_pts * z_pix * cd - z_pts * sth_pix) * isb
+
+    # Bearing at boresight toward pixel (gamma)
+    sg = sth_pix * sd * isb
+    cg = -(sth_pix * z_pts * cd - z_pix * sth_pts) * isb
+
+    # delta = alpha - gamma  →  cos/sin via subtraction formula
+    cos_d = ca * cg + sa * sg
+    sin_d = sa * cg - ca * sg
+
+    cos_2d = (cos_d + sin_d) * (cos_d - sin_d)
+    sin_2d = 2.0 * cos_d * sin_d
+
+    cos_2d = max(-1.0, min(1.0, cos_2d))
+    sin_2d = max(-1.0, min(1.0, sin_2d))
+
+    return cos_2d, sin_2d
+
+
+@numba.jit(nopython=True, cache=True)
+def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
+    """Compute cos(2δ) and sin(2δ) for the spin-2 frame rotation.
+
+    δ = alpha - gamma, where alpha is the bearing from the HEALPix pixel toward
+    the boresight and gamma is the bearing from the boresight back toward the
+    pixel, both measured from their respective local meridians.
+
+    Uses the spherical triangle bearing formulas; avoids atan2 and beta by working
+    directly with (cos α, sin α) and (cos γ, sin γ) and applying the
+    double-angle identities to find tan(δ) = N / D, then reconstructing cos(2δ) and sin(2δ) via the
+    double-angle formulas in terms of tan(δ) to avoid any loss of precision when
+    δ is small.
+
+    Parameters
+    ----------
+    z_pix, sth_pix, phi_pix : float   cos θ, sin θ, φ of the HEALPix pixel
+    z_pts, sth_pts, phi_pts : float   cos θ, sin θ, φ of the boresight
+
+    Returns
+    -------
+    cos_2d, sin_2d : float
+    """
+    # same point check (also covers the sin_beta ≈ 0 case)
+    if phi_pts == phi_pix and sth_pts == sth_pix and z_pts == z_pix:
+        return 1.0, 0.0
+
+    # step 1
+    dphi = phi_pts - phi_pix
+    ch = math.cos(dphi * 0.5)
+    sh = math.sin(dphi * 0.5)
+    sin_dphi = 2.0 * ch * sh
+    cos_dphi = 1 - 2.0 * sh * sh
+    sh2 = sh * sh  # sin^2 (Delta phi / 2)
+
+    # step 2
+    dz = z_pts - z_pix
+    ds = sth_pts - sth_pix
+    st2 = 0.25 * (dz * dz + ds * ds)  # sin^2 (Delta theta / 2)
+    S = sth_pix * sth_pts
+    h = st2 + S * sh2  # haversine of the angular separation
+
+    # step 3
+    sin2_dtheta = 4.0 * st2 * (1 - st2)  # sin^2 (Delta theta)
+
+    # step 4
+    z_sum = z_pts + z_pix
+    N = 2.0 * sin_dphi * z_sum * h  # numerator for tan(delta)
+
+    # step 5
+    C = z_pts * z_pix
+    term1 = sin2_dtheta * cos_dphi
+    term2 = 4.0 * S * C * sh2 * sh2
+    term3 = S * sin_dphi * sin_dphi
+    D = term1 - term2 + term3  # denominator for tan(delta)
+
+    # step 6
+    u = 1.0 / (N * N + D * D)
+    cos_2d = (D * D - N * N) * u
+    sin_2d = 2.0 * N * D * u
 
     return cos_2d, sin_2d
 

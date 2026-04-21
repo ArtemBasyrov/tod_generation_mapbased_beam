@@ -117,32 +117,32 @@ class TestGatherAccumJit:
 
 
 class TestSpin2Cos2dSin2d:
-    """Unit tests for _spin2_cos2d_sin2d_jit."""
+    """Unit tests for _spin2_cos2d_sin2d_jit (haversine / tan(δ) formulation)."""
 
     @staticmethod
     def _angles(theta, phi):
         return math.cos(theta), math.sin(theta), phi
 
     def test_identity_same_point(self):
-        """Same pixel and target → no rotation (cos=1, sin=0)."""
+        """Exact same pixel and target → no rotation (cos=1, sin=0)."""
         z, s, p = self._angles(0.5, 1.2)
         c2, s2 = _spin2_cos2d_sin2d_jit(z, s, p, z, s, p)
         assert abs(c2 - 1.0) < 1e-12
         assert abs(s2) < 1e-12
 
     def test_unit_norm(self):
-        """cos²(2δ) + sin²(2δ) ≈ 1 for random pairs."""
+        """cos²(2δ) + sin²(2δ) == 1 for random pairs (algebraically exact in new formula)."""
         rng = np.random.default_rng(0)
-        for _ in range(100):
+        for _ in range(200):
             t1, p1 = rng.uniform(0.05, math.pi - 0.05), rng.uniform(0.0, 2 * math.pi)
             t2, p2 = rng.uniform(0.05, math.pi - 0.05), rng.uniform(0.0, 2 * math.pi)
             z1, s1 = math.cos(t1), math.sin(t1)
             z2, s2 = math.cos(t2), math.sin(t2)
             c2, si2 = _spin2_cos2d_sin2d_jit(z1, s1, p1, z2, s2, p2)
-            npt.assert_allclose(c2**2 + si2**2, 1.0, atol=1e-12)
+            npt.assert_allclose(c2**2 + si2**2, 1.0, atol=1e-14)
 
     def test_antisymmetry(self):
-        """Swapping pixel and target negates δ: cos(2δ) is even, sin(2δ) is odd."""
+        """Swapping pix ↔ target negates δ: cos(2δ) is even, sin(2δ) is odd."""
         t1, p1 = 0.7, 0.3
         t2, p2 = 1.4, 2.1
         z1, s1 = math.cos(t1), math.sin(t1)
@@ -187,14 +187,40 @@ class TestSpin2Cos2dSin2d:
             npt.assert_allclose(c2, c2_ref, atol=1e-12)
             npt.assert_allclose(s2, s2_ref, atol=1e-12)
 
-    def test_near_pole_no_nan(self):
-        """Near-antipodal/coincident points return (1.0, 0.0) without NaN."""
-        # Nearly same point
+    def test_same_meridian_no_rotation(self):
+        """Points on the same meridian (dphi=0) → cos=1, sin=0 identically (N=0 branch)."""
+        cases = [(0.3, 1.0), (1.0, 2.5), (0.1, math.pi - 0.1)]
+        for t1, t2 in cases:
+            z1, s1 = math.cos(t1), math.sin(t1)
+            z2, s2 = math.cos(t2), math.sin(t2)
+            c2, si2 = _spin2_cos2d_sin2d_jit(z1, s1, 0.0, z2, s2, 0.0)
+            npt.assert_allclose(c2, 1.0, atol=1e-12, err_msg=f"t1={t1}, t2={t2}")
+            npt.assert_allclose(si2, 0.0, atol=1e-12, err_msg=f"t1={t1}, t2={t2}")
+
+    def test_exact_coincident_pole_returns_identity(self):
+        """Exact same point at the north pole → equality guard returns (1, 0)."""
         c2, s2 = _spin2_cos2d_sin2d_jit(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
-        assert math.isfinite(c2) and math.isfinite(s2)
-        # Nearly antipodal
-        c2, s2 = _spin2_cos2d_sin2d_jit(1.0, 0.0, 0.0, -1.0, 0.0, math.pi)
-        assert math.isfinite(c2) and math.isfinite(s2)
+        assert c2 == 1.0 and s2 == 0.0
+
+    def test_near_coincident_is_finite(self):
+        """Near-coincident (not exactly equal) points → finite result close to (1, 0)."""
+        eps = 1e-7
+        t0, p0 = 1.0, 1.5
+        z0, s0 = math.cos(t0), math.sin(t0)
+        z1, s1 = math.cos(t0 + eps), math.sin(t0 + eps)
+        c2, si2 = _spin2_cos2d_sin2d_jit(z0, s0, p0, z1, s1, p0 + eps)
+        assert math.isfinite(c2) and math.isfinite(si2)
+        npt.assert_allclose(c2**2 + si2**2, 1.0, atol=1e-12)
+
+    def test_near_pole_is_finite(self):
+        """Near-pole (non-degenerate) pair → finite result on the unit circle."""
+        z_pix, sth_pix, phi_pix = math.cos(0.01), math.sin(0.01), 0.0
+        z_pts, sth_pts, phi_pts = math.cos(1.0), math.sin(1.0), 1.0
+        c2, si2 = _spin2_cos2d_sin2d_jit(
+            z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts
+        )
+        assert math.isfinite(c2) and math.isfinite(si2)
+        npt.assert_allclose(c2**2 + si2**2, 1.0, atol=1e-12)
 
 
 # ===========================================================================
