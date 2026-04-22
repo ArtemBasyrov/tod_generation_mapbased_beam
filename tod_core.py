@@ -14,8 +14,8 @@ precompute_rotation_vector_batch — Rodrigues vectors and pol. angle offsets fo
 
 Gather/accumulate kernels (in tod_bilinear.py)
 --------------------------
-_gather_accum_jit       — fused HEALPix bilinear gather + beam-weighted accumulation.
-_gather_accum_fused_jit — fully fused vec2ang + HEALPix bilinear + beam accumulation.
+_gather_accum_jit        — fused HEALPix bilinear gather + beam-weighted accumulation.
+_gather_accum_dedup_jit  — bilinear + per-boresight pixel dedup + trig-free spin-2.
 
 HEALPix RING helpers (in numba_healpy.py)
 -----------------------------------------
@@ -26,14 +26,10 @@ _get_interp_weights_jit, get_interp_weights_numba
 import numpy as np
 import healpy as hp
 
-from numba_healpy import (
-    _TWO_PI,
-    get_interp_weights_numba,
-)
+from numba_healpy import get_interp_weights_numba
 from tod_rotations import (
     _rodrigues_jit,
     _rotation_params,
-    _recenter_and_rotate,
     precompute_rotation_vector_batch,
 )
 from tod_nearest import (
@@ -41,7 +37,7 @@ from tod_nearest import (
 )
 from tod_bilinear import (
     _gather_accum_jit,
-    _gather_accum_fused_jit,
+    _gather_accum_dedup_jit,
 )
 
 # Target working-set size for the (B × Sc × 3 × float32) vec_rot intermediate.
@@ -94,15 +90,11 @@ def beam_tod_batch(
         theta_b (numpy.ndarray): Boresight colatitude [rad], shape ``(B,)``.
         psis_b (numpy.ndarray): Combined rotation angle ``psi_b - beta`` [rad],
             shape ``(B,)``.
-        n_target (numpy.ndarray | None): Boresight-frame local north unit
-            vector ``(B, 3)``, as returned by
-            :func:`precompute_rotation_vector_batch`. Used as the Q/U spin-2
-            rotation target on the bilinear path. If ``None``, derived from
-            ``phi_b, theta_b``.
+        n_target (numpy.ndarray | None): Unused; kept for API compatibility.
         interp_mode (str): Sky-map interpolation strategy. One of:
 
             * ``'bilinear'`` *(default)* — 4-pixel bilinear HEALPix
-              interpolation via the fused Numba kernel.
+              interpolation via the dedup Numba kernel.
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
             (``'gaussian'`` and ``'bicubic'`` are available on their respective branches.)
@@ -143,25 +135,9 @@ def beam_tod_batch(
     Sc = max(Sc, -(-S // _MAX_TILES))  # tile-count cap (ceiling div)
     Sc = min(Sc, S)
 
-    # Rotation scalars are not needed on the flat-sky path — both rotations
-    # are bypassed. Compute them only for the other two paths.
     axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
         rot_vecs, phi_b, theta_b, psis_b
     )
-
-    # Boresight-frame local north for spin-2 Q/U correction.  Reused from
-    # precompute_rotation_vector_batch when caller provides it, otherwise
-    # derived here from (phi_b, theta_b).
-    if n_target is None:
-        phi_f32 = np.asarray(phi_b, dtype=np.float32)
-        theta_f32 = np.asarray(theta_b, dtype=np.float32)
-        ct = np.cos(theta_f32)
-        st = np.sin(theta_f32)
-        cp = np.cos(phi_f32)
-        sp = np.sin(phi_f32)
-        n_target_f32 = np.stack([ct * cp, ct * sp, -st], axis=-1)
-    else:
-        n_target_f32 = np.ascontiguousarray(n_target, dtype=np.float32)
 
     tod = {comp: np.zeros(B, dtype=np.float32) for comp in comp_indices}
 
@@ -169,7 +145,6 @@ def beam_tod_batch(
         s1 = min(s0 + Sc, S)
         bv_chunk = beam_vals[s0:s1]  # (Sc,)
 
-        # Original path: double Rodrigues (recenter + psi roll).
         vec_chunk = np.asarray(vec_orig[s0:s1], dtype=np.float32)  # (Sc, 3)
         vec_rot = np.empty((B, s1 - s0, 3), dtype=np.float32)
         _rodrigues_jit(vec_chunk, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot)
@@ -190,7 +165,7 @@ def beam_tod_batch(
                     c_u,
                 )
             else:
-                _gather_accum_fused_jit(
+                _gather_accum_dedup_jit(
                     vec_rot,
                     nside,
                     mp_stacked,
@@ -199,7 +174,6 @@ def beam_tod_batch(
                     s1 - s0,
                     tod_arr,
                     ax_pts,
-                    n_target_f32,
                     c_q,
                     c_u,
                 )
