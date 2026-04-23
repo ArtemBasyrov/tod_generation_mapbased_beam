@@ -15,7 +15,7 @@ precompute_rotation_vector_batch — Rodrigues vectors and pol. angle offsets fo
 Gather/accumulate kernels (in tod_bilinear.py)
 --------------------------
 _gather_accum_jit        — fused HEALPix bilinear gather + beam-weighted accumulation.
-_gather_accum_dedup_jit  — bilinear + per-boresight pixel dedup + trig-free spin-2.
+_gather_accum_fused_jit  — bilinear gather + per-b direct-mapped spin-2 cache + accumulation.
 
 HEALPix RING helpers (in numba_healpy.py)
 -----------------------------------------
@@ -37,7 +37,7 @@ from tod_nearest import (
 )
 from tod_bilinear import (
     _gather_accum_jit,
-    _gather_accum_dedup_jit,
+    _gather_accum_fused_jit,
 )
 
 # Target working-set size for the (B × Sc × 3 × float32) vec_rot intermediate.
@@ -59,7 +59,6 @@ def beam_tod_batch(
     phi_b,
     theta_b,
     psis_b,
-    n_target=None,
     interp_mode="bilinear",
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
@@ -90,7 +89,6 @@ def beam_tod_batch(
         theta_b (numpy.ndarray): Boresight colatitude [rad], shape ``(B,)``.
         psis_b (numpy.ndarray): Combined rotation angle ``psi_b - beta`` [rad],
             shape ``(B,)``.
-        n_target (numpy.ndarray | None): Unused; kept for API compatibility.
         interp_mode (str): Sky-map interpolation strategy. One of:
 
             * ``'bilinear'`` *(default)* — 4-pixel bilinear HEALPix
@@ -165,7 +163,7 @@ def beam_tod_batch(
                     c_u,
                 )
             else:
-                _gather_accum_dedup_jit(
+                _gather_accum_fused_jit(
                     vec_rot,
                     nside,
                     mp_stacked,
@@ -174,6 +172,7 @@ def beam_tod_batch(
                     s1 - s0,
                     tod_arr,
                     ax_pts,
+                    ax_pts,  # n_target — unused by the kernel; passed for API parity
                     c_q,
                     c_u,
                 )

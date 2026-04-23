@@ -12,6 +12,8 @@ _get_interp_weights_jit — parallel (prange over N) replacement for
                           get_interpol algorithm exactly.
 get_interp_weights_numba— public wrapper; drop-in replacement for hp.get_interp_weights.
 
+_ring_interp_single_jit     — bilinear neighbour lookup for one unit-vector query;
+                               acos-free for the normal case (sin weight formula).
 _pix2ang_ring_jit           — scalar (theta, phi) from RING pixel index (nopython).
 _pix2zphi_ring_jit          — scalar (z, phi), avoids acos.
 _pix2z_cosphi_sinphi_jit    — scalar (z, cos φ, sin φ), no trig in caller needed.
@@ -247,6 +249,108 @@ def get_interp_weights_numba(nside, theta, phi):
     return pix_out, wgt_out
 
 
+# ── Single-pixel bilinear interpolation ──────────────────────────────────────
+
+
+@numba.jit(nopython=True, cache=True)
+def _ring_interp_single_jit(nside, z, phi_w):
+    """Bilinear HEALPix RING neighbour lookup for one unit-vector query.
+
+    Mirrors the HEALPix C++ ``get_interpol`` algorithm bit-for-bit, including
+    the polar boundary cases.  The θ-linear weight is computed via ``acos``
+    so the kernel is numerically identical to ``hp.get_interp_weights`` at
+    every nside.
+
+    Parameters
+    ----------
+    nside  : int
+    z      : float   cos θ of the query point, clamped to [−1, 1]
+    phi_w  : float   longitude of the query point in [0, 2π)
+
+    Returns
+    -------
+    p0, p1, p2, p3 : int64    RING pixel indices of the four neighbours
+    w0, w1, w2, w3 : float64  bilinear interpolation weights (sum to 1)
+    """
+    npix_total = 12 * nside * nside
+    ir_above = _ring_above_jit(nside, z)
+    ir_below = ir_above + 1
+
+    if ir_above == 0:
+        # ── North-pole boundary ───────────────────────────────────────────────
+        na, fpa, phi0a, dphia = _ring_info_jit(nside, 1, npix_total)
+        tw = ((phi_w - phi0a) / dphia) % float(na)
+        ip_a = int(tw)
+        frac = tw - ip_a
+        ip_a2 = (ip_a + 1) % na
+        p0 = fpa + (ip_a + 2) % na
+        p1 = fpa + (ip_a2 + 2) % na
+        p2 = fpa + ip_a
+        p3 = fpa + ip_a2
+        za = _ring_z_jit(nside, 1)
+        ta = math.acos(za)
+        # Query colatitude θ from clamped z; safe since z in [-1, 1].
+        theta = math.acos(z)
+        w_theta = theta / ta
+        nf = (1.0 - w_theta) * 0.25
+        w0 = nf
+        w1 = nf
+        w2 = (1.0 - frac) * w_theta + nf
+        w3 = frac * w_theta + nf
+
+    elif ir_below == 4 * nside:
+        # ── South-pole boundary ───────────────────────────────────────────────
+        ir_last = 4 * nside - 1
+        na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_last, npix_total)
+        tw = ((phi_w - phi0a) / dphia) % float(na)
+        ip_a = int(tw)
+        frac = tw - ip_a
+        ip_a2 = (ip_a + 1) % na
+        p0 = fpa + ip_a
+        p1 = fpa + ip_a2
+        p2 = (ip_a + 2) % na + fpa
+        p3 = (ip_a2 + 2) % na + fpa
+        za = _ring_z_jit(nside, ir_last)
+        ta = math.acos(za)
+        theta = math.acos(z)
+        w_theta_south = (theta - ta) / (math.pi - ta)
+        sf = w_theta_south * 0.25
+        w0 = (1.0 - frac) * (1.0 - w_theta_south) + sf
+        w1 = frac * (1.0 - w_theta_south) + sf
+        w2 = sf
+        w3 = sf
+
+    else:
+        # ── Normal case — exact θ via acos, matches hp.get_interp_weights ────
+        za = _ring_z_jit(nside, ir_above)
+        zb = _ring_z_jit(nside, ir_below)
+        ta = math.acos(za)
+        tb = math.acos(zb)
+        theta = math.acos(z)
+        w_below = (theta - ta) / (tb - ta)
+        w_above = 1.0 - w_below
+
+        na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_above, npix_total)
+        tw = ((phi_w - phi0a) / dphia) % float(na)
+        iphia = int(tw)
+        fphia = tw - iphia
+        p0 = fpa + iphia
+        p1 = fpa + (iphia + 1) % na
+        w0 = w_above * (1.0 - fphia)
+        w1 = w_above * fphia
+
+        nb, fpb, phi0b, dphib = _ring_info_jit(nside, ir_below, npix_total)
+        tw = ((phi_w - phi0b) / dphib) % float(nb)
+        iphib = int(tw)
+        fphib = tw - iphib
+        p2 = fpb + iphib
+        p3 = fpb + (iphib + 1) % nb
+        w2 = w_below * (1.0 - fphib)
+        w3 = w_below * fphib
+
+    return p0, p1, p2, p3, w0, w1, w2, w3
+
+
 # ── HEALPix pix2ang (RING scheme, scalar) ────────────────────────────────────
 
 
@@ -334,7 +438,8 @@ def _pix2z_cosphi_sinphi_jit(nside, pix):
 
     Extends _pix2zphi_ring_jit by returning cos and sin of the pixel longitude
     directly, so the caller never needs to call math.cos/math.sin on the result.
-    Used by _gather_accum_dedup_jit to eliminate trig from the spin-2 hot loop.
+    Provided as a trig-saving alternative to _pix2zphi_ring_jit when the caller
+    needs cos φ / sin φ rather than φ itself.
     """
     npix = 12 * nside * nside
     ncap = 2 * nside * (nside - 1)
