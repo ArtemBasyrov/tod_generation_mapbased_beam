@@ -14,6 +14,7 @@ from numba_healpy import (
     _ring_interp_with_angles_jit,
     get_interp_weights_numba,  # re-exported for tests
 )
+from tod_rotations import _rodrigues_apply_one_jit
 
 # Knuth multiplicative-hash constant for the direct-mapped spin-2 cache.
 # Chosen to break the spatial clustering of consecutive HEALPix pixel indices
@@ -203,69 +204,71 @@ def _spin2_lookup_cached(
 
 @numba.jit(nopython=True, parallel=True, cache=True)
 def _gather_accum_fused_jit(
-    vec_rot,
+    vec_orig,
+    axes,
+    cos_a,
+    sin_a,
+    ax_pts,
+    cos_p,
+    sin_p,
     nside,
     mp_stacked,
     beam_vals,
     B,
-    Sc,
+    S,
     tod,
-    ax_pts,
-    n_target,
     c_q=-1,
     c_u=-1,
 ):
-    """Fused HEALPix bilinear gather + spin-2 amortisation + accumulation.
+    """Fully fused Rodrigues + HEALPix bilinear gather + spin-2 + accumulation.
 
-    Parallelised over the boresight dimension B; each ``b`` owns ``tod[:, b]``
-    exclusively so there are no write races.
+    The rotated beam-pixel vector is computed scalar-wise inside the inner
+    loop via :func:`_rodrigues_apply_one_jit`, so no ``(B, S, 3)`` intermediate
+    is materialised.  That eliminates the DRAM write-then-read round-trip of
+    the old "pre-rotate to buffer, then gather" pipeline and lets the S-tile
+    loop go away entirely: the kernel is called once per beam entry per
+    batch, with all ``S`` beam pixels processed inside a single parallel
+    region.
 
-    When Q/U are present the kernel amortises the spin-2 frame rotation across
-    repeated HEALPix neighbour pixels using a per-``b`` direct-mapped cache:
-    each pixel's ``cos(2δ), sin(2δ)`` is computed at most once per boresight
-    and reused on subsequent occurrences.  Since beam pixels are spatially
-    clustered around the boresight, the same HEALPix neighbour appears many
-    times across the 4*Sc bilinear stencils — the cache turns those into
-    near-free L1 hits.
+    Parallelised over the boresight dimension ``B``; each ``b`` owns
+    ``tod[:, b]`` exclusively so there are no write races.
 
-    Why a direct-mapped cache instead of sort-then-dedup
-    ----------------------------------------------------
-    A full sort-based dedup (``argsort`` over 4*Sc pixel indices, build
-    ``inv_idx``, then compute spin-2 on ``n_uniq`` uniques) was measured to
-    be 2-3× SLOWER than the inline-spin-2 approach: at typical Sc the
-    ``argsort`` cost (O(n log n) on ~32k elements ≈ 1-3 ms per b) exceeds the
-    spin-2 calls it saves (~30 ns each × ~25 k saved calls ≈ 750 µs).
-
-    The direct-mapped cache replaces the global O(n log n) dedup with a
-    per-lookup O(1) probe that fits in L1.  No sort, no permutation arrays,
-    no separate passes — the ring lookup, spin-2 cache, and accumulation all
-    run in one tight loop over s.
+    When Q/U are present the kernel amortises the spin-2 frame rotation
+    across repeated HEALPix neighbour pixels using a per-``b`` direct-mapped
+    cache (``_spin2_lookup_cached``): each pixel's ``cos(2δ), sin(2δ)`` is
+    computed at most once per boresight and reused on subsequent
+    occurrences.  Because the kernel is now called once per beam entry, the
+    cache amortises across all ``4 * S`` bilinear stencils — not just one
+    tile's worth, as in the pre-fusion pipeline.
 
     Cache layout (Q/U path)
     -----------------------
-    The cache is a triple of parallel arrays of size ``_SPIN2_CACHE_SIZE``:
+    Three parallel arrays of size ``_SPIN2_CACHE_SIZE``:
     ``cache_pix`` (int64, HEALPix index currently in slot, or -1),
     ``cache_c2d`` / ``cache_s2d`` (float64, cos 2δ / sin 2δ for that pixel).
-    Slot selection and miss-fallback live in :func:`_spin2_lookup_cached`.
-
     At ``_SPIN2_CACHE_SIZE = 1024`` the three arrays total ~24 KiB, fitting
-    in L1.  The cache is reset to -1 at the start of each ``b`` because
-    spin-2 values depend on the boresight direction.
+    in L1.  Reset to -1 at the start of each ``b`` because spin-2 values
+    depend on the boresight direction.
 
-    When Q/U are absent the kernel collapses to a single fused vec2ang +
-    bilinear-gather + accumulate loop with no scratch.
+    When Q/U are absent the kernel collapses to a single fused Rodrigues +
+    vec2ang + bilinear-gather + accumulate loop with no scratch.
 
     Parameters
     ----------
-    vec_rot    : (B, Sc, 3)   float32   rotated beam unit vectors
+    vec_orig   : (S, 3)       float32   beam-frame unit vectors (un-rotated)
+    axes       : (B, 3)       float32   Rodrigues-1 rotation axes
+    cos_a      : (B,)         float32   cos of Rodrigues-1 angle
+    sin_a      : (B,)         float32   sin of Rodrigues-1 angle
+    ax_pts     : (B, 3)       float32   boresight unit vectors (Rodrigues-2
+                                        axis, also used as the spin-2
+                                        query-direction)
+    cos_p      : (B,)         float32   cos of Rodrigues-2 angle (ψ_b − β)
+    sin_p      : (B,)         float32   sin of Rodrigues-2 angle
     nside      : int
     mp_stacked : (C, N_hp)    float32   stacked sky-map components
-    beam_vals  : (Sc,)        float32   beam weights for this tile
-    B, Sc      : int
+    beam_vals  : (S,)         float32   beam weights
+    B, S       : int
     tod        : (C, B)       float64   accumulated in place
-    ax_pts     : (B, 3)       float32   boresight unit vectors
-    n_target   : (B, 3)       float32   boresight local-north (unused; kept
-                                        for API compatibility with callers)
     c_q        : int          index of Q in C-dim of mp_stacked (−1 = absent)
     c_u        : int          index of U in C-dim of mp_stacked (−1 = absent)
     """
@@ -275,27 +278,49 @@ def _gather_accum_fused_jit(
     if has_qu:
         for b in numba.prange(B):
             # Per-b spin-2 cache.  Numba's NRT allocator handles this in
-            # ~100 ns plus the ~3 µs memset; going thread-local would force
-            # ``cache=False`` (dynamic-globals NumbaWarning), which costs
-            # 5-15 s of recompile per fresh worker process — far worse.
+            # ~100 ns plus the ~3 µs memset.  Allocated once per b now that
+            # the S-tile Python loop is gone — so the cache amortises over
+            # all S beam pixels, not just one tile's worth.
             cache_pix = np.full(_SPIN2_CACHE_SIZE, -1, dtype=np.int64)
             cache_c2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
             cache_s2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
 
-            # Boresight (z, sin θ, φ) — computed once per b.
+            # Per-b rotation scalars — hoisted out of the inner s-loop.
+            kx = float(axes[b, 0])
+            ky = float(axes[b, 1])
+            kz = float(axes[b, 2])
+            ca = float(cos_a[b])
+            sa = float(sin_a[b])
             bx = float(ax_pts[b, 0])
             by = float(ax_pts[b, 1])
             bz = float(ax_pts[b, 2])
+            cp_ = float(cos_p[b])
+            sp_ = float(sin_p[b])
+
+            # Boresight (z, sin θ, φ) for spin-2 — computed once per b.
             z_pts = max(-1.0, min(1.0, bz))
             sth_pts = math.sqrt(max(0.0, 1.0 - bz * bz))
             phi_pts = math.atan2(by, bx)
             if phi_pts < 0.0:
                 phi_pts += _TWO_PI
 
-            for s in range(Sc):
-                vx = float(vec_rot[b, s, 0])
-                vy = float(vec_rot[b, s, 1])
-                vz = float(vec_rot[b, s, 2])
+            for s in range(S):
+                # Rodrigues in registers — no (B, S, 3) intermediate.
+                vx, vy, vz = _rodrigues_apply_one_jit(
+                    float(vec_orig[s, 0]),
+                    float(vec_orig[s, 1]),
+                    float(vec_orig[s, 2]),
+                    kx,
+                    ky,
+                    kz,
+                    ca,
+                    sa,
+                    bx,
+                    by,
+                    bz,
+                    cp_,
+                    sp_,
+                )
                 z = max(-1.0, min(1.0, vz))
                 phi_w = math.atan2(vy, vx)
                 if phi_w < 0.0:
@@ -404,10 +429,33 @@ def _gather_accum_fused_jit(
     else:
         # ── No Q/U: no spin-2 to amortise; skip the cache and go direct.
         for b in numba.prange(B):
-            for s in range(Sc):
-                vx = float(vec_rot[b, s, 0])
-                vy = float(vec_rot[b, s, 1])
-                vz = float(vec_rot[b, s, 2])
+            kx = float(axes[b, 0])
+            ky = float(axes[b, 1])
+            kz = float(axes[b, 2])
+            ca = float(cos_a[b])
+            sa = float(sin_a[b])
+            bx = float(ax_pts[b, 0])
+            by = float(ax_pts[b, 1])
+            bz = float(ax_pts[b, 2])
+            cp_ = float(cos_p[b])
+            sp_ = float(sin_p[b])
+
+            for s in range(S):
+                vx, vy, vz = _rodrigues_apply_one_jit(
+                    float(vec_orig[s, 0]),
+                    float(vec_orig[s, 1]),
+                    float(vec_orig[s, 2]),
+                    kx,
+                    ky,
+                    kz,
+                    ca,
+                    sa,
+                    bx,
+                    by,
+                    bz,
+                    cp_,
+                    sp_,
+                )
                 z = max(-1.0, min(1.0, vz))
                 phi_w = math.atan2(vy, vx)
                 if phi_w < 0.0:

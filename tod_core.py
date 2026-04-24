@@ -5,17 +5,25 @@ All functions are stateless and take only arrays as arguments.
 
 Rotation kernels (in tod_rotations.py)
 ---------------------------------------
-_rodrigues_jit                — fused double Rodrigues rotation (recenter + pol. roll).
-_rodrigues1_from_rolled_jit   — single Rodrigues rotation (recenter only) for cached
-                                pre-rolled beam vectors.
-_rotation_params              — per-sample scalars needed by _rodrigues_jit.
+_rodrigues_jit                — fused double Rodrigues rotation (recenter + pol. roll),
+                                materialises a (B, S, 3) buffer.  Used by the
+                                numpy-fallback path and by tests.
+_rodrigues_apply_one_jit      — scalar per-(b, s) fused Rodrigues; inlined into
+                                the production gather kernels so the (B, S, 3)
+                                intermediate is never materialised.
+_rotation_params              — per-sample scalars needed by the Rodrigues kernels.
 _recenter_and_rotate          — fused recenter + pol-roll wrapper.
 precompute_rotation_vector_batch — Rodrigues vectors and pol. angle offsets for a batch.
 
-Gather/accumulate kernels (in tod_bilinear.py)
---------------------------
-_gather_accum_jit        — fused HEALPix bilinear gather + beam-weighted accumulation.
-_gather_accum_fused_jit  — bilinear gather + per-b direct-mapped spin-2 cache + accumulation.
+Gather/accumulate kernels
+-------------------------
+_gather_accum_jit          — scalar bilinear accumulation from pre-computed pixels/weights
+                             (in tod_bilinear.py; used by tests).
+_gather_accum_fused_jit    — fully fused Rodrigues + bilinear gather + per-b
+                             direct-mapped spin-2 cache + accumulation
+                             (in tod_bilinear.py).
+_gather_accum_nearest_jit  — fused Rodrigues + nearest-pixel gather + accumulation
+                             (in tod_nearest.py).
 
 HEALPix RING helpers (in numba_healpy.py)
 -----------------------------------------
@@ -28,8 +36,8 @@ import healpy as hp
 
 from numba_healpy import get_interp_weights_numba
 from tod_rotations import (
-    _rodrigues_jit,
     _rotation_params,
+    _recenter_and_rotate,
     precompute_rotation_vector_batch,
 )
 from tod_nearest import (
@@ -39,16 +47,6 @@ from tod_bilinear import (
     _gather_accum_jit,
     _gather_accum_fused_jit,
 )
-
-# Target working-set size for the (B × Sc × 3 × float32) vec_rot intermediate.
-# Sized to stay within a typical L2 cache (2 MB).
-_S_TILE_TARGET_BYTES = 2 * 1024 * 1024
-
-# Maximum number of S-tiles per beam entry.  Each tile makes one call into the
-# HEALPix interpolation logic.  Capping at _MAX_TILES ensures Sc is always at
-# least S/_MAX_TILES, keeping per-tile overhead bounded while still preventing
-# out-of-memory.
-_MAX_TILES = 8
 
 
 def beam_tod_batch(
@@ -63,26 +61,20 @@ def beam_tod_batch(
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
 
-    Tiles over the ``S`` selected beam pixels so that the
-    ``(B × Sc × 3 × float32)`` intermediate vector buffer stays within the L2
-    cache target. Uses Numba JIT kernels for both the rotation and the
-    gather + accumulation steps.
-
-    The execution path is selected automatically based on ``data``:
-
-    * **Full double-Rodrigues** — used when no cache arrays are
-      present. Applies both Rodrigues rotations per ``(B, S)`` element at
-      runtime.
+    Uses Numba JIT kernels that fuse the Rodrigues rotation into the gather +
+    accumulation step: no ``(B, S, 3)`` intermediate is materialised on the
+    production ``mp_stacked`` path, and there is no S-tile loop — one kernel
+    call per beam entry per batch.
 
     Args:
         nside (int): HEALPix ``nside`` of the sky map.
         mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``. Each
             element is a 1-D ``float32`` array of length ``12 * nside**2``.
-            Used only on the full double-Rodrigues fallback path.
+            Used only on the numpy-fallback path (when ``mp_stacked`` is not
+            provided).
         data (dict): Beam data entry as returned by :func:`prepare_beam_data`.
             Required keys: ``'vec_orig'``, ``'beam_vals'``, ``'comp_indices'``.
-            Optional keys for cached paths: ``'mp_stacked'``, ``'vec_rolled'``,
-            ``'psi_grid'``, ``'dtheta'``, ``'dphi'``.
+            Production path additionally requires ``'mp_stacked'``.
         rot_vecs (numpy.ndarray): Rodrigues rotation vectors from
             :func:`precompute_rotation_vector_batch`, shape ``(B, 3)``.
         phi_b (numpy.ndarray): Boresight longitude [rad], shape ``(B,)``.
@@ -92,7 +84,7 @@ def beam_tod_batch(
         interp_mode (str): Sky-map interpolation strategy. One of:
 
             * ``'bilinear'`` *(default)* — 4-pixel bilinear HEALPix
-              interpolation via the dedup Numba kernel.
+              interpolation with spin-2 Q/U frame correction.
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
             (``'gaussian'`` and ``'bicubic'`` are available on their respective branches.)
@@ -126,65 +118,63 @@ def beam_tod_batch(
             "switch to the 'gaussian' or 'bicubic' branch"
         )
 
-    # Lower bound from L2 target; upper bound from _MAX_TILES cap.
-    # The max() ensures we never produce more than _MAX_TILES tiles even when
-    # the memory-based Sc is tiny (e.g. Sc=79 at B=2212 → 64 tiles → 64 C calls).
-    Sc = max(1, _S_TILE_TARGET_BYTES // (B * 3 * 4))  # memory target
-    Sc = max(Sc, -(-S // _MAX_TILES))  # tile-count cap (ceiling div)
-    Sc = min(Sc, S)
-
     axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
         rot_vecs, phi_b, theta_b, psis_b
     )
+    vec_orig_f32 = np.ascontiguousarray(vec_orig, dtype=np.float32)
+    beam_vals_f32 = np.ascontiguousarray(beam_vals, dtype=np.float32)
 
-    tod = {comp: np.zeros(B, dtype=np.float32) for comp in comp_indices}
-
-    for s0 in range(0, S, Sc):
-        s1 = min(s0 + Sc, S)
-        bv_chunk = beam_vals[s0:s1]  # (Sc,)
-
-        vec_chunk = np.asarray(vec_orig[s0:s1], dtype=np.float32)  # (Sc, 3)
-        vec_rot = np.empty((B, s1 - s0, 3), dtype=np.float32)
-        _rodrigues_jit(vec_chunk, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot)
-
-        if mp_stacked is not None:
-            tod_arr = np.zeros((C, B), dtype=np.float64)
-            if use_nearest:
-                _gather_accum_nearest_jit(
-                    vec_rot,
-                    nside,
-                    mp_stacked,
-                    bv_chunk,
-                    B,
-                    s1 - s0,
-                    tod_arr,
-                    ax_pts,
-                    c_q,
-                    c_u,
-                )
-            else:
-                _gather_accum_fused_jit(
-                    vec_rot,
-                    nside,
-                    mp_stacked,
-                    bv_chunk,
-                    B,
-                    s1 - s0,
-                    tod_arr,
-                    ax_pts,
-                    ax_pts,  # n_target — unused by the kernel; passed for API parity
-                    c_q,
-                    c_u,
-                )
-            for i, comp in enumerate(comp_indices):
-                tod[comp] += tod_arr[i].astype(np.float32)
+    if mp_stacked is not None:
+        tod_arr = np.zeros((C, B), dtype=np.float64)
+        if use_nearest:
+            _gather_accum_nearest_jit(
+                vec_orig_f32,
+                axes,
+                cos_a,
+                sin_a,
+                ax_pts,
+                cos_p,
+                sin_p,
+                nside,
+                mp_stacked,
+                beam_vals_f32,
+                B,
+                S,
+                tod_arr,
+                c_q,
+                c_u,
+            )
         else:
-            theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
-            pixels, weights = get_interp_weights_numba(nside, theta_flat, phi_flat)
-            mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
-            mp_flat = np.einsum("ckn,kn->cn", mp_gathered, weights)
-            tod_chunk = mp_flat.reshape(C, B, s1 - s0) @ bv_chunk
-            for i, comp in enumerate(comp_indices):
-                tod[comp] += tod_chunk[i].astype(np.float32)
+            _gather_accum_fused_jit(
+                vec_orig_f32,
+                axes,
+                cos_a,
+                sin_a,
+                ax_pts,
+                cos_p,
+                sin_p,
+                nside,
+                mp_stacked,
+                beam_vals_f32,
+                B,
+                S,
+                tod_arr,
+                c_q,
+                c_u,
+            )
+        return {
+            comp: tod_arr[i].astype(np.float32) for i, comp in enumerate(comp_indices)
+        }
 
-    return tod
+    # ── Fallback: healpy-based gather when mp_stacked is not provided.
+    # Not on the production hot path — materialises the (B, S, 3) rotated
+    # vector buffer via the batch Rodrigues kernel.
+    vec_rot = _recenter_and_rotate(vec_orig_f32, rot_vecs, phi_b, theta_b, psis_b)
+    theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
+    pixels, weights = get_interp_weights_numba(nside, theta_flat, phi_flat)
+    mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
+    mp_flat = np.einsum("ckn,kn->cn", mp_gathered, weights)
+    tod_chunk = mp_flat.reshape(C, B, S) @ beam_vals_f32
+    return {
+        comp: tod_chunk[i].astype(np.float32) for i, comp in enumerate(comp_indices)
+    }

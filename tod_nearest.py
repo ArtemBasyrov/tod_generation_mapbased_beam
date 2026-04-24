@@ -14,29 +14,54 @@ from numba_healpy import (
     _ring_info_jit,
     _ring_z_jit,
 )
+from tod_rotations import _rodrigues_apply_one_jit
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
 def _gather_accum_nearest_jit(
-    vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, c_q=-1, c_u=-1
+    vec_orig,
+    axes,
+    cos_a,
+    sin_a,
+    ax_pts,
+    cos_p,
+    sin_p,
+    nside,
+    mp_stacked,
+    beam_vals,
+    B,
+    S,
+    tod,
+    c_q=-1,
+    c_u=-1,
 ):
     """
-    Fully fused vec2ang + HEALPix nearest-pixel lookup + beam accumulation.
+    Fully fused Rodrigues + HEALPix nearest-pixel lookup + beam accumulation.
 
-    For each rotated beam vector the single nearest RING-scheme pixel is found
-    via the inline ang2pix algorithm (_ang2pix_ring_jit inlined) and its
+    For each ``(b, s)`` pair the beam-frame vector is rotated into the sky
+    frame in registers via :func:`_rodrigues_apply_one_jit`, the nearest
+    RING-scheme pixel is found via the inlined ang2pix algorithm, and its
     sky-map value is accumulated with the beam weight.  Parallelised over B.
+    No intermediate ``(B, S, 3)`` buffer is materialised.
 
     Parameters
     ----------
-    vec_rot    : (B, Sc, 3)   float32   rotated beam unit vectors
+    vec_orig   : (S, 3)       float32   beam-frame unit vectors (un-rotated)
+    axes       : (B, 3)       float32   Rodrigues-1 rotation axes
+    cos_a      : (B,)         float32   cos of Rodrigues-1 angle
+    sin_a      : (B,)         float32   sin of Rodrigues-1 angle
+    ax_pts     : (B, 3)       float32   boresight unit vectors (Rodrigues-2
+                                        axis).  Passed for API consistency
+                                        with the bilinear path; not used for
+                                        Q/U frame correction on the nearest
+                                        path (see bilinear note).
+    cos_p      : (B,)         float32   cos of Rodrigues-2 angle (ψ_b − β)
+    sin_p      : (B,)         float32   sin of Rodrigues-2 angle
     nside      : int
     mp_stacked : (C, N_hp)    float32   stacked sky-map components
-    beam_vals  : (Sc,)        float32   beam weights for this tile
-    B, Sc      : int
+    beam_vals  : (S,)         float32   beam weights
+    B, S       : int
     tod        : (C, B)       float64   accumulated in place
-    ax_pts     : (B, 3)       float32   boresight unit vectors (API consistency;
-                              not used for Q/U frame correction — see bilinear note)
     c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)
     c_u        : int          index of U within C-dim of mp_stacked (−1 = absent)
     """
@@ -44,19 +69,41 @@ def _gather_accum_nearest_jit(
     npix_total = 12 * nside * nside
 
     for b in numba.prange(B):
-        for s in range(Sc):
-            # vec2ang (inline)
-            vx = float(vec_rot[b, s, 0])
-            vy = float(vec_rot[b, s, 1])
-            vz = float(vec_rot[b, s, 2])
+        kx = float(axes[b, 0])
+        ky = float(axes[b, 1])
+        kz = float(axes[b, 2])
+        ca = float(cos_a[b])
+        sa = float(sin_a[b])
+        bx = float(ax_pts[b, 0])
+        by = float(ax_pts[b, 1])
+        bz = float(ax_pts[b, 2])
+        cp_ = float(cos_p[b])
+        sp_ = float(sin_p[b])
+
+        for s in range(S):
+            vx, vy, vz = _rodrigues_apply_one_jit(
+                float(vec_orig[s, 0]),
+                float(vec_orig[s, 1]),
+                float(vec_orig[s, 2]),
+                kx,
+                ky,
+                kz,
+                ca,
+                sa,
+                bx,
+                by,
+                bz,
+                cp_,
+                sp_,
+            )
+
             theta = math.atan2(math.sqrt(vx * vx + vy * vy), vz)
             phi = math.atan2(vy, vx)
             if phi < 0.0:
                 phi += _TWO_PI
 
-            # nearest-pixel lookup (inlined _ang2pix_ring_jit)
             z = vz / math.sqrt(vx * vx + vy * vy + vz * vz)  # cos(theta)
-            phi_w = phi  # already in [0, 2π)
+            phi_w = phi
 
             ir_above = _ring_above_jit(nside, z)
             if ir_above < 1:

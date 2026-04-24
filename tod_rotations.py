@@ -5,6 +5,11 @@ Numba JIT kernels
 -----------------
 _rodrigues_jit              — fused double Rodrigues rotation (recenter + pol. roll).
                               Writes directly into a pre-allocated (B, S, 3) buffer.
+_rodrigues_apply_one_jit    — scalar per-(b, s) version: takes one input vector
+                              and per-sample rotation scalars, returns the
+                              rotated vector as a (vx, vy, vz) tuple.  Intended
+                              to be inlined into gather kernels so the
+                              (B, S, 3) intermediate is never materialised.
 
 _spin2_rodrigues_cos2d_sin2d — cos(2δ) and sin(2δ) for spin-2 frame rotation via
                                inlined Rodrigues parallel transport.
@@ -73,6 +78,60 @@ def _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out):
             out[b, s, 0] = rx * cp_ + (py * rz - pz * ry) * sp_ + px * dpr * omp
             out[b, s, 1] = ry * cp_ + (pz * rx - px * rz) * sp_ + py * dpr * omp
             out[b, s, 2] = rz * cp_ + (px * ry - py * rx) * sp_ + pz * dpr * omp
+
+
+@numba.jit(nopython=True, cache=True, inline="always")
+def _rodrigues_apply_one_jit(
+    vx_in,
+    vy_in,
+    vz_in,
+    kx,
+    ky,
+    kz,
+    ca,
+    sa,
+    px,
+    py,
+    pz,
+    cp_,
+    sp_,
+):
+    """Fused double-Rodrigues rotation applied to a single beam-pixel vector.
+
+    Scalar per-(b, s) variant of :func:`_rodrigues_jit`, designed to be inlined
+    into gather kernels so the ``(B, S, 3)`` intermediate buffer is never
+    materialised: the rotated vector lives entirely in registers for the span
+    of one inner-loop iteration.
+
+    Math is identical to :func:`_rodrigues_jit` (same operation ordering, same
+    operand types), so numerical results match element-wise.
+
+    Parameters
+    ----------
+    vx_in, vy_in, vz_in : float    Input (beam-frame) unit-vector components.
+    kx, ky, kz          : float    Rotation-1 (recenter) axis for this sample.
+    ca, sa              : float    cos, sin of rotation-1 angle.
+    px, py, pz          : float    Rotation-2 (polarisation-roll) axis — the
+                                   boresight unit vector.
+    cp_, sp_            : float    cos, sin of rotation-2 angle (ψ_b − β).
+
+    Returns
+    -------
+    vx, vy, vz : float  Rotated (sky-frame) unit-vector components.
+    """
+    oma = 1.0 - ca
+    omp = 1.0 - cp_
+    # Rodrigues 1 — recenter beam
+    dkv = kx * vx_in + ky * vy_in + kz * vz_in
+    rx = vx_in * ca + (ky * vz_in - kz * vy_in) * sa + kx * dkv * oma
+    ry = vy_in * ca + (kz * vx_in - kx * vz_in) * sa + ky * dkv * oma
+    rz = vz_in * ca + (kx * vy_in - ky * vx_in) * sa + kz * dkv * oma
+    # Rodrigues 2 — polarisation roll about the boresight
+    dpr = px * rx + py * ry + pz * rz
+    vx = rx * cp_ + (py * rz - pz * ry) * sp_ + px * dpr * omp
+    vy = ry * cp_ + (pz * rx - px * rz) * sp_ + py * dpr * omp
+    vz = rz * cp_ + (px * ry - py * rx) * sp_ + pz * dpr * omp
+    return vx, vy, vz
 
 
 @numba.jit(nopython=True, cache=True)

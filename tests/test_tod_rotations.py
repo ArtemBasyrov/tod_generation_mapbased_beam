@@ -37,6 +37,7 @@ import pytest
 from tod_rotations import (
     _rotation_params,
     _rodrigues_jit,
+    _rodrigues_apply_one_jit,
     _recenter_and_rotate,
     precompute_rotation_vector_batch,
     _spin2_rodrigues_cos2d_sin2d,
@@ -258,6 +259,171 @@ class TestRodriguesJit:
         _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out)
         norms = np.linalg.norm(out.astype(np.float64), axis=-1)
         npt.assert_allclose(norms, np.ones((B, S)), atol=1e-4)
+
+
+# ===========================================================================
+# TestRodriguesApplyOne
+# ===========================================================================
+
+
+class TestRodriguesApplyOne:
+    """Tests for :func:`_rodrigues_apply_one_jit`.
+
+    The scalar helper must produce numerically the same result as the batch
+    :func:`_rodrigues_jit` kernel for every ``(b, s)`` element (up to the
+    single-precision rounding that happens when the batch kernel stores
+    intermediates in its float32 output buffer).  It is also invoked with
+    identity-like parameter sets to check the algebraic edges: zero-angle
+    rotations, rotation about the input vector itself, etc.
+    """
+
+    @staticmethod
+    def _batch_reference(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p):
+        out = np.empty((axes.shape[0], vec_orig.shape[0], 3), dtype=np.float32)
+        _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out)
+        return out
+
+    @staticmethod
+    def _random_batch(B, S, rng):
+        vec_orig = rng.standard_normal((S, 3))
+        vec_orig /= np.linalg.norm(vec_orig, axis=-1, keepdims=True)
+        vec_orig = vec_orig.astype(np.float32)
+
+        angles_1 = rng.uniform(0.0, math.pi, B).astype(np.float32)
+        axes = rng.standard_normal((B, 3))
+        axes /= np.linalg.norm(axes, axis=-1, keepdims=True)
+        axes = axes.astype(np.float32)
+        cos_a = np.cos(angles_1).astype(np.float32)
+        sin_a = np.sin(angles_1).astype(np.float32)
+
+        ax_pts = rng.standard_normal((B, 3))
+        ax_pts /= np.linalg.norm(ax_pts, axis=-1, keepdims=True)
+        ax_pts = ax_pts.astype(np.float32)
+
+        angles_2 = rng.uniform(0.0, 2 * math.pi, B).astype(np.float32)
+        cos_p = np.cos(angles_2).astype(np.float32)
+        sin_p = np.sin(angles_2).astype(np.float32)
+
+        return vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p
+
+    def test_matches_batch_kernel(self):
+        """Scalar helper matches the batch kernel element-wise across random inputs."""
+        rng = np.random.default_rng(123)
+        B, S = 5, 7
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p) = self._random_batch(
+            B, S, rng
+        )
+        ref = self._batch_reference(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p)
+
+        for b in range(B):
+            for s in range(S):
+                vx, vy, vz = _rodrigues_apply_one_jit(
+                    float(vec_orig[s, 0]),
+                    float(vec_orig[s, 1]),
+                    float(vec_orig[s, 2]),
+                    float(axes[b, 0]),
+                    float(axes[b, 1]),
+                    float(axes[b, 2]),
+                    float(cos_a[b]),
+                    float(sin_a[b]),
+                    float(ax_pts[b, 0]),
+                    float(ax_pts[b, 1]),
+                    float(ax_pts[b, 2]),
+                    float(cos_p[b]),
+                    float(sin_p[b]),
+                )
+                # The batch kernel rounds into float32 when it writes; allow
+                # that rounding as slack in the comparison.
+                npt.assert_allclose(
+                    [vx, vy, vz],
+                    ref[b, s],
+                    atol=1e-6,
+                    err_msg=f"(b={b}, s={s}) scalar / batch disagree",
+                )
+
+    def test_identity_is_noop(self):
+        """With zero angles and arbitrary axes, the input vector is returned unchanged."""
+        rng = np.random.default_rng(0)
+        for _ in range(20):
+            v = rng.standard_normal(3)
+            v /= np.linalg.norm(v)
+            k = rng.standard_normal(3)
+            k /= np.linalg.norm(k)
+            p = rng.standard_normal(3)
+            p /= np.linalg.norm(p)
+            vx, vy, vz = _rodrigues_apply_one_jit(
+                float(v[0]),
+                float(v[1]),
+                float(v[2]),
+                float(k[0]),
+                float(k[1]),
+                float(k[2]),
+                1.0,
+                0.0,
+                float(p[0]),
+                float(p[1]),
+                float(p[2]),
+                1.0,
+                0.0,
+            )
+            npt.assert_allclose([vx, vy, vz], v, atol=1e-14)
+
+    def test_rotation_preserves_norm(self):
+        """The rotated vector has the same L2 norm as the input."""
+        rng = np.random.default_rng(7)
+        B, S = 4, 6
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p) = self._random_batch(
+            B, S, rng
+        )
+        for b in range(B):
+            for s in range(S):
+                nrm_in = float(np.linalg.norm(vec_orig[s]))
+                vx, vy, vz = _rodrigues_apply_one_jit(
+                    float(vec_orig[s, 0]),
+                    float(vec_orig[s, 1]),
+                    float(vec_orig[s, 2]),
+                    float(axes[b, 0]),
+                    float(axes[b, 1]),
+                    float(axes[b, 2]),
+                    float(cos_a[b]),
+                    float(sin_a[b]),
+                    float(ax_pts[b, 0]),
+                    float(ax_pts[b, 1]),
+                    float(ax_pts[b, 2]),
+                    float(cos_p[b]),
+                    float(sin_p[b]),
+                )
+                nrm_out = math.sqrt(vx * vx + vy * vy + vz * vz)
+                npt.assert_allclose(nrm_out, nrm_in, atol=1e-6)
+
+    def test_rotate_about_own_axis_fixes_vector(self):
+        """Rotation-1 about a vector parallel to the input leaves it invariant.
+
+        With cos_p=1, sin_p=0 (identity pol roll), this isolates the first
+        Rodrigues rotation.  Axis = input direction → ω × v = 0 and v·ω = ||v||,
+        so Rodrigues reduces to v → v regardless of the angle.
+        """
+        rng = np.random.default_rng(11)
+        for _ in range(20):
+            v = rng.standard_normal(3)
+            v /= np.linalg.norm(v)
+            angle = rng.uniform(0.0, math.pi)
+            vx, vy, vz = _rodrigues_apply_one_jit(
+                float(v[0]),
+                float(v[1]),
+                float(v[2]),
+                float(v[0]),
+                float(v[1]),
+                float(v[2]),  # axis = v
+                math.cos(angle),
+                math.sin(angle),
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,  # identity Rodrigues-2
+            )
+            npt.assert_allclose([vx, vy, vz], v, atol=1e-6)
 
 
 # ===========================================================================

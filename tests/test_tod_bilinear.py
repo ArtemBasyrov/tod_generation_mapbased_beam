@@ -39,6 +39,109 @@ from tod_bilinear import (
     _spin2_lookup_cached,
     get_interp_weights_numba,
 )
+from tod_rotations import _rodrigues_jit
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the fused-kernel tests.
+#
+# The fused kernel takes beam-frame unit vectors (vec_orig) plus a full set of
+# per-sample Rodrigues parameters and applies the rotation in registers.  These
+# helpers build random rotation parameters and also compute the reference
+# (B, S, 3) vec_rot array via the batch Rodrigues kernel so that the existing
+# numpy/healpy reference pipelines keep working unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _random_unit_vec(shape, rng):
+    v = rng.standard_normal(shape)
+    v /= np.linalg.norm(v, axis=-1, keepdims=True)
+    return v.astype(np.float32)
+
+
+def _make_beam_and_rot_params(B, S, rng, pole_safe=True):
+    """Build (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot_ref).
+
+    ``vec_rot_ref`` is what the batch Rodrigues kernel produces — the reference
+    the fused kernel must agree with.
+    """
+    vec_orig = _random_unit_vec((S, 3), rng)
+
+    angles_1 = rng.uniform(0.0, math.pi, B).astype(np.float32)
+    axes = _random_unit_vec((B, 3), rng)
+    cos_a = np.cos(angles_1).astype(np.float32)
+    sin_a = np.sin(angles_1).astype(np.float32)
+
+    if pole_safe:
+        # Keep boresights away from the numerical north / south poles so that
+        # spin-2 γ is well defined in the reference code (sin θ > 0).
+        theta = rng.uniform(0.1, math.pi - 0.1, B)
+        phi = rng.uniform(0.0, 2 * math.pi, B)
+        ax_pts = np.stack(
+            [np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)],
+            axis=-1,
+        ).astype(np.float32)
+    else:
+        ax_pts = _random_unit_vec((B, 3), rng)
+
+    angles_2 = rng.uniform(0.0, 2 * math.pi, B).astype(np.float32)
+    cos_p = np.cos(angles_2).astype(np.float32)
+    sin_p = np.sin(angles_2).astype(np.float32)
+
+    vec_rot_ref = np.empty((B, S, 3), dtype=np.float32)
+    _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot_ref)
+
+    return vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot_ref
+
+
+def _identity_rot_params(B, ax_pts=None):
+    """Build rotation params that act as the identity on vec_orig.
+
+    Useful for tests that want ``vec_rot[b, s] = vec_orig[s]`` (no rotation)
+    regardless of ``b``, e.g. when checking the gather/accumulate stage against
+    a map-value reference that's invariant under sample index.
+    """
+    axes = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (B, 1))
+    cos_a = np.ones(B, dtype=np.float32)
+    sin_a = np.zeros(B, dtype=np.float32)
+    if ax_pts is None:
+        ax_pts = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (B, 1))
+    cos_p = np.ones(B, dtype=np.float32)
+    sin_p = np.zeros(B, dtype=np.float32)
+    return axes, cos_a, sin_a, ax_pts.astype(np.float32), cos_p, sin_p
+
+
+def _recenter_rot_params_to_boresight(ax_pts):
+    """Build rotation params that rotate vec_orig = [0,0,1] onto each ax_pts[b].
+
+    Rodrigues-1 does the recentre; Rodrigues-2 is identity, so the pol-roll
+    leaves the result at ax_pts[b].  Intended for tests that want
+    ``vec_rot[b, 0] == ax_pts[b]`` with a single-pixel beam at the beam-frame
+    north pole.
+    """
+    B = ax_pts.shape[0]
+    axes = np.zeros((B, 3), dtype=np.float32)
+    cos_a = np.ones(B, dtype=np.float32)
+    sin_a = np.zeros(B, dtype=np.float32)
+    for b in range(B):
+        tx, ty, tz = float(ax_pts[b, 0]), float(ax_pts[b, 1]), float(ax_pts[b, 2])
+        angle = math.acos(max(-1.0, min(1.0, tz)))
+        if angle < 1e-8:
+            axes[b] = [1.0, 0.0, 0.0]
+        else:
+            # axis = ẑ × target (unnormalised) = (-ty, tx, 0)
+            ax = np.array([-ty, tx, 0.0])
+            nrm = np.linalg.norm(ax)
+            if nrm > 1e-10:
+                axes[b] = (ax / nrm).astype(np.float32)
+            else:
+                # ax_pts[b] is antipodal to [0,0,1] — any perpendicular axis works
+                axes[b] = [1.0, 0.0, 0.0]
+        cos_a[b] = math.cos(angle)
+        sin_a[b] = math.sin(angle)
+    cos_p = np.ones(B, dtype=np.float32)
+    sin_p = np.zeros(B, dtype=np.float32)
+    return axes, cos_a, sin_a, cos_p, sin_p
 
 
 # ===========================================================================
@@ -467,25 +570,49 @@ class TestSpin2LookupCached:
 
 
 class TestGatherAccumFusedJit:
-    """
-    Tests for _gather_accum_fused_jit.
+    """Tests for _gather_accum_fused_jit (fused-Rodrigues signature).
 
-    Validates the fused vec2ang + HEALPix interpolation + beam accumulation
-    kernel against the original split-call pipeline and against the toy-model
-    Q/U rotation reference.
+    The kernel now takes beam-frame ``vec_orig`` and per-sample Rodrigues
+    parameters and applies the rotation in registers, so tests build the
+    rotation parameters via :func:`_make_beam_and_rot_params` and compute the
+    reference ``vec_rot`` via the batch Rodrigues kernel to feed into the
+    split-call / toy-model numpy references.
     """
 
     @staticmethod
-    def _make_vec_rot(B, Sc, rng):
-        v = rng.standard_normal((B, Sc, 3))
-        v /= np.linalg.norm(v, axis=-1, keepdims=True)
-        return v.astype(np.float32)
-
-    @staticmethod
-    def _dummy_rot_targets(B):
-        return (
-            np.zeros((B, 3), dtype=np.float32),
-            np.zeros((B, 3), dtype=np.float32),
+    def _call_fused(
+        vec_orig,
+        axes,
+        cos_a,
+        sin_a,
+        ax_pts,
+        cos_p,
+        sin_p,
+        nside,
+        mp_stacked,
+        beam_vals,
+        B,
+        S,
+        tod,
+        c_q=-1,
+        c_u=-1,
+    ):
+        _gather_accum_fused_jit(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
+            c_q,
+            c_u,
         )
 
     @staticmethod
@@ -511,14 +638,7 @@ class TestGatherAccumFusedJit:
 
     @staticmethod
     def _toy_model_qu_reference(vec_rot, nside, mp_stacked, beam_vals, ax_pts, B, Sc):
-        """
-        Reference Q/U accumulation matching example_QU_convolution.py.
-
-        For each sample b: get interp weights for all Sc beam pixels,
-        find unique HEALPix pixels, rotate (Q, U) at each unique pixel into
-        the boresight frame via the spherical-trig delta formula, then
-        accumulate with bilinear weights × beam weights.
-        """
+        """Reference Q/U accumulation matching example_QU_convolution.py."""
         C = mp_stacked.shape[0]
         tod = np.zeros((C, B), dtype=np.float64)
         for i in range(B):
@@ -588,75 +708,164 @@ class TestGatherAccumFusedJit:
 
     def test_output_shape(self):
         rng = np.random.default_rng(40)
-        C, B, Sc, nside = 3, 5, 4, 16
-        vec_rot = self._make_vec_rot(B, Sc, rng)
+        C, B, S, nside = 3, 5, 4, 16
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         mp_stacked = np.ones((C, hp.nside2npix(nside)), dtype=np.float32)
-        beam_vals = np.ones(Sc, dtype=np.float32) / Sc
+        beam_vals = np.ones(S, dtype=np.float32) / S
         tod = np.zeros((C, B), dtype=np.float64)
-        ax_pts, n_target = self._dummy_rot_targets(B)
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
         )
         assert tod.shape == (C, B)
 
     def test_zero_beam_vals_no_contribution(self):
         rng = np.random.default_rng(41)
-        C, B, Sc, nside = 2, 4, 6, 16
-        vec_rot = self._make_vec_rot(B, Sc, rng)
+        C, B, S, nside = 2, 4, 6, 16
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         mp_stacked = rng.standard_normal((C, hp.nside2npix(nside))).astype(np.float32)
-        beam_vals = np.zeros(Sc, dtype=np.float32)
+        beam_vals = np.zeros(S, dtype=np.float32)
         tod = np.zeros((C, B), dtype=np.float64)
-        ax_pts, n_target = self._dummy_rot_targets(B)
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
         )
         npt.assert_array_equal(tod, np.zeros((C, B)))
 
     def test_constant_map_normalised_beam(self):
         rng = np.random.default_rng(42)
-        C, B, Sc, nside = 2, 6, 12, 32
+        C, B, S, nside = 2, 6, 12, 32
         map_val = 7.5
-        vec_rot = self._make_vec_rot(B, Sc, rng)
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         mp_stacked = np.full((C, hp.nside2npix(nside)), map_val, dtype=np.float32)
-        beam_vals = np.full(Sc, 1.0 / Sc, dtype=np.float32)
+        beam_vals = np.full(S, 1.0 / S, dtype=np.float32)
         tod = np.zeros((C, B), dtype=np.float64)
-        ax_pts, n_target = self._dummy_rot_targets(B)
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
         )
         npt.assert_allclose(tod, np.full((C, B), map_val), atol=1e-4)
 
     def test_inplace_accumulation(self):
         rng = np.random.default_rng(43)
-        C, B, Sc, nside = 2, 4, 5, 16
-        vec_rot = self._make_vec_rot(B, Sc, rng)
+        C, B, S, nside = 2, 4, 5, 16
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         mp_stacked = np.ones((C, hp.nside2npix(nside)), dtype=np.float32)
-        beam_vals = np.ones(Sc, dtype=np.float32)
+        beam_vals = np.ones(S, dtype=np.float32)
         tod = np.zeros((C, B), dtype=np.float64)
-        ax_pts, n_target = self._dummy_rot_targets(B)
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
         )
         first = tod.copy()
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
         )
         npt.assert_allclose(tod, 2.0 * first, atol=1e-14)
 
     def test_deterministic(self):
         rng = np.random.default_rng(44)
-        C, B, Sc, nside = 2, 5, 8, 16
-        vec_rot = self._make_vec_rot(B, Sc, rng)
+        C, B, S, nside = 2, 5, 8, 16
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         mp_stacked = rng.uniform(0.0, 1.0, (C, hp.nside2npix(nside))).astype(np.float32)
-        beam_vals = np.ones(Sc, dtype=np.float32) / Sc
+        beam_vals = np.ones(S, dtype=np.float32) / S
         tod1 = np.zeros((C, B), dtype=np.float64)
         tod2 = np.zeros((C, B), dtype=np.float64)
-        ax_pts, n_target = self._dummy_rot_targets(B)
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod1, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod1,
         )
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod2, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod2,
         )
         npt.assert_array_equal(tod1, tod2)
 
@@ -664,39 +873,58 @@ class TestGatherAccumFusedJit:
 
     @pytest.mark.parametrize("nside", [4, 16, 64])
     def test_agrees_with_split_call_reference(self, nside):
-        """
-        Scalar path (c_q = c_u = -1) matches the reference pipeline to 1e-6.
+        """Scalar path (c_q = c_u = -1) matches the reference pipeline to 1e-5.
+
+        The reference builds vec_rot via the batch Rodrigues kernel, whose
+        intermediates round through float32 when they land in the output
+        buffer.  The fused kernel keeps its Rodrigues intermediates in float64
+        registers, so it is slightly more precise — a rounding gap that shows
+        up at nside=64 with ~7e-6 max absolute difference, well below the
+        1e-5 tolerance used throughout this suite.
         """
         rng = np.random.default_rng(45)
-        C, B, Sc = 3, 8, 20
-        vec_rot = self._make_vec_rot(B, Sc, rng)
+        C, B, S = 3, 8, 20
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         npix = hp.nside2npix(nside)
         mp_stacked = rng.uniform(0.5, 1.5, (C, npix)).astype(np.float32)
-        beam_vals = rng.uniform(0.1, 1.0, Sc).astype(np.float32)
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
         beam_vals /= beam_vals.sum()
 
         tod_ref = self._split_call_reference(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc
+            vec_rot, nside, mp_stacked, beam_vals, B, S
         )
         tod_fused = np.zeros((C, B), dtype=np.float64)
-        ax_pts, n_target = self._dummy_rot_targets(B)
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod_fused, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod_fused,
         )
-        npt.assert_allclose(tod_fused, tod_ref, atol=1e-6)
+        npt.assert_allclose(tod_fused, tod_ref, atol=1e-5)
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_agrees_with_healpy_reference(self, nside):
-        """
-        Scalar path is consistent with hp.get_interp_weights → _gather_accum_jit
-        to 1e-5.
-        """
+        """Scalar path is consistent with hp.get_interp_weights → _gather_accum_jit
+        to 1e-5."""
         rng = np.random.default_rng(46)
-        C, B, Sc = 3, 8, 20
-        vec_rot = self._make_vec_rot(B, Sc, rng)
+        C, B, S = 3, 8, 20
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         npix = hp.nside2npix(nside)
         mp_stacked = rng.uniform(0.5, 1.5, (C, npix)).astype(np.float32)
-        beam_vals = rng.uniform(0.1, 1.0, Sc).astype(np.float32)
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
         beam_vals /= beam_vals.sum()
 
         theta_flat, phi_flat = hp.vec2ang(vec_rot.reshape(-1, 3).astype(np.float64))
@@ -708,20 +936,36 @@ class TestGatherAccumFusedJit:
             beam_vals,
             mp_stacked,
             B,
-            Sc,
+            S,
             tod_hp,
         )
-
         tod_fused = np.zeros((C, B), dtype=np.float64)
-        ax_pts, n_target = self._dummy_rot_targets(B)
-        _gather_accum_fused_jit(
-            vec_rot, nside, mp_stacked, beam_vals, B, Sc, tod_fused, ax_pts, n_target
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod_fused,
         )
         npt.assert_allclose(tod_fused, tod_hp, atol=1e-5)
 
     @pytest.mark.parametrize("nside", [4, 16])
     def test_various_sphere_regions(self, nside):
-        """Scalar path agrees with reference in NPC, equatorial belt, and SPC."""
+        """Scalar path agrees with reference in NPC, equatorial belt, and SPC.
+
+        Uses identity rotation (axes/cos_a/sin_a/cos_p/sin_p = identity) so
+        that ``vec_rot[b, 0] == vec_orig[0]`` and the per-sample query direction
+        is the same as the boresight target we picked — covering all three
+        HEALPix zones.
+        """
         rng = np.random.default_rng(47)
         C, B = 2, 10
         npix = hp.nside2npix(nside)
@@ -733,24 +977,43 @@ class TestGatherAccumFusedJit:
             ("equatorial", (math.acos(2.0 / 3.0) + 0.02, math.acos(-2.0 / 3.0) - 0.02)),
             ("SPC", (math.acos(-2.0 / 3.0) + 0.02, np.pi - 0.05)),
         ]:
+            # One independent per-b query direction per region, realised by a
+            # per-b recentering rotation of vec_orig = [0, 0, 1] onto ax_pts[b].
             theta = rng.uniform(*theta_range, B)
             phi = rng.uniform(0.0, 2 * np.pi, B)
-            vec_bs = np.stack(
+            ax_pts = np.stack(
                 [
                     np.sin(theta) * np.cos(phi),
                     np.sin(theta) * np.sin(phi),
                     np.cos(theta),
                 ],
                 axis=-1,
-            ).astype(np.float32)[:, np.newaxis, :]
+            ).astype(np.float32)
 
+            vec_orig = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+            axes, cos_a, sin_a, cos_p, sin_p = _recenter_rot_params_to_boresight(ax_pts)
+
+            vec_rot = np.empty((B, 1, 3), dtype=np.float32)
+            _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot)
             tod_ref = self._split_call_reference(
-                vec_bs, nside, mp_stacked, beam_vals, B, 1
+                vec_rot, nside, mp_stacked, beam_vals, B, 1
             )
+
             tod_fused = np.zeros((C, B), dtype=np.float64)
-            ax_pts, n_target = self._dummy_rot_targets(B)
-            _gather_accum_fused_jit(
-                vec_bs, nside, mp_stacked, beam_vals, B, 1, tod_fused, ax_pts, n_target
+            self._call_fused(
+                vec_orig,
+                axes,
+                cos_a,
+                sin_a,
+                ax_pts,
+                cos_p,
+                sin_p,
+                nside,
+                mp_stacked,
+                beam_vals,
+                B,
+                1,
+                tod_fused,
             )
             npt.assert_allclose(
                 tod_fused,
@@ -761,49 +1024,50 @@ class TestGatherAccumFusedJit:
 
     # ── Q/U spin-2 correction ────────────────────────────────────────────────
 
-    def _make_boresight_targets(self, B, rng):
-        """Random boresight positions (B, 3) float32 unit vectors."""
-        v = rng.standard_normal((B, 3))
-        v /= np.linalg.norm(v, axis=-1, keepdims=True)
-        return v.astype(np.float32)
-
     def test_qu_constant_map_no_rotation(self):
-        """
-        Constant (Q=1, U=0) map; beam pixel = boresight direction.
+        """Constant (Q=1, U=0) map; beam pixel = boresight direction.
 
-        The 4 bilinear neighbours are the ring pixels surrounding the boresight,
-        each at angular separation ≲ half a HEALPix pixel.  The rotation angle δ
-        for each neighbour is therefore small (≪ 1 rad), giving:
-            Q_out = Σ w_j cos(2δ_j) ≈ 1 − O(δ²)
-            U_out = Σ w_j sin(2δ_j) ≈ 0
+        Built via a single-pixel beam at the beam-frame north pole rotated onto
+        each sample's boresight — so ``vec_rot[b, 0] == ax_pts[b]`` to within
+        float32 precision, matching the original test's scenario.
 
-        At nside=64 the pixel diameter is ≈ 0.92°, so |δ_j| ≲ 0.5° and
-        the error is of order (0.5π/180)² / 2 ≈ 4 × 10⁻⁵, well below 1e-3.
+        At nside=64 the pixel diameter is ≈ 0.92°, so |δ_j| ≲ 0.5° and the
+        error is of order (0.5π/180)² / 2 ≈ 4 × 10⁻⁵, well below 1e-3.
         """
-        nside = 64  # fine enough that neighbour δ is negligible
+        nside = 64
         npix = hp.nside2npix(nside)
-        B, Sc = 4, 1
+        B, S = 4, 1
         rng = np.random.default_rng(50)
 
-        ax_pts = self._make_boresight_targets(B, rng)
-        vec_rot = ax_pts[:, np.newaxis, :].copy()
+        ax_pts = _random_unit_vec((B, 3), rng)
+        # Avoid vectors too close to the south pole so the recenter rotation
+        # stays numerically well conditioned.
+        ax_pts[ax_pts[:, 2] < -0.95, 2] = -0.9
+        ax_pts /= np.linalg.norm(ax_pts, axis=-1, keepdims=True)
+        ax_pts = ax_pts.astype(np.float32)
+
+        vec_orig = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+        axes, cos_a, sin_a, cos_p, sin_p = _recenter_rot_params_to_boresight(ax_pts)
 
         mp_stacked = np.zeros((3, npix), dtype=np.float32)
-        mp_stacked[1] = 1.0
-        beam_vals = np.ones(Sc, dtype=np.float32)
-        n_target = np.zeros((B, 3), dtype=np.float32)
+        mp_stacked[1] = 1.0  # Q = 1
+        beam_vals = np.ones(S, dtype=np.float32)
 
         tod = np.zeros((3, B), dtype=np.float64)
-        _gather_accum_fused_jit(
-            vec_rot,
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
             nside,
             mp_stacked,
             beam_vals,
             B,
-            Sc,
+            S,
             tod,
-            ax_pts,
-            n_target,
             c_q=1,
             c_u=2,
         )
@@ -813,36 +1077,37 @@ class TestGatherAccumFusedJit:
 
     @pytest.mark.parametrize("nside", [16, 64])
     def test_qu_agrees_with_toy_model(self, nside):
-        """
-        Q/U path matches the toy-model numpy reference (example_QU_convolution.py)
-        to 1e-4 (float32 map + bilinear interp agreement).
-        """
+        """Q/U path matches the toy-model numpy reference to 1e-4."""
         rng = np.random.default_rng(51 + nside)
-        B, Sc = 6, 12
+        B, S = 6, 12
         npix = hp.nside2npix(nside)
 
-        vec_rot = self._make_vec_rot(B, Sc, rng)
-        ax_pts = self._make_boresight_targets(B, rng)
-        n_target = np.zeros((B, 3), dtype=np.float32)  # not used by new kernel
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, vec_rot) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
 
         mp_stacked = rng.uniform(-1.0, 1.0, (3, npix)).astype(np.float32)
-        beam_vals = rng.uniform(0.1, 1.0, Sc).astype(np.float32)
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
         beam_vals /= beam_vals.sum()
 
         tod_ref = self._toy_model_qu_reference(
-            vec_rot, nside, mp_stacked, beam_vals, ax_pts, B, Sc
+            vec_rot, nside, mp_stacked, beam_vals, ax_pts, B, S
         )
         tod_fused = np.zeros((3, B), dtype=np.float64)
-        _gather_accum_fused_jit(
-            vec_rot,
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
             nside,
             mp_stacked,
             beam_vals,
             B,
-            Sc,
+            S,
             tod_fused,
-            ax_pts,
-            n_target,
             c_q=1,
             c_u=2,
         )
@@ -857,44 +1122,50 @@ class TestGatherAccumFusedJit:
     def test_qu_t_unchanged_by_correction(self):
         """T component is not affected by the Q/U spin-2 rotation."""
         rng = np.random.default_rng(52)
-        nside, B, Sc = 16, 5, 8
+        nside, B, S = 16, 5, 8
         npix = hp.nside2npix(nside)
 
-        vec_rot = self._make_vec_rot(B, Sc, rng)
-        ax_pts = self._make_boresight_targets(B, rng)
-        n_target = np.zeros((B, 3), dtype=np.float32)
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
         mp_stacked = rng.uniform(-1.0, 1.0, (3, npix)).astype(np.float32)
-        beam_vals = rng.uniform(0.1, 1.0, Sc).astype(np.float32)
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
         beam_vals /= beam_vals.sum()
 
-        # T component with Q/U correction active
         tod_with = np.zeros((3, B), dtype=np.float64)
-        _gather_accum_fused_jit(
-            vec_rot,
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
             nside,
             mp_stacked,
             beam_vals,
             B,
-            Sc,
+            S,
             tod_with,
-            ax_pts,
-            n_target,
             c_q=1,
             c_u=2,
         )
 
-        # T component without Q/U correction (c_q=c_u=-1)
         tod_without = np.zeros((3, B), dtype=np.float64)
-        _gather_accum_fused_jit(
-            vec_rot,
+        self._call_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
             nside,
             mp_stacked,
             beam_vals,
             B,
-            Sc,
+            S,
             tod_without,
-            ax_pts,
-            n_target,
         )
         npt.assert_allclose(tod_with[0], tod_without[0], atol=1e-12)
 
