@@ -36,6 +36,7 @@ from tod_bilinear import (
     _gather_accum_jit,
     _gather_accum_fused_jit,
     _spin2_cos2d_sin2d_jit,
+    _spin2_lookup_cached,
     get_interp_weights_numba,
 )
 
@@ -221,6 +222,243 @@ class TestSpin2Cos2dSin2d:
         )
         assert math.isfinite(c2) and math.isfinite(si2)
         npt.assert_allclose(c2**2 + si2**2, 1.0, atol=1e-12)
+
+
+# ===========================================================================
+# TestSpin2LookupCached
+# ===========================================================================
+
+
+class TestSpin2LookupCached:
+    """Tests for the direct-mapped spin-2 cache helper.
+
+    The helper wraps :func:`_spin2_cos2d_sin2d_jit` with a per-pixel cache.
+    Correctness requirements:
+
+    - On a cold slot (pixel index -1 or a different pixel) the helper must
+      return the same ``(cos 2δ, sin 2δ)`` as a direct call to
+      ``_spin2_cos2d_sin2d_jit``, AND install those values in the slot.
+    - On a warm slot (same pixel as the one stored) the cached values are
+      returned without re-computing — verified by flipping the cache entry to a
+      sentinel value and ensuring that value is returned.
+    - When two pixels hash to the same slot, the newer one evicts the older
+      one, and subsequent lookups of the evicted pixel are a miss (recompute).
+    """
+
+    N_CACHE = 1024
+    CMASK = N_CACHE - 1
+
+    def _empty_cache(self):
+        return (
+            np.full(self.N_CACHE, -1, dtype=np.int64),
+            np.empty(self.N_CACHE, dtype=np.float64),
+            np.empty(self.N_CACHE, dtype=np.float64),
+        )
+
+    def _ref(self, z_n, phi_n, z_pts, sth_pts, phi_pts):
+        sth_n = math.sqrt(max(0.0, 1.0 - z_n * z_n))
+        return _spin2_cos2d_sin2d_jit(z_n, sth_n, phi_n, z_pts, sth_pts, phi_pts)
+
+    def test_miss_matches_direct_call(self):
+        """On a cold cache the helper returns exactly _spin2_cos2d_sin2d_jit."""
+        cache_pix, cache_c2d, cache_s2d = self._empty_cache()
+        z_pts, sth_pts, phi_pts = 0.6, 0.8, 1.2
+
+        rng = np.random.default_rng(0)
+        for _ in range(50):
+            p = int(rng.integers(0, 10_000_000))
+            theta_n = rng.uniform(0.05, math.pi - 0.05)
+            phi_n = rng.uniform(0.0, 2 * math.pi)
+            z_n = math.cos(theta_n)
+
+            c2d_ref, s2d_ref = self._ref(z_n, phi_n, z_pts, sth_pts, phi_pts)
+            c2d, s2d = _spin2_lookup_cached(
+                p,
+                z_n,
+                phi_n,
+                z_pts,
+                sth_pts,
+                phi_pts,
+                cache_pix,
+                cache_c2d,
+                cache_s2d,
+                self.CMASK,
+            )
+            npt.assert_allclose(c2d, c2d_ref, atol=1e-14)
+            npt.assert_allclose(s2d, s2d_ref, atol=1e-14)
+
+    def test_miss_populates_slot(self):
+        """After a miss the slot contains the queried pixel and its spin-2 values."""
+        cache_pix, cache_c2d, cache_s2d = self._empty_cache()
+        z_pts, sth_pts, phi_pts = 0.6, 0.8, 1.2
+        p, z_n, phi_n = 12345, 0.3, 0.7
+
+        c2d, s2d = _spin2_lookup_cached(
+            p,
+            z_n,
+            phi_n,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        slot = (p * 2654435769) & self.CMASK
+        assert cache_pix[slot] == p
+        npt.assert_allclose(cache_c2d[slot], c2d, atol=0.0)
+        npt.assert_allclose(cache_s2d[slot], s2d, atol=0.0)
+
+    def test_hit_returns_stored_value(self):
+        """A warm slot returns the cached value without recomputing.
+
+        Verified by corrupting the cached (c2d, s2d) with a sentinel; the
+        helper must return the sentinel rather than the true spin-2 values.
+        """
+        cache_pix, cache_c2d, cache_s2d = self._empty_cache()
+        z_pts, sth_pts, phi_pts = 0.6, 0.8, 1.2
+        p, z_n, phi_n = 42, 0.2, 1.1
+
+        # First call: miss, populates slot.
+        _spin2_lookup_cached(
+            p,
+            z_n,
+            phi_n,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        slot = (p * 2654435769) & self.CMASK
+        # Overwrite stored values with a sentinel.
+        cache_c2d[slot] = -123.456
+        cache_s2d[slot] = 789.012
+        # Second call: hit — must return the sentinel.
+        c2d, s2d = _spin2_lookup_cached(
+            p,
+            z_n,
+            phi_n,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        assert c2d == -123.456
+        assert s2d == 789.012
+
+    def test_eviction_on_hash_collision(self):
+        """Two pixels hashing to the same slot: second evicts first."""
+        cache_pix, cache_c2d, cache_s2d = self._empty_cache()
+        z_pts, sth_pts, phi_pts = 0.6, 0.8, 1.2
+
+        # Find two distinct pixels that collide.
+        p_a = 13
+        slot_a = (p_a * 2654435769) & self.CMASK
+        p_b = None
+        for candidate in range(p_a + 1, p_a + 200_000):
+            if ((candidate * 2654435769) & self.CMASK) == slot_a:
+                p_b = candidate
+                break
+        assert p_b is not None, "Could not find a collision within search range"
+
+        z_a, phi_a = 0.2, 0.5
+        z_b, phi_b = -0.4, 2.1
+
+        _spin2_lookup_cached(
+            p_a,
+            z_a,
+            phi_a,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        assert cache_pix[slot_a] == p_a
+        # Lookup p_b: miss (different pixel), evicts p_a.
+        c2d_b, s2d_b = _spin2_lookup_cached(
+            p_b,
+            z_b,
+            phi_b,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        assert cache_pix[slot_a] == p_b
+        c2d_ref, s2d_ref = self._ref(z_b, phi_b, z_pts, sth_pts, phi_pts)
+        npt.assert_allclose(c2d_b, c2d_ref, atol=1e-14)
+        npt.assert_allclose(s2d_b, s2d_ref, atol=1e-14)
+
+        # Re-querying p_a is now a miss again (slot holds p_b).
+        c2d_a, s2d_a = _spin2_lookup_cached(
+            p_a,
+            z_a,
+            phi_a,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        c2d_a_ref, s2d_a_ref = self._ref(z_a, phi_a, z_pts, sth_pts, phi_pts)
+        npt.assert_allclose(c2d_a, c2d_a_ref, atol=1e-14)
+        npt.assert_allclose(s2d_a, s2d_a_ref, atol=1e-14)
+        assert cache_pix[slot_a] == p_a  # evicted p_b
+
+    def test_reset_slot_treated_as_miss(self):
+        """A slot explicitly set back to -1 is treated as a cold miss."""
+        cache_pix, cache_c2d, cache_s2d = self._empty_cache()
+        z_pts, sth_pts, phi_pts = 0.6, 0.8, 1.2
+        p, z_n, phi_n = 77, 0.1, 2.0
+
+        _spin2_lookup_cached(
+            p,
+            z_n,
+            phi_n,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        slot = (p * 2654435769) & self.CMASK
+        # Poison with bad stored values AND reset the sentinel:
+        cache_pix[slot] = -1
+        cache_c2d[slot] = -999.0
+        cache_s2d[slot] = -999.0
+        # Now a lookup must recompute — returns the true value, not the garbage.
+        c2d, s2d = _spin2_lookup_cached(
+            p,
+            z_n,
+            phi_n,
+            z_pts,
+            sth_pts,
+            phi_pts,
+            cache_pix,
+            cache_c2d,
+            cache_s2d,
+            self.CMASK,
+        )
+        c2d_ref, s2d_ref = self._ref(z_n, phi_n, z_pts, sth_pts, phi_pts)
+        npt.assert_allclose(c2d, c2d_ref, atol=1e-14)
+        npt.assert_allclose(s2d, s2d_ref, atol=1e-14)
 
 
 # ===========================================================================

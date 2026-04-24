@@ -10,17 +10,29 @@ import numpy as np
 import numba
 from numba_healpy import (
     _TWO_PI,
-    _ring_above_jit,
-    _ring_info_jit,
-    _ring_z_jit,
     _ring_interp_single_jit,
+    _ring_interp_with_angles_jit,
     get_interp_weights_numba,  # re-exported for tests
 )
+
+# Knuth multiplicative-hash constant for the direct-mapped spin-2 cache.
+# Chosen to break the spatial clustering of consecutive HEALPix pixel indices
+# that would collide on a plain low-bit mask.
+_SPIN2_CACHE_HASH = 2654435769
+
+# Direct-mapped spin-2 cache size (power of 2).  Sized to hold the ~100-300
+# unique HEALPix pixels covered by a 30′ beam disc at nside=1024 with load
+# ≪ 0.1, so collision misses are negligible.  The three backing arrays total
+# ~24 KiB, fitting comfortably in L1.
+_SPIN2_CACHE_SIZE = 1024
+_SPIN2_CACHE_MASK = _SPIN2_CACHE_SIZE - 1
+
 
 __all__ = (
     "_gather_accum_jit",
     "_gather_accum_fused_jit",
     "_spin2_cos2d_sin2d_jit",
+    "_spin2_lookup_cached",
     "get_interp_weights_numba",
 )
 
@@ -132,6 +144,60 @@ def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
     return cos_2d, sin_2d
 
 
+# ── Spin-2 cache probe helper ─────────────────────────────────────────────────
+
+
+@numba.jit(nopython=True, cache=True, inline="always")
+def _spin2_lookup_cached(
+    p,
+    z_n,
+    phi_n,
+    z_pts,
+    sth_pts,
+    phi_pts,
+    cache_pix,
+    cache_c2d,
+    cache_s2d,
+    cmask,
+):
+    """Probe the direct-mapped spin-2 cache for pixel ``p``; compute+store on miss.
+
+    Cache slot is selected by Knuth's multiplicative hash so consecutive RING
+    pixel indices on the same ring don't collide.  A slot whose stored pixel
+    index equals ``p`` is a hit (returns the cached ``(cos 2δ, sin 2δ)``); any
+    other value — including the initial sentinel ``-1`` — is a miss, in which
+    case the spin-2 rotation is computed via :func:`_spin2_cos2d_sin2d_jit`
+    and written into the slot, evicting any previous occupant.
+
+    The cache is boresight-scoped: its contents are valid only for the
+    ``(z_pts, sth_pts, phi_pts)`` passed in.  Callers must reset the cache
+    (``cache_pix[:] = -1``) whenever they move to a new boresight.
+
+    Parameters
+    ----------
+    p                         : int64    HEALPix RING pixel index
+    z_n, phi_n                : float64  cos θ and φ of pixel ``p``'s centre
+    z_pts, sth_pts, phi_pts   : float64  cos θ, sin θ, φ of the boresight
+    cache_pix                 : (N,) int64    slot → pixel index (or -1)
+    cache_c2d                 : (N,) float64  slot → cached cos(2δ)
+    cache_s2d                 : (N,) float64  slot → cached sin(2δ)
+    cmask                     : int      N − 1, where N is a power of 2
+
+    Returns
+    -------
+    c2d, s2d : float64  cos(2δ), sin(2δ) for the pixel → boresight transport.
+    """
+    slot = (p * _SPIN2_CACHE_HASH) & cmask
+    if cache_pix[slot] == p:
+        return cache_c2d[slot], cache_s2d[slot]
+    sth_n = math.sqrt(max(0.0, 1.0 - z_n * z_n))
+    c2d, s2d = _spin2_cos2d_sin2d_jit(z_n, sth_n, phi_n, z_pts, sth_pts, phi_pts)
+    cache_pix[slot] = p
+    cache_c2d[slot] = c2d
+    cache_s2d[slot] = s2d
+    return c2d, s2d
+
+
 # ── Fully fused kernel (spin-2 amortised via direct-mapped cache) ─────────────
 
 
@@ -177,17 +243,14 @@ def _gather_accum_fused_jit(
 
     Cache layout (Q/U path)
     -----------------------
-    ``cache_pix[N_CACHE]``  : int64    HEALPix index currently in slot, or -1
-    ``cache_c2d[N_CACHE]``  : float64  cos(2δ) for that pixel + this boresight
-    ``cache_s2d[N_CACHE]``  : float64  sin(2δ) for that pixel + this boresight
+    The cache is a triple of parallel arrays of size ``_SPIN2_CACHE_SIZE``:
+    ``cache_pix`` (int64, HEALPix index currently in slot, or -1),
+    ``cache_c2d`` / ``cache_s2d`` (float64, cos 2δ / sin 2δ for that pixel).
+    Slot selection and miss-fallback live in :func:`_spin2_lookup_cached`.
 
-    The slot is selected by a Knuth-style multiplicative hash
-    ``(p * 2654435769) & CMASK`` to break the spatial clustering of
-    consecutive HEALPix pixel indices that would collide on a plain low-bit
-    mask.  ``N_CACHE = 4096`` keeps the three arrays at ~96 KiB total — fits
-    comfortably in L2, mostly in L1.  The cache is reset to -1 at the start
-    of each ``b`` (one ~3 µs memset) because spin-2 values depend on the
-    boresight direction.
+    At ``_SPIN2_CACHE_SIZE = 1024`` the three arrays total ~24 KiB, fitting
+    in L1.  The cache is reset to -1 at the start of each ``b`` because
+    spin-2 values depend on the boresight direction.
 
     When Q/U are absent the kernel collapses to a single fused vec2ang +
     bilinear-gather + accumulate loop with no scratch.
@@ -207,30 +270,19 @@ def _gather_accum_fused_jit(
     c_u        : int          index of U in C-dim of mp_stacked (−1 = absent)
     """
     C = mp_stacked.shape[0]
-    npix_total = 12 * nside * nside
     has_qu = c_q >= 0 and c_u >= 0
-
-    # Direct-mapped spin-2 cache — power of 2.  Sized for the realistic
-    # workload: at 1-arcmin beam pixels and nside=1024 the typical
-    # 30-arcmin beam disc covers ~100-300 HEALPix pixels, so a 4096-slot
-    # cache holds the entire working set with load ≪ 0.1 and essentially
-    # no collision misses.  The three arrays total ~96 KiB, fitting in L2.
-    # Reset cost (memset to -1) ~3 µs per b — small vs the spin-2 work
-    # it amortises.
-    N_CACHE = 1024
-    CMASK = N_CACHE - 1
 
     if has_qu:
         for b in numba.prange(B):
-            # Per-b cache.  Numba's NRT allocator handles this in ~100 ns
-            # plus the ~3 µs memset; going thread-local would force
+            # Per-b spin-2 cache.  Numba's NRT allocator handles this in
+            # ~100 ns plus the ~3 µs memset; going thread-local would force
             # ``cache=False`` (dynamic-globals NumbaWarning), which costs
             # 5-15 s of recompile per fresh worker process — far worse.
-            cache_pix = np.full(N_CACHE, -1, dtype=np.int64)
-            cache_c2d = np.empty(N_CACHE, dtype=np.float64)
-            cache_s2d = np.empty(N_CACHE, dtype=np.float64)
+            cache_pix = np.full(_SPIN2_CACHE_SIZE, -1, dtype=np.int64)
+            cache_c2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
+            cache_s2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
 
-            # Boresight (z, sin θ, φ) once per b
+            # Boresight (z, sin θ, φ) — computed once per b.
             bx = float(ax_pts[b, 0])
             by = float(ax_pts[b, 1])
             bz = float(ax_pts[b, 2])
@@ -250,169 +302,74 @@ def _gather_accum_fused_jit(
                     phi_w += _TWO_PI
                 bv = float(beam_vals[s])
 
-                # ── Inlined HEALPix bilinear neighbour lookup ──────────────
-                # Same math as _ring_interp_single_jit (acos-exact), expanded
-                # so we keep the per-neighbour (z_n, φ_n) needed by the
-                # spin-2 miss path WITHOUT having to recompute via
-                # _pix2zphi_ring_jit.  This makes a cache miss cost the same
-                # as the old inline-spin-2 kernel, and a cache hit ~3× faster.
-                ir_above = _ring_above_jit(nside, z)
-                ir_below = ir_above + 1
+                (
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    w0,
+                    w1,
+                    w2,
+                    w3,
+                    z_n0,
+                    z_n1,
+                    z_n2,
+                    z_n3,
+                    phi_n0,
+                    phi_n1,
+                    phi_n2,
+                    phi_n3,
+                ) = _ring_interp_with_angles_jit(nside, z, phi_w)
 
-                if ir_above == 0:
-                    # ── North-pole boundary ────────────────────────────────
-                    na, fpa, phi0a, dphia = _ring_info_jit(nside, 1, npix_total)
-                    tw = ((phi_w - phi0a) / dphia) % float(na)
-                    ip_a = int(tw)
-                    frac = tw - ip_a
-                    ip_a2 = (ip_a + 1) % na
-                    p0 = fpa + (ip_a + 2) % na
-                    p1 = fpa + (ip_a2 + 2) % na
-                    p2 = fpa + ip_a
-                    p3 = fpa + ip_a2
-                    za = _ring_z_jit(nside, 1)
-                    ta = math.acos(za)
-                    theta = math.acos(z)
-                    w_theta = theta / ta
-                    nf = (1.0 - w_theta) * 0.25
-                    w0 = nf
-                    w1 = nf
-                    w2 = (1.0 - frac) * w_theta + nf
-                    w3 = frac * w_theta + nf
-                    z_n0 = za
-                    z_n1 = za
-                    z_n2 = za
-                    z_n3 = za
-                    phi_n0 = phi0a + ((ip_a + 2) % na) * dphia
-                    phi_n1 = phi0a + ((ip_a2 + 2) % na) * dphia
-                    phi_n2 = phi0a + ip_a * dphia
-                    phi_n3 = phi0a + ip_a2 * dphia
+                c2d0, s2d0 = _spin2_lookup_cached(
+                    p0,
+                    z_n0,
+                    phi_n0,
+                    z_pts,
+                    sth_pts,
+                    phi_pts,
+                    cache_pix,
+                    cache_c2d,
+                    cache_s2d,
+                    _SPIN2_CACHE_MASK,
+                )
+                c2d1, s2d1 = _spin2_lookup_cached(
+                    p1,
+                    z_n1,
+                    phi_n1,
+                    z_pts,
+                    sth_pts,
+                    phi_pts,
+                    cache_pix,
+                    cache_c2d,
+                    cache_s2d,
+                    _SPIN2_CACHE_MASK,
+                )
+                c2d2, s2d2 = _spin2_lookup_cached(
+                    p2,
+                    z_n2,
+                    phi_n2,
+                    z_pts,
+                    sth_pts,
+                    phi_pts,
+                    cache_pix,
+                    cache_c2d,
+                    cache_s2d,
+                    _SPIN2_CACHE_MASK,
+                )
+                c2d3, s2d3 = _spin2_lookup_cached(
+                    p3,
+                    z_n3,
+                    phi_n3,
+                    z_pts,
+                    sth_pts,
+                    phi_pts,
+                    cache_pix,
+                    cache_c2d,
+                    cache_s2d,
+                    _SPIN2_CACHE_MASK,
+                )
 
-                elif ir_below == 4 * nside:
-                    # ── South-pole boundary ────────────────────────────────
-                    ir_last = 4 * nside - 1
-                    na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_last, npix_total)
-                    tw = ((phi_w - phi0a) / dphia) % float(na)
-                    ip_a = int(tw)
-                    frac = tw - ip_a
-                    ip_a2 = (ip_a + 1) % na
-                    p0 = fpa + ip_a
-                    p1 = fpa + ip_a2
-                    p2 = fpa + (ip_a + 2) % na
-                    p3 = fpa + (ip_a2 + 2) % na
-                    za = _ring_z_jit(nside, ir_last)
-                    ta = math.acos(za)
-                    theta = math.acos(z)
-                    w_theta_south = (theta - ta) / (math.pi - ta)
-                    sf = w_theta_south * 0.25
-                    w0 = (1.0 - frac) * (1.0 - w_theta_south) + sf
-                    w1 = frac * (1.0 - w_theta_south) + sf
-                    w2 = sf
-                    w3 = sf
-                    z_n0 = za
-                    z_n1 = za
-                    z_n2 = za
-                    z_n3 = za
-                    phi_n0 = phi0a + ip_a * dphia
-                    phi_n1 = phi0a + ip_a2 * dphia
-                    phi_n2 = phi0a + ((ip_a + 2) % na) * dphia
-                    phi_n3 = phi0a + ((ip_a2 + 2) % na) * dphia
-
-                else:
-                    # ── Normal case ────────────────────────────────────────
-                    za = _ring_z_jit(nside, ir_above)
-                    zb = _ring_z_jit(nside, ir_below)
-                    ta = math.acos(za)
-                    tb = math.acos(zb)
-                    theta = math.acos(z)
-                    w_below = (theta - ta) / (tb - ta)
-                    w_above = 1.0 - w_below
-
-                    na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_above, npix_total)
-                    tw = ((phi_w - phi0a) / dphia) % float(na)
-                    iphia = int(tw)
-                    fphia = tw - iphia
-                    iphia1 = (iphia + 1) % na
-                    p0 = fpa + iphia
-                    p1 = fpa + iphia1
-                    w0 = w_above * (1.0 - fphia)
-                    w1 = w_above * fphia
-
-                    nb_, fpb, phi0b, dphib = _ring_info_jit(nside, ir_below, npix_total)
-                    tw = ((phi_w - phi0b) / dphib) % float(nb_)
-                    iphib = int(tw)
-                    fphib = tw - iphib
-                    iphib1 = (iphib + 1) % nb_
-                    p2 = fpb + iphib
-                    p3 = fpb + iphib1
-                    w2 = w_below * (1.0 - fphib)
-                    w3 = w_below * fphib
-
-                    z_n0 = za
-                    z_n1 = za
-                    z_n2 = zb
-                    z_n3 = zb
-                    phi_n0 = phi0a + iphia * dphia
-                    phi_n1 = phi0a + iphia1 * dphia
-                    phi_n2 = phi0b + iphib * dphib
-                    phi_n3 = phi0b + iphib1 * dphib
-
-                # ── Spin-2 lookup for each of the 4 corners ────────────────
-                # Cache key: HEALPix pixel index, hashed by Knuth's golden
-                # multiplier so consecutive ring neighbours don't collide.
-                slot0 = (p0 * 2654435769) & CMASK
-                if cache_pix[slot0] == p0:
-                    c2d0 = cache_c2d[slot0]
-                    s2d0 = cache_s2d[slot0]
-                else:
-                    sth_n = math.sqrt(max(0.0, 1.0 - z_n0 * z_n0))
-                    c2d0, s2d0 = _spin2_cos2d_sin2d_jit(
-                        z_n0, sth_n, phi_n0, z_pts, sth_pts, phi_pts
-                    )
-                    cache_pix[slot0] = p0
-                    cache_c2d[slot0] = c2d0
-                    cache_s2d[slot0] = s2d0
-
-                slot1 = (p1 * 2654435769) & CMASK
-                if cache_pix[slot1] == p1:
-                    c2d1 = cache_c2d[slot1]
-                    s2d1 = cache_s2d[slot1]
-                else:
-                    sth_n = math.sqrt(max(0.0, 1.0 - z_n1 * z_n1))
-                    c2d1, s2d1 = _spin2_cos2d_sin2d_jit(
-                        z_n1, sth_n, phi_n1, z_pts, sth_pts, phi_pts
-                    )
-                    cache_pix[slot1] = p1
-                    cache_c2d[slot1] = c2d1
-                    cache_s2d[slot1] = s2d1
-
-                slot2 = (p2 * 2654435769) & CMASK
-                if cache_pix[slot2] == p2:
-                    c2d2 = cache_c2d[slot2]
-                    s2d2 = cache_s2d[slot2]
-                else:
-                    sth_n = math.sqrt(max(0.0, 1.0 - z_n2 * z_n2))
-                    c2d2, s2d2 = _spin2_cos2d_sin2d_jit(
-                        z_n2, sth_n, phi_n2, z_pts, sth_pts, phi_pts
-                    )
-                    cache_pix[slot2] = p2
-                    cache_c2d[slot2] = c2d2
-                    cache_s2d[slot2] = s2d2
-
-                slot3 = (p3 * 2654435769) & CMASK
-                if cache_pix[slot3] == p3:
-                    c2d3 = cache_c2d[slot3]
-                    s2d3 = cache_s2d[slot3]
-                else:
-                    sth_n = math.sqrt(max(0.0, 1.0 - z_n3 * z_n3))
-                    c2d3, s2d3 = _spin2_cos2d_sin2d_jit(
-                        z_n3, sth_n, phi_n3, z_pts, sth_pts, phi_pts
-                    )
-                    cache_pix[slot3] = p3
-                    cache_c2d[slot3] = c2d3
-                    cache_s2d[slot3] = s2d3
-
-                # ── Accumulate ────────────────────────────────────────────
                 q0 = float(mp_stacked[c_q, p0])
                 u0 = float(mp_stacked[c_u, p0])
                 q1 = float(mp_stacked[c_q, p1])
@@ -445,10 +402,7 @@ def _gather_accum_fused_jit(
                         + w3 * float(mp_stacked[c, p3])
                     ) * bv
     else:
-        # ── No Q/U: single-pass fused vec2ang + gather + accumulate ──────
-        # No dedup needed — there is no spin-2 cost to amortise.  Skipping
-        # the scratch allocation and the pass split avoids ~6 array allocs
-        # per boresight and keeps everything in registers.
+        # ── No Q/U: no spin-2 to amortise; skip the cache and go direct.
         for b in numba.prange(B):
             for s in range(Sc):
                 vx = float(vec_rot[b, s, 0])

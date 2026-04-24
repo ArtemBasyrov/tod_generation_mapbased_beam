@@ -347,12 +347,11 @@ class TestPrecomputeRotationVectorBatch:
         B = 5
         phi_batch = np.linspace(0, np.pi / 4, B)
         theta_batch = np.linspace(np.pi / 4, np.pi / 2, B)
-        rot_vector, beta, n_target = precompute_rotation_vector_batch(
+        rot_vector, beta = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         assert rot_vector.shape == (B, 3)
         assert beta.shape == (B,)
-        assert n_target.shape == (B, 3)
 
     def test_beta_in_zero_to_2pi(self):
         """All beta values are in [0, 2pi)."""
@@ -362,7 +361,7 @@ class TestPrecomputeRotationVectorBatch:
         B = 20
         phi_batch = rng.uniform(0, np.pi / 6, B)
         theta_batch = rng.uniform(np.pi / 3, 2 * np.pi / 3, B)
-        _, beta, _ = precompute_rotation_vector_batch(
+        _, beta = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         assert np.all(beta >= 0.0), "Some beta values are negative"
@@ -375,7 +374,7 @@ class TestPrecomputeRotationVectorBatch:
         # centre_idx=(N//2, N//2)=(100,100), ra=0, dec=0 -> phi=0, theta=pi/2
         phi_batch = np.array([0.0])
         theta_batch = np.array([np.pi / 2])
-        rot_vector, _, _ = precompute_rotation_vector_batch(
+        rot_vector, _ = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         npt.assert_array_less(np.linalg.norm(rot_vector, axis=-1), 1e-10)
@@ -388,7 +387,7 @@ class TestPrecomputeRotationVectorBatch:
         # Point 90 degrees away in phi: phi=pi/2, theta=pi/2
         phi_batch = np.array([np.pi / 2])
         theta_batch = np.array([np.pi / 2])
-        rot_vector, _, _ = precompute_rotation_vector_batch(
+        rot_vector, _ = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         npt.assert_allclose(np.linalg.norm(rot_vector, axis=-1), np.pi / 2, atol=1e-6)
@@ -399,7 +398,7 @@ class TestPrecomputeRotationVectorBatch:
         ra, dec = self._make_grid(N)
         phi_batch = np.array([0.1])
         theta_batch = np.array([np.pi / 2])
-        rot_vector, _, _ = precompute_rotation_vector_batch(
+        rot_vector, _ = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         assert rot_vector.dtype == np.float64

@@ -93,7 +93,7 @@ class TestBeamTodBatch:
         dec = np.zeros((N, N))
         phi_batch = rng.uniform(0, 0.04, B)
         theta_batch = rng.uniform(np.pi / 2 - 0.04, np.pi / 2, B)
-        rot_vecs, betas, _ = precompute_rotation_vector_batch(
+        rot_vecs, betas = precompute_rotation_vector_batch(
             ra, dec, phi_batch, theta_batch, center_idx=(N // 2, N // 2)
         )
         psis_b = -betas

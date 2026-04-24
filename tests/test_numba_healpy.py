@@ -48,6 +48,8 @@ from numba_healpy import (
     _query_disc_jit,
     query_disc_numba,
     _ang2pix_ring_jit,
+    _ring_interp_single_jit,
+    _ring_interp_with_angles_jit,
 )
 
 
@@ -468,6 +470,144 @@ class TestGetInterpWeightsNumba:
         _get_interp_weights_jit(nside, theta, phi, pix_j, wgt_j)
         npt.assert_array_equal(pix_j, pix_w)
         npt.assert_array_equal(wgt_j, wgt_w)
+
+
+# ===========================================================================
+# TestRingInterpWithAnglesJit
+# ===========================================================================
+
+
+class TestRingInterpWithAnglesJit:
+    """Tests for _ring_interp_with_angles_jit.
+
+    The function must return the same ``(p0..p3, w0..w3)`` as
+    :func:`_ring_interp_single_jit` (bit-for-bit), and the additional
+    ``(z_n, phi_n)`` values must round-trip through ``hp.pix2ang`` for each of
+    the four neighbour pixels.  Coverage includes the three HEALPix regimes:
+    normal case (equatorial belt + polar cap proper), north-pole boundary,
+    and south-pole boundary.
+    """
+
+    @staticmethod
+    def _query_points(rng, n, theta_range):
+        """Return an (n, 3) float64 array of unit vectors in the θ range."""
+        thetas = rng.uniform(*theta_range, n)
+        phis = rng.uniform(0.0, 2 * math.pi, n)
+        return (
+            np.stack(
+                [
+                    np.sin(thetas) * np.cos(phis),
+                    np.sin(thetas) * np.sin(phis),
+                    np.cos(thetas),
+                ],
+                axis=-1,
+            ),
+            thetas,
+            phis,
+        )
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_pixels_and_weights_match_single_jit(self, nside):
+        """The first 8 returns (pixels, weights) must match _ring_interp_single_jit
+        bit-for-bit across all three regimes."""
+        rng = np.random.default_rng(2024)
+        # Sample colatitudes spanning NPC, equatorial belt, and SPC.
+        thetas = np.concatenate(
+            [
+                rng.uniform(0.01, math.acos(2.0 / 3.0) - 0.02, 40),  # NPC
+                rng.uniform(
+                    math.acos(2.0 / 3.0) + 0.02, math.acos(-2.0 / 3.0) - 0.02, 40
+                ),  # equatorial
+                rng.uniform(math.acos(-2.0 / 3.0) + 0.02, math.pi - 0.01, 40),  # SPC
+            ]
+        )
+        phis = rng.uniform(0.0, 2 * math.pi, thetas.size)
+        for theta, phi in zip(thetas, phis):
+            z = math.cos(theta)
+            phi_w = phi % (2 * math.pi)
+
+            out_single = _ring_interp_single_jit(nside, z, phi_w)
+            out_full = _ring_interp_with_angles_jit(nside, z, phi_w)
+
+            # pixels (0..3) and weights (4..7) must match bit-for-bit.
+            for i in range(8):
+                assert out_full[i] == out_single[i], (
+                    f"Element {i} mismatch at nside={nside}, theta={theta}, phi={phi}"
+                )
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_neighbour_angles_match_hp_pix2ang(self, nside):
+        """For each of the 4 returned neighbour pixels, (z_n, phi_n) must
+        match ``hp.pix2ang`` (i.e. cos(theta_ref) == z_n and phi_ref == phi_n)."""
+        rng = np.random.default_rng(99)
+        thetas = np.concatenate(
+            [
+                rng.uniform(0.01, math.acos(2.0 / 3.0) - 0.02, 20),
+                rng.uniform(
+                    math.acos(2.0 / 3.0) + 0.02, math.acos(-2.0 / 3.0) - 0.02, 20
+                ),
+                rng.uniform(math.acos(-2.0 / 3.0) + 0.02, math.pi - 0.01, 20),
+            ]
+        )
+        phis = rng.uniform(0.0, 2 * math.pi, thetas.size)
+        for theta, phi in zip(thetas, phis):
+            z = math.cos(theta)
+            phi_w = phi % (2 * math.pi)
+            out = _ring_interp_with_angles_jit(nside, z, phi_w)
+            pixels = out[0:4]
+            z_n = out[8:12]
+            phi_n = out[12:16]
+            # Reference from healpy.
+            theta_ref, phi_ref = hp.pix2ang(nside, np.asarray(pixels, dtype=np.int64))
+            for i in range(4):
+                npt.assert_allclose(
+                    z_n[i],
+                    math.cos(theta_ref[i]),
+                    atol=1e-12,
+                    err_msg=f"z_n[{i}] at nside={nside}",
+                )
+                # phi may differ by multiples of 2π; compare via angular difference.
+                dphi = (phi_n[i] - phi_ref[i] + math.pi) % (2 * math.pi) - math.pi
+                npt.assert_allclose(
+                    dphi, 0.0, atol=1e-12, err_msg=f"phi_n[{i}] at nside={nside}"
+                )
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_north_pole_boundary(self, nside):
+        """Query points above ring 1 (north of pole) take the NPC boundary branch."""
+        z1 = _ring_z_jit(nside, 1)  # ring-1 z-centre
+        # Pick a z slightly above ring 1.
+        z = min(1.0, 0.5 * (1.0 + z1))
+        rng = np.random.default_rng(0)
+        for phi in rng.uniform(0, 2 * math.pi, 10):
+            out = _ring_interp_with_angles_jit(nside, z, phi)
+            # All 4 neighbours sit on ring 1.
+            for zn in out[8:12]:
+                npt.assert_allclose(zn, z1, atol=1e-14)
+            # Weights sum to 1.
+            assert abs(sum(out[4:8]) - 1.0) < 1e-12
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_south_pole_boundary(self, nside):
+        """Query points below ring 4·nside-1 take the SPC boundary branch."""
+        z_last = _ring_z_jit(nside, 4 * nside - 1)
+        z = max(-1.0, 0.5 * (-1.0 + z_last))
+        rng = np.random.default_rng(1)
+        for phi in rng.uniform(0, 2 * math.pi, 10):
+            out = _ring_interp_with_angles_jit(nside, z, phi)
+            for zn in out[8:12]:
+                npt.assert_allclose(zn, z_last, atol=1e-14)
+            assert abs(sum(out[4:8]) - 1.0) < 1e-12
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_weights_sum_to_one(self, nside):
+        """Bilinear weights always sum to 1 across all regimes."""
+        rng = np.random.default_rng(3)
+        for _ in range(200):
+            theta = rng.uniform(0.01, math.pi - 0.01)
+            phi = rng.uniform(0.0, 2 * math.pi)
+            out = _ring_interp_with_angles_jit(nside, math.cos(theta), phi)
+            npt.assert_allclose(sum(out[4:8]), 1.0, atol=1e-12)
 
 
 # ===========================================================================
