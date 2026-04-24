@@ -189,10 +189,6 @@ def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx
               (axis × angle), shape ``(B, 3)``.
             - **beta** (*numpy.ndarray*) – Polarisation angle offset [rad],
               shape ``(B,)``.  Always in ``[0, 2π)``.
-            - **n_target** (*numpy.ndarray*) – Boresight-frame local north
-              unit vector ``(cosφ cosθ, sinφ cosθ, -sinθ)``, shape ``(B, 3)``.
-              Reused by the spin-2 Q/U correction in the gather-accumulate
-              kernel as the rotation target.
     """
     if center_idx is None:
         center_idx = (ra.shape[0] // 2, ra.shape[1] // 2)
@@ -246,7 +242,7 @@ def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx
     beta = np.arctan2(np.sum(w * E_target, axis=-1), np.sum(w * N_target, axis=-1))
     beta = np.where(beta < 0, beta + 2 * np.pi, beta)
 
-    return rot_vector, beta, N_target
+    return rot_vector, beta
 
 
 def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):

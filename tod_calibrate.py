@@ -67,7 +67,7 @@ def _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=None):
         list[int]: Sorted candidate batch sizes.
     """
     # Adaptive minimum: scale with available memory per process
-    # Heuristic: min_bs ≈ 128 + (memory_gb * 64)
+    # Heuristic: min_bs ≈ 128 + (memory_gb * 32)
     # - 1.5 GB/proc  → ~128–192
     # - 10 GB/proc   → ~1.25K
     # - 100+ GB/proc → ~12.5K+
@@ -75,7 +75,7 @@ def _candidate_batch_sizes(mem_cap, max_memory_per_process_gb=None):
     if max_memory_per_process_gb is None:
         min_bs = 1  # backward compatible: include all powers of 2
     else:
-        min_bs = max(256, int(128 + max_memory_per_process_gb * 64))
+        min_bs = max(256, int(128 + max_memory_per_process_gb * 32))
 
     log_max = int(np.log2(mem_cap)) + 1
     powers = [int(2**k) for k in range(1, log_max + 1)]
@@ -149,7 +149,7 @@ def _calibrate_batch_size(
         for b in range(n_batches):
             s, e = b * bs, min((b + 1) * bs, probe_n)
             phi_b, theta_b, psi_b = phi_p[s:e], theta_p[s:e], psi_p[s:e]
-            rot_vecs, betas, n_target = precompute_rotation_vector_batch(
+            rot_vecs, betas = precompute_rotation_vector_batch(
                 ra0, dec0, phi_b, theta_b
             )
             psis_b = -betas + psi_b
@@ -162,7 +162,6 @@ def _calibrate_batch_size(
                     phi_b,
                     theta_b,
                     psis_b,
-                    n_target,
                     interp_mode=interp_mode,
                 )
         return time.perf_counter() - t0
