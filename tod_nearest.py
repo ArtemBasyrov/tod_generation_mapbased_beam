@@ -15,6 +15,7 @@ from numba_healpy import (
     _ring_z_jit,
 )
 from tod_rotations import _rodrigues_apply_one_jit
+from tod_bilinear import _spin2_cos2d_sin2d_jit
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
@@ -51,10 +52,9 @@ def _gather_accum_nearest_jit(
     cos_a      : (B,)         float32   cos of Rodrigues-1 angle
     sin_a      : (B,)         float32   sin of Rodrigues-1 angle
     ax_pts     : (B, 3)       float32   boresight unit vectors (Rodrigues-2
-                                        axis).  Passed for API consistency
-                                        with the bilinear path; not used for
-                                        Q/U frame correction on the nearest
-                                        path (see bilinear note).
+                                        axis, also used as the spin-2
+                                        query direction for Q/U frame
+                                        correction).
     cos_p      : (B,)         float32   cos of Rodrigues-2 angle (ψ_b − β)
     sin_p      : (B,)         float32   sin of Rodrigues-2 angle
     nside      : int
@@ -67,6 +67,7 @@ def _gather_accum_nearest_jit(
     """
     C = mp_stacked.shape[0]
     npix_total = 12 * nside * nside
+    has_qu = c_q >= 0 and c_u >= 0
 
     for b in numba.prange(B):
         kx = float(axes[b, 0])
@@ -79,6 +80,13 @@ def _gather_accum_nearest_jit(
         bz = float(ax_pts[b, 2])
         cp_ = float(cos_p[b])
         sp_ = float(sin_p[b])
+
+        # Boresight coordinates for spin-2, hoisted out of the s-loop.
+        bz_pts = max(-1.0, min(1.0, bz))
+        bsth_pts = math.sqrt(max(0.0, 1.0 - bz * bz))
+        bphi_pts = math.atan2(by, bx)
+        if bphi_pts < 0.0:
+            bphi_pts += _TWO_PI
 
         for s in range(S):
             vx, vy, vz = _rodrigues_apply_one_jit(
@@ -114,6 +122,8 @@ def _gather_accum_nearest_jit(
 
             best_pix = 0
             best_cos = -2.0
+            best_z_c = 0.0
+            best_phi_c = 0.0
             sin_th = math.sin(theta)
 
             for ir_g in (ir_above, ir_below):
@@ -129,16 +139,22 @@ def _gather_accum_nearest_jit(
                     if cos_d > best_cos:
                         best_cos = cos_d
                         best_pix = first_pix + ip_try
+                        best_z_c = z_c
+                        best_phi_c = phi_c
 
             bv = float(beam_vals[s])
-            if c_q < 0 or c_u < 0:
+            if not has_qu:
                 for c in range(C):
                     tod[c, b] += mp_stacked[c, best_pix] * bv
             else:
+                sth_n = math.sqrt(max(0.0, 1.0 - best_z_c * best_z_c))
+                c2d, s2d = _spin2_cos2d_sin2d_jit(
+                    best_z_c, sth_n, best_phi_c, bz_pts, bsth_pts, bphi_pts
+                )
+                q_val = float(mp_stacked[c_q, best_pix])
+                u_val = float(mp_stacked[c_u, best_pix])
+                tod[c_q, b] += (q_val * c2d + u_val * s2d) * bv
+                tod[c_u, b] += (-q_val * s2d + u_val * c2d) * bv
                 for c in range(C):
                     if c != c_q and c != c_u:
                         tod[c, b] += mp_stacked[c, best_pix] * bv
-                    elif c == c_q:
-                        tod[c_q, b] += float(mp_stacked[c_q, best_pix]) * bv
-                    elif c == c_u:
-                        tod[c_u, b] += float(mp_stacked[c_u, best_pix]) * bv
