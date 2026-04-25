@@ -21,7 +21,10 @@
   # set calibration_enabled: false to force using the cached values below
   calibration_enabled: true
   calibration_n_processes: null
+  calibration_numba_threads: null   # threads per worker (Numba prange).
   calibration_batch_size: null
+  # Hard upper bound on n_processes the calibrator may pick.
+  # Defaults to n_processes above. Set lower if you want to keep cores free.
   # beam grid interpolation method — choose one of:
   #   'nearest'  — single nearest-pixel lookup (fastest, no mixing between pixels)
   #   'bilinear' — 4-pixel bilinear HEALPix interpolation (default, fast Numba kernel)

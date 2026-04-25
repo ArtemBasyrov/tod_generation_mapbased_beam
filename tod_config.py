@@ -27,9 +27,12 @@ end_day = _cfg["end_day"]
 n_processes = _cfg["n_processes"]
 max_memory_per_process = _cfg["max_memory_per_process"]
 
-# Optional calibration cache
+# Optional calibration cache. All three must be set (or calibration_enabled=true)
+# for the run to skip calibration. Users can hand-edit any of these to override
+# the calibrated value.
 calibration_enabled = _cfg.get("calibration_enabled", True)
 calibration_n_processes = _cfg.get("calibration_n_processes", None)
+calibration_numba_threads = _cfg.get("calibration_numba_threads", None)
 calibration_batch_size = _cfg.get("calibration_batch_size", None)
 
 # Beam grid interpolation method

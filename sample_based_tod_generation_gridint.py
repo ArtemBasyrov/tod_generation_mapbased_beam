@@ -10,7 +10,7 @@ import healpy as hp
 import tod_config as config
 from tod_io import load_beam, load_scan_information, open_scan_day
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
-from tod_calibrate import _calibrate_n_processes, calibrate_beam_clustering
+from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
 from tod_utils import (
     _get_ncpus,
     _fmt_time,
@@ -43,7 +43,7 @@ _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
 # ── Pool initialiser ─────────────────────────────────────────────────────────
 
 
-def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
+def _worker_init(beam_data_static, mp_desc, beam_shm_descs, n_threads):
     """
     Called once in each spawned worker process.
 
@@ -62,6 +62,11 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs):
                                for mp_stacked
     """
     global _g_mp, _g_beam_data, _g_shm_handles
+
+    if n_threads is not None and n_threads > 0:
+        import numba
+
+        numba.set_num_threads(int(n_threads))
 
     # Attach to the stacked (3, npix) sky-map block
     shm_mp = SharedMemory(name=mp_desc["name"])
@@ -320,13 +325,14 @@ def _process_day(day_index, batch_size, Nb):
 # ── Calibration cache ─────────────────────────────────────────────────────────
 
 
-def _save_calibration(n_processes, batch_size):
+def _save_calibration(n_processes, n_threads, batch_size):
     """Write calibration results back to the active config file."""
     import yaml
 
     with open(config.CONFIG_FILE) as f:
         raw = yaml.safe_load(f)
     raw["calibration_n_processes"] = int(n_processes)
+    raw["calibration_numba_threads"] = int(n_threads)
     raw["calibration_batch_size"] = int(batch_size)
     raw["calibration_enabled"] = False
     with open(config.CONFIG_FILE, "w") as f:
@@ -340,7 +346,8 @@ def _save_calibration(n_processes, batch_size):
         )
     print(
         f"Calibration saved to {config.CONFIG_FILE} "
-        f"(n_processes={n_processes}, batch_size={batch_size})"
+        f"(n_processes={n_processes}, numba_threads={n_threads}, "
+        f"batch_size={batch_size})"
     )
 
 
@@ -378,219 +385,6 @@ def main(n_cpu_ceiling):
     start = max(start_day or 0, 0)
     end = min(end_day or Nb, Nb)
     days = range(start, end)
-    days = [
-        106,
-        107,
-        108,
-        109,
-        110,
-        111,
-        122,
-        123,
-        124,
-        125,
-        126,
-        127,
-        138,
-        139,
-        140,
-        141,
-        142,
-        143,
-        154,
-        155,
-        156,
-        157,
-        158,
-        159,
-        170,
-        171,
-        172,
-        173,
-        174,
-        175,
-        186,
-        187,
-        188,
-        189,
-        190,
-        191,
-        192,
-        193,
-        194,
-        195,
-        196,
-        197,
-        198,
-        199,
-        200,
-        201,
-        202,
-        203,
-        204,
-        205,
-        206,
-        207,
-        208,
-        209,
-        210,
-        211,
-        212,
-        213,
-        214,
-        215,
-        216,
-        217,
-        218,
-        219,
-        220,
-        221,
-        222,
-        223,
-        224,
-        225,
-        226,
-        227,
-        228,
-        229,
-        230,
-        231,
-        232,
-        233,
-        234,
-        235,
-        236,
-        237,
-        238,
-        239,
-        240,
-        241,
-        242,
-        243,
-        244,
-        245,
-        246,
-        247,
-        248,
-        249,
-        250,
-        251,
-        252,
-        253,
-        254,
-        255,
-        256,
-        257,
-        258,
-        259,
-        260,
-        261,
-        262,
-        263,
-        264,
-        265,
-        266,
-        267,
-        268,
-        269,
-        270,
-        271,
-        272,
-        273,
-        274,
-        275,
-        276,
-        277,
-        278,
-        279,
-        280,
-        281,
-        282,
-        283,
-        284,
-        285,
-        286,
-        287,
-        288,
-        289,
-        290,
-        291,
-        292,
-        293,
-        294,
-        295,
-        296,
-        297,
-        298,
-        299,
-        300,
-        301,
-        302,
-        303,
-        304,
-        305,
-        306,
-        307,
-        308,
-        309,
-        310,
-        311,
-        312,
-        313,
-        314,
-        315,
-        316,
-        317,
-        318,
-        319,
-        320,
-        321,
-        322,
-        323,
-        324,
-        325,
-        326,
-        327,
-        328,
-        329,
-        330,
-        331,
-        332,
-        333,
-        334,
-        335,
-        336,
-        337,
-        338,
-        339,
-        340,
-        341,
-        342,
-        343,
-        344,
-        345,
-        346,
-        347,
-        348,
-        349,
-        350,
-        351,
-        352,
-        353,
-        354,
-        355,
-        356,
-        357,
-        358,
-        359,
-        360,
-        361,
-        362,
-        363,
-        364,
-        365,
-        366,
-    ]
 
     os.makedirs(folder_tod_output, exist_ok=True)
 
@@ -646,24 +440,33 @@ def main(n_cpu_ceiling):
 
     use_cached = not config.calibration_enabled or (
         config.calibration_n_processes is not None
+        and config.calibration_numba_threads is not None
         and config.calibration_batch_size is not None
     )
     if use_cached:
         ncpus = config.calibration_n_processes
+        n_threads = config.calibration_numba_threads
         batch_size = config.calibration_batch_size
-        print(f"Using cached calibration: n_processes={ncpus}, batch_size={batch_size}")
+        print(
+            f"Using cached calibration: n_processes={ncpus}, "
+            f"numba_threads={n_threads}, batch_size={batch_size}"
+        )
     else:
-        print("Calibrating optimal worker count and batch size...")
-        ncpus, batch_size = _calibrate_n_processes(
+        print("Calibrating runtime (n_processes × numba_threads × batch_size)...")
+        ncpus, n_threads, batch_size = calibrate_runtime(
             beam_data,
             folder_scan,
             probe_day=start,
             mp=MP,
             n_cpu_ceiling=n_cpu_ceiling,
+            max_processes_user=config.n_processes,
             interp_mode=interp_mode,
         )
-        _save_calibration(ncpus, batch_size)
-    print(f"Processing days {start}–{end - 1}  ({len(days)} days,  {ncpus} workers)")
+        _save_calibration(ncpus, n_threads, batch_size)
+    print(
+        f"Processing days {start}–{end - 1}  ({len(days)} days,  "
+        f"{ncpus} workers × {n_threads} threads)"
+    )
 
     if ncpus > 1:
         # ── Allocate shared memory ─────────────────────────────────────────
@@ -701,7 +504,7 @@ def main(n_cpu_ceiling):
             with multiprocessing.Pool(
                 processes=ncpus,
                 initializer=_worker_init,
-                initargs=(beam_data_static, mp_desc, beam_shm_descs),
+                initargs=(beam_data_static, mp_desc, beam_shm_descs, n_threads),
             ) as pool:
                 results = pool.map(worker, days)
         finally:
@@ -717,6 +520,10 @@ def main(n_cpu_ceiling):
         for day, _, err in failed:
             print(f"  Day {day} failed: {err}")
     else:
+        if n_threads is not None and n_threads > 0:
+            import numba
+
+            numba.set_num_threads(int(n_threads))
         for day_index in days:
             tod_day = tod_exact_gen_batched(
                 beam_data, day_index, MP, batch_size, process_name="main"
