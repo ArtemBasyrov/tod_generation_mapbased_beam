@@ -25,8 +25,6 @@ power_threshold_U = _cfg["power_fraction_threshold_U"]
 start_day = _cfg["start_day"]
 end_day = _cfg["end_day"]
 n_processes = _cfg["n_processes"]
-max_memory_per_process = _cfg["max_memory_per_process"]
-
 # Optional calibration cache. All three must be set (or calibration_enabled=true)
 # for the run to skip calibration. Users can hand-edit any of these to override
 # the calibrated value.

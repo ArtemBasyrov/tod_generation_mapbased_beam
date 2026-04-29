@@ -1,8 +1,7 @@
 """
 CPU / process count and memory detection for HPC and local environments.
 
-Falls back to `n_processes` / `max_memory_per_process` from config if SLURM
-or psutil are unavailable.
+Falls back to `n_processes` from config if SLURM is unavailable. Requires psutil.
 """
 
 import os
@@ -99,12 +98,6 @@ def _get_memory_per_process(n_processes):
     ``_LOCAL_RAM_FRACTION`` (75 %) of available RAM is used so the rest of the
     system stays responsive.
 
-    Detection priority:
-
-    1. ``psutil`` available memory × fraction ÷ ``n_processes`` (auto-detected).
-    2. ``config.max_memory_per_process`` (explicit fallback when ``psutil`` is
-       unavailable).
-
     Args:
         n_processes (int): Number of worker processes to budget memory for.
 
@@ -124,12 +117,8 @@ def _get_memory_per_process(n_processes):
             f"{n_processes} processes  → {memory_gb:.2f} GB/process  ({env_label})"
         )
         return memory_gb
-    except Exception:
-        pass
-
-    memory_gb = config.max_memory_per_process
-    print(f"[mem] Using {memory_gb} GB/process from config (fallback)")
-    return memory_gb
+    except Exception as exc:
+        raise RuntimeError("psutil is required to determine available memory") from exc
 
 
 def _fmt_time(seconds):

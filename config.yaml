@@ -8,15 +8,14 @@
   beam_file_I: "beam_pixel_map_I.fits"
   beam_file_Q: "beam_pixel_map_Q.fits"
   beam_file_U: "beam_pixel_map_U.fits"
-  power_fraction_threshold_I: 0.99 # threshold for including beam pixels in the convolution
-  power_fraction_threshold_Q: 0.99
-  power_fraction_threshold_U: 0.99
+  power_fraction_threshold_I: 1.00 # threshold for including beam pixels in the convolution
+  power_fraction_threshold_Q: 1.00
+  power_fraction_threshold_U: 1.00
 
   start_day: 0
   end_day: 366
   # multipricessing parameters
   n_processes: 6
-  max_memory_per_process: 1.5 # GB
   # calibration cache — set by the calibration run, disabled on subsequent runs
   # set calibration_enabled: false to force using the cached values below
   calibration_enabled: true
@@ -48,7 +47,7 @@
   # Disable entirely: set n_beam_clusters: null.
   n_beam_clusters: null               # int → enable; null → no clustering
   beam_cluster_tail_fraction: null    # fraction of beam power treated as tail
-  clustering_calibration_enabled: false
+  clustering_calibration_enabled: true
   # Maximum tolerated relative RMS divergence in the beam transfer function
   # B_ell between the clustered and reference (unclustered) beam.  The
   # calibration picks the fastest (tail_fraction, n_clusters) pair whose

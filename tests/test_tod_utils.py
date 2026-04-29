@@ -208,18 +208,6 @@ class TestGetMemoryPerProcess:
         expected = available_gb * 1.0 / n_processes
         npt.assert_allclose(result, expected, rtol=1e-6)
 
-    def test_fallback_when_psutil_unavailable(self):
-        """Falls back to config.max_memory_per_process when psutil is unavailable."""
-        n_processes = 4
-        with patch.dict(sys.modules, {"psutil": None}):
-            import importlib
-            import tod_utils as _tu
-
-            importlib.reload(_tu)
-            result = _tu._get_memory_per_process(n_processes)
-
-        assert result == config.max_memory_per_process
-
 
 # ===========================================================================
 # TestGetNcpus
