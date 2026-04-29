@@ -205,7 +205,13 @@ def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
 # ── TOD generation ────────────────────────────────────────────────────────────
 
 
-def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=None):
+def tod_exact_gen_batched(
+    beam_data,
+    day_index,
+    mp,
+    batch_size,
+    process_name=None,
+):
     """Generate TOD for a single observation day using batched processing.
 
     Opens the scan files as persistent memory-maps (avoiding repeated
@@ -244,7 +250,8 @@ def tod_exact_gen_batched(beam_data, day_index, mp, batch_size, process_name=Non
     n_batches = (n_samples + batch_size - 1) // batch_size
     print(
         prefix
-        + f"Day {day_index} — {n_samples} samples, batch_size={batch_size}, n_batches={n_batches}"
+        + f"Day {day_index} — {n_samples} samples, batch_size={batch_size}, "
+        + f"n_batches={n_batches}"
     )
 
     tod_day = np.zeros((3, n_samples))
@@ -311,7 +318,11 @@ def _process_day(day_index, batch_size, Nb):
     print(f"[{process_name}] Processing day {day_index + 1}/{Nb}")
     try:
         tod_day = tod_exact_gen_batched(
-            _g_beam_data, day_index, _g_mp, batch_size, process_name=process_name
+            _g_beam_data,
+            day_index,
+            _g_mp,
+            batch_size,
+            process_name=process_name,
         )
         output_file = f"{folder_tod_output}tod_day_{day_index}.npy"
         np.save(output_file, tod_day)
@@ -526,7 +537,11 @@ def main(n_cpu_ceiling):
             numba.set_num_threads(int(n_threads))
         for day_index in days:
             tod_day = tod_exact_gen_batched(
-                beam_data, day_index, MP, batch_size, process_name="main"
+                beam_data,
+                day_index,
+                MP,
+                batch_size,
+                process_name="main",
             )
             output_file = f"{folder_tod_output}/tod_day_{day_index}.npy"
             np.save(output_file, tod_day)
