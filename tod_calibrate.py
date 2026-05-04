@@ -120,33 +120,38 @@ def _measure_throughput(
     beam_data,
     ra0,
     dec0,
-    folder_scan,
-    probe_day,
+    phi_full,
+    theta_full,
+    psi_full,
     bs,
     n_threads,
     interp_mode,
     prefix="",
 ):
-    """Set thread count, measure throughput at given batch size."""
+    """Set thread count, measure throughput at given batch size.
+
+    phi_full/theta_full/psi_full must hold _PROBE_MAX_SAMPLES samples
+    (loaded once by the caller); this function slices them.
+    """
     numba.set_num_threads(max(1, n_threads))
 
     # Adapt probe size to target ~_PROBE_TARGET_SECONDS.
     # Use a small pilot to estimate samples/sec, then size the real probe.
     pilot_n = max(bs * 2, 4_000)
-    pilot_n = min(pilot_n, _PROBE_MAX_SAMPLES)
-    phi_p, theta_p, psi_p = _make_probe_data(beam_data, folder_scan, probe_day, pilot_n)
+    pilot_n = min(pilot_n, len(phi_full))
+    phi_p, theta_p, psi_p = phi_full[:pilot_n], theta_full[:pilot_n], psi_full[:pilot_n]
     pilot_t = _run_one(
         nside, mp, beam_data, ra0, dec0, phi_p, theta_p, psi_p, bs, interp_mode
     )
     rate = len(phi_p) / max(pilot_t, 1e-6)
     target_n = int(rate * _PROBE_TARGET_SECONDS)
-    target_n = max(_PROBE_MIN_SAMPLES, min(target_n, _PROBE_MAX_SAMPLES))
+    target_n = max(_PROBE_MIN_SAMPLES, min(target_n, len(phi_full)))
     target_n = max(target_n, bs * 4)  # at least 4 batches
 
     if target_n > len(phi_p):
-        phi_p, theta_p, psi_p = _make_probe_data(
-            beam_data, folder_scan, probe_day, target_n
-        )
+        phi_p = phi_full[:target_n]
+        theta_p = theta_full[:target_n]
+        psi_p = psi_full[:target_n]
 
     # Take the best of 2 short runs to suppress noise.
     best_t = float("inf")
@@ -243,6 +248,11 @@ def calibrate_runtime(
         )
     ref_bs = min(ref_bs, bs_cap_p1)
 
+    # Load probe scan data once — _measure_throughput slices as needed.
+    phi_full, theta_full, psi_full = _make_probe_data(
+        beam_data, folder_scan, probe_day, _PROBE_MAX_SAMPLES
+    )
+
     print(prefix + f"[calibrate] Phase A — sweep threads at B={ref_bs}")
     tp_by_threads = {}
     for t in _thread_candidates(n_cores):
@@ -252,8 +262,9 @@ def calibrate_runtime(
             beam_data,
             ra0,
             dec0,
-            folder_scan,
-            probe_day,
+            phi_full,
+            theta_full,
+            psi_full,
             bs=ref_bs,
             n_threads=t,
             interp_mode=interp_mode,
@@ -293,8 +304,9 @@ def calibrate_runtime(
                     beam_data,
                     ra0,
                     dec0,
-                    folder_scan,
-                    probe_day,
+                    phi_full,
+                    theta_full,
+                    psi_full,
                     bs=b,
                     n_threads=t,
                     interp_mode=interp_mode,
@@ -427,6 +439,19 @@ def calibrate_beam_clustering(
 
     S_bf = {bf: data["n_sel"] for bf, data in beam_data.items()}
 
+    # Pre-compute n_tail for each (beam_file, tail_fraction) to enable
+    # short-circuiting when K_req >= n_tail (no clustering occurs).
+    n_tail_per_bf_tf = {}
+    for bf, data in beam_data.items():
+        bv = data["beam_vals"]
+        n_tail_per_bf_tf[bf] = {}
+        sort_idx = np.argsort(bv)
+        cumsum = np.cumsum(bv[sort_idx])
+        S = len(bv)
+        for tf in tail_fractions:
+            n_tail = int(np.searchsorted(cumsum, tf, side="right"))
+            n_tail_per_bf_tf[bf][tf] = max(1, min(n_tail, S - 1))
+
     print("[clust_calib] Sweeping clustering parameters …")
     results = []
     for tf in tail_fractions:
@@ -434,9 +459,15 @@ def calibrate_beam_clustering(
             K_out_per_bf = {}
             bell_divs = []
             for bf, data in beam_data.items():
+                n_tail = n_tail_per_bf_tf[bf][tf]
+                if K_req >= n_tail:
+                    # Tail already fits in K_req clusters — no reduction possible.
+                    K_out_per_bf[bf] = S_bf[bf]
+                    bell_divs.append(0.0)
+                    continue
                 vec_c, bv_c, _ = cluster_beam_pixels(
-                    data["vec_orig"].copy(),
-                    data["beam_vals"].copy(),
+                    data["vec_orig"],
+                    data["beam_vals"],
                     n_clusters=K_req,
                     tail_fraction=tf,
                     verbose=False,

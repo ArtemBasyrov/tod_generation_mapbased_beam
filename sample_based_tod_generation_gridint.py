@@ -449,11 +449,7 @@ def main(n_cpu_ceiling):
             np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
         )
 
-    use_cached = not config.calibration_enabled or (
-        config.calibration_n_processes is not None
-        and config.calibration_numba_threads is not None
-        and config.calibration_batch_size is not None
-    )
+    use_cached = not config.calibration_enabled
     if use_cached:
         ncpus = config.calibration_n_processes
         n_threads = config.calibration_numba_threads

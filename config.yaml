@@ -47,7 +47,7 @@
   # Disable entirely: set n_beam_clusters: null.
   n_beam_clusters: null               # int → enable; null → no clustering
   beam_cluster_tail_fraction: null    # fraction of beam power treated as tail
-  clustering_calibration_enabled: true
+  clustering_calibration_enabled: false
   # Maximum tolerated relative RMS divergence in the beam transfer function
   # B_ell between the clustered and reference (unclustered) beam.  The
   # calibration picks the fastest (tail_fraction, n_clusters) pair whose
