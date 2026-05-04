@@ -105,13 +105,12 @@ def _gather_accum_nearest_jit(
                 sp_,
             )
 
-            theta = math.atan2(math.sqrt(vx * vx + vy * vy), vz)
-            phi = math.atan2(vy, vx)
-            if phi < 0.0:
-                phi += _TWO_PI
+            phi_w = math.atan2(vy, vx)
+            if phi_w < 0.0:
+                phi_w += _TWO_PI
 
-            z = vz / math.sqrt(vx * vx + vy * vy + vz * vz)  # cos(theta)
-            phi_w = phi
+            z = vz
+            sin_th = math.sqrt(max(0.0, vx * vx + vy * vy))
 
             ir_above = _ring_above_jit(nside, z)
             if ir_above < 1:
@@ -124,7 +123,6 @@ def _gather_accum_nearest_jit(
             best_cos = -2.0
             best_z_c = 0.0
             best_phi_c = 0.0
-            sin_th = math.sin(theta)
 
             for ir_g in (ir_above, ir_below):
                 if ir_g < 1 or ir_g > 4 * nside - 1:

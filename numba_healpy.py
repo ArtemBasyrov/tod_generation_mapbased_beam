@@ -257,7 +257,7 @@ def get_interp_weights_numba(nside, theta, phi):
 
 
 @numba.jit(nopython=True, cache=True)
-def _ring_interp_single_jit(nside, z, phi_w):
+def _ring_interp_single_jit(nside, z, phi_w, npix_total):
     """Bilinear HEALPix RING neighbour lookup for one unit-vector query.
 
     Mirrors the HEALPix C++ ``get_interpol`` algorithm bit-for-bit, including
@@ -267,16 +267,16 @@ def _ring_interp_single_jit(nside, z, phi_w):
 
     Parameters
     ----------
-    nside  : int
-    z      : float   cos θ of the query point, clamped to [−1, 1]
-    phi_w  : float   longitude of the query point in [0, 2π)
+    nside      : int
+    z          : float   cos θ of the query point, clamped to [−1, 1]
+    phi_w      : float   longitude of the query point in [0, 2π)
+    npix_total : int     12 * nside * nside (pre-computed by caller)
 
     Returns
     -------
     p0, p1, p2, p3 : int64    RING pixel indices of the four neighbours
     w0, w1, w2, w3 : float64  bilinear interpolation weights (sum to 1)
     """
-    npix_total = 12 * nside * nside
     ir_above = _ring_above_jit(nside, z)
     ir_below = ir_above + 1
 
@@ -356,7 +356,7 @@ def _ring_interp_single_jit(nside, z, phi_w):
 
 
 @numba.jit(nopython=True, cache=True)
-def _ring_interp_with_angles_jit(nside, z, phi_w):
+def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
     """Bilinear HEALPix RING neighbour lookup, returning neighbour angles too.
 
     Identical math to :func:`_ring_interp_single_jit` but additionally returns
@@ -366,9 +366,10 @@ def _ring_interp_with_angles_jit(nside, z, phi_w):
 
     Parameters
     ----------
-    nside  : int
-    z      : float   cos θ of the query point, clamped to [−1, 1]
-    phi_w  : float   longitude of the query point in [0, 2π)
+    nside      : int
+    z          : float   cos θ of the query point, clamped to [−1, 1]
+    phi_w      : float   longitude of the query point in [0, 2π)
+    npix_total : int     12 * nside * nside (pre-computed by caller)
 
     Returns
     -------
@@ -377,7 +378,6 @@ def _ring_interp_with_angles_jit(nside, z, phi_w):
     z_n0, z_n1, z_n2, z_n3 : float64  cos θ of each neighbour's ring
     phi_n0, phi_n1, phi_n2, phi_n3 : float64  φ of each neighbour [rad]
     """
-    npix_total = 12 * nside * nside
     ir_above = _ring_above_jit(nside, z)
     ir_below = ir_above + 1
 

@@ -136,6 +136,7 @@ def _kmeans_sphere(
     labels = np.empty(S, dtype=np.int32)
     cos_disp = np.full(K, -1.0)  # sentinel: triggers arccos only when needed
 
+    cos_tol = np.cos(tol)
     for iteration in range(max_iter):
         sim = vec @ centroids.T  # (S, K)
         labels = sim.argmax(axis=1).astype(np.int32)
@@ -164,7 +165,7 @@ def _kmeans_sphere(
         cos_disp = np.clip((centroids * new_centroids).sum(axis=1), -1.0, 1.0)
         centroids = new_centroids
 
-        if cos_disp.min() > np.cos(tol):
+        if cos_disp.min() > cos_tol:
             if verbose:
                 max_disp = float(np.arccos(cos_disp).max())
                 print(

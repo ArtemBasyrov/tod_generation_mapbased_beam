@@ -526,8 +526,8 @@ class TestRingInterpWithAnglesJit:
             z = math.cos(theta)
             phi_w = phi % (2 * math.pi)
 
-            out_single = _ring_interp_single_jit(nside, z, phi_w)
-            out_full = _ring_interp_with_angles_jit(nside, z, phi_w)
+            out_single = _ring_interp_single_jit(nside, z, phi_w, 12 * nside * nside)
+            out_full = _ring_interp_with_angles_jit(nside, z, phi_w, 12 * nside * nside)
 
             # pixels (0..3) and weights (4..7) must match bit-for-bit.
             for i in range(8):
@@ -553,7 +553,7 @@ class TestRingInterpWithAnglesJit:
         for theta, phi in zip(thetas, phis):
             z = math.cos(theta)
             phi_w = phi % (2 * math.pi)
-            out = _ring_interp_with_angles_jit(nside, z, phi_w)
+            out = _ring_interp_with_angles_jit(nside, z, phi_w, 12 * nside * nside)
             pixels = out[0:4]
             z_n = out[8:12]
             phi_n = out[12:16]
@@ -580,7 +580,7 @@ class TestRingInterpWithAnglesJit:
         z = min(1.0, 0.5 * (1.0 + z1))
         rng = np.random.default_rng(0)
         for phi in rng.uniform(0, 2 * math.pi, 10):
-            out = _ring_interp_with_angles_jit(nside, z, phi)
+            out = _ring_interp_with_angles_jit(nside, z, phi, 12 * nside * nside)
             # All 4 neighbours sit on ring 1.
             for zn in out[8:12]:
                 npt.assert_allclose(zn, z1, atol=1e-14)
@@ -594,7 +594,7 @@ class TestRingInterpWithAnglesJit:
         z = max(-1.0, 0.5 * (-1.0 + z_last))
         rng = np.random.default_rng(1)
         for phi in rng.uniform(0, 2 * math.pi, 10):
-            out = _ring_interp_with_angles_jit(nside, z, phi)
+            out = _ring_interp_with_angles_jit(nside, z, phi, 12 * nside * nside)
             for zn in out[8:12]:
                 npt.assert_allclose(zn, z_last, atol=1e-14)
             assert abs(sum(out[4:8]) - 1.0) < 1e-12
@@ -606,7 +606,9 @@ class TestRingInterpWithAnglesJit:
         for _ in range(200):
             theta = rng.uniform(0.01, math.pi - 0.01)
             phi = rng.uniform(0.0, 2 * math.pi)
-            out = _ring_interp_with_angles_jit(nside, math.cos(theta), phi)
+            out = _ring_interp_with_angles_jit(
+                nside, math.cos(theta), phi, 12 * nside * nside
+            )
             npt.assert_allclose(sum(out[4:8]), 1.0, atol=1e-12)
 
 

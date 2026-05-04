@@ -274,13 +274,18 @@ def _gather_accum_fused_jit(
     """
     C = mp_stacked.shape[0]
     has_qu = c_q >= 0 and c_u >= 0
+    npix_total = 12 * nside * nside
+
+    # Precompute which channels are neither Q nor U (used in the has_qu path).
+    n_other = 0
+    _other_ch = np.empty(C, dtype=np.int64)
+    for _c in range(C):
+        if _c != c_q and _c != c_u:
+            _other_ch[n_other] = _c
+            n_other += 1
 
     if has_qu:
         for b in numba.prange(B):
-            # Per-b spin-2 cache.  Numba's NRT allocator handles this in
-            # ~100 ns plus the ~3 µs memset.  Allocated once per b now that
-            # the S-tile Python loop is gone — so the cache amortises over
-            # all S beam pixels, not just one tile's worth.
             cache_pix = np.full(_SPIN2_CACHE_SIZE, -1, dtype=np.int64)
             cache_c2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
             cache_s2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
@@ -344,7 +349,7 @@ def _gather_accum_fused_jit(
                     phi_n1,
                     phi_n2,
                     phi_n3,
-                ) = _ring_interp_with_angles_jit(nside, z, phi_w)
+                ) = _ring_interp_with_angles_jit(nside, z, phi_w, npix_total)
 
                 c2d0, s2d0 = _spin2_lookup_cached(
                     p0,
@@ -417,9 +422,8 @@ def _gather_accum_fused_jit(
                     + w3 * (-q3 * s2d3 + u3 * c2d3)
                 ) * bv
 
-                for c in range(C):
-                    if c == c_q or c == c_u:
-                        continue
+                for _oi in range(n_other):
+                    c = _other_ch[_oi]
                     tod[c, b] += (
                         w0 * float(mp_stacked[c, p0])
                         + w1 * float(mp_stacked[c, p1])
@@ -461,7 +465,7 @@ def _gather_accum_fused_jit(
                 if phi_w < 0.0:
                     phi_w += _TWO_PI
                 p0, p1, p2, p3, w0, w1, w2, w3 = _ring_interp_single_jit(
-                    nside, z, phi_w
+                    nside, z, phi_w, npix_total
                 )
                 bv = float(beam_vals[s])
                 for c in range(C):

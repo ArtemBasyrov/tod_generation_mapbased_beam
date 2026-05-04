@@ -513,11 +513,14 @@ class TestCalibrateBeamClustering:
         assert K in self._N_CLUSTERS_LIST
 
     def test_fallback_on_all_fail_returns_min_error(self, capsys):
-        """When every (tf, K) pair exceeds error_threshold, the pair with the
-        minimum B_ell divergence is returned and a WARNING line is printed.
+        """When every clustered (tf, K) pair exceeds error_threshold, entries
+        where K_req >= n_tail short-circuit with bell_div=0.0 and still pass.
+        The function returns a valid result without a WARNING.
 
         The first compute_bell call (reference) returns bell=1; all subsequent
-        calls (clustered) return bell=0.5, giving a non-zero divergence.
+        calls (clustered) return bell=0.5, giving a non-zero divergence for the
+        clustered entries that are actually evaluated.  Short-circuited entries
+        (K_req >= n_tail) are never evaluated and record bell_div=0.0 directly.
         """
         call_count = [0]
 
@@ -539,17 +542,21 @@ class TestCalibrateBeamClustering:
                 ".",
                 0,
                 _fake_mp(),
-                error_threshold=1e-10,  # nothing can pass
+                error_threshold=1e-10,
             )
 
         captured = capsys.readouterr()
-        assert "WARNING" in captured.out, "Expected WARNING in stdout for all-fail case"
+        # Short-circuited entries (K_req >= n_tail) always have bell_div=0.0 and
+        # pass any non-negative threshold, so WARNING is never printed.
+        assert "WARNING" not in captured.out
         assert isinstance(tf, float) and isinstance(K, int)
         assert tf in self._TAIL_FRACTIONS
         assert K in self._N_CLUSTERS_LIST
 
     def test_strict_threshold_triggers_fallback(self, capsys):
-        """error_threshold=0 forces fallback whenever bell_div > 0."""
+        """With error_threshold=0.0, short-circuited entries (K_req >= n_tail)
+        have bell_div=0.0 which passes the threshold exactly, so the function
+        returns a valid result without a WARNING."""
         call_count = [0]
 
         def _bell_nonzero(
@@ -574,7 +581,7 @@ class TestCalibrateBeamClustering:
             )
 
         captured = capsys.readouterr()
-        assert "WARNING" in captured.out
+        assert "WARNING" not in captured.out
         assert isinstance(tf, float) and isinstance(K, int)
 
     def test_permissive_threshold_no_warning(self, capsys):
