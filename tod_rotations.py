@@ -239,8 +239,7 @@ def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx
             pixel in the ``ra``/``dec`` arrays. When ``None`` (default), the
             centre is derived from the array shape as
             ``(ra.shape[0] // 2, ra.shape[1] // 2)``, which matches the
-            convention used by :func:`~tod_io.load_beam` and
-            :mod:`precompute_beam_cache`.
+            convention used by :func:`~tod_io.load_beam`
 
     Returns:
         tuple:
