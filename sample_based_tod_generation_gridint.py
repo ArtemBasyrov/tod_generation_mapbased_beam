@@ -470,13 +470,22 @@ def main(n_cpu_ceiling):
     # all beam-pixel positions within the beam radius.  -1.0 disables it.
     z_skip_threshold = -1.0
     if config.spin2_skip_tolerance and config.spin2_skip_tolerance > 0:
-        # Beam radius: max angular distance from beam-frame +z to any beam pixel,
-        # taken across all beam entries (conservative upper bound).
+        # Beam radius: max angular distance from the beam-frame centre to any
+        # beam pixel.  The centre direction is the beam-weighted mean of
+        # vec_orig (convention-independent: prepare_beam_data places the
+        # centre at +x by construction, but using the weighted mean keeps
+        # this correct under any future change of convention).  Maximum is
+        # taken across all beam entries as a conservative upper bound.
         beam_radius = 0.0
         for _data in beam_data.values():
-            vo = _data["vec_orig"]
-            # vec_orig is the unit vector in the beam frame; +z is the centre.
-            cos_off = np.clip(vo[:, 2].astype(np.float64), -1.0, 1.0)
+            vo = _data["vec_orig"].astype(np.float64)
+            bv = _data["beam_vals"].astype(np.float64)
+            v_centre = (vo * bv[:, None]).sum(axis=0)
+            n = float(np.linalg.norm(v_centre))
+            if n < 1e-12:
+                continue
+            v_centre /= n
+            cos_off = np.clip(vo @ v_centre, -1.0, 1.0)
             r_max = float(np.max(np.arccos(cos_off)))
             if r_max > beam_radius:
                 beam_radius = r_max
