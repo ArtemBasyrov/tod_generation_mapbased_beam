@@ -846,6 +846,216 @@ class TestGatherAccumNearestJit:
         npt.assert_allclose(tod, tod_ref, atol=1e-6)
 
 
+# ===========================================================================
+# TestNearestSpin2Skip
+# ===========================================================================
+
+
+class TestNearestSpin2Skip:
+    """Tests for the spin-2 skip optimisation in _gather_accum_nearest_jit."""
+
+    @staticmethod
+    def _run(
+        vec_orig,
+        axes,
+        cos_a,
+        sin_a,
+        ax_pts,
+        cos_p,
+        sin_p,
+        nside,
+        mp_stacked,
+        beam_vals,
+        B,
+        S,
+        c_q,
+        c_u,
+        z_skip_threshold,
+    ):
+        tod = np.zeros((mp_stacked.shape[0], B), dtype=np.float64)
+        _gather_accum_nearest_jit(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
+            c_q,
+            c_u,
+            float(z_skip_threshold),
+        )
+        return tod
+
+    def test_default_disabled_matches_unoptimised(self):
+        rng = np.random.default_rng(201)
+        nside, B, S = 16, 5, 8
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        tod_default = np.zeros((3, B), dtype=np.float64)
+        _gather_accum_nearest_jit(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod_default,
+            1,
+            2,
+        )
+        tod_explicit = self._run(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            -1.0,
+        )
+        npt.assert_array_equal(tod_default, tod_explicit)
+
+    def test_polar_unaffected_equatorial_skipped(self):
+        """Polar boresights apply spin-2; equatorial boresights skip → match scalar."""
+        rng = np.random.default_rng(202)
+        nside, B, S = 16, 4, 6
+
+        # Equatorial boresights only — |bz| ≤ 0.05.
+        theta = rng.uniform(math.pi / 2 - 0.05, math.pi / 2 + 0.05, B)
+        phi = rng.uniform(0.0, 2 * math.pi, B)
+        ax_pts = np.stack(
+            [np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)],
+            axis=-1,
+        ).astype(np.float32)
+        vec_orig = _random_unit_vec((S, 3), rng)
+        angles_1 = rng.uniform(0.0, math.pi, B).astype(np.float32)
+        axes = _random_unit_vec((B, 3), rng)
+        cos_a = np.cos(angles_1).astype(np.float32)
+        sin_a = np.sin(angles_1).astype(np.float32)
+        angles_2 = rng.uniform(0.0, 2 * math.pi, B).astype(np.float32)
+        cos_p = np.cos(angles_2).astype(np.float32)
+        sin_p = np.sin(angles_2).astype(np.float32)
+
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        # Threshold 0.1 ⇒ all boresights skipped.
+        tod_skip = self._run(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            0.1,
+        )
+        # Reference: scalar (no spin-2) via c_q = c_u = -1.
+        tod_scalar = self._run(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            -1,
+            -1,
+            -1.0,
+        )
+        npt.assert_allclose(tod_skip, tod_scalar, atol=1e-12)
+
+    def test_intensity_channel_unchanged(self):
+        rng = np.random.default_rng(203)
+        nside, B, S = 16, 5, 8
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        tod_skip = self._run(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            0.5,
+        )
+        tod_no_skip = self._run(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            -1.0,
+        )
+        npt.assert_allclose(tod_skip[0], tod_no_skip[0], atol=1e-12)
+
+
 # ---------------------------------------------------------------------------
 # Run directly
 # ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@ from tod_bilinear import (
     _gather_accum_fused_jit,
     _spin2_cos2d_sin2d_jit,
     _spin2_lookup_cached,
+    compute_spin2_skip_z_threshold,
     get_interp_weights_numba,
 )
 from tod_rotations import _rodrigues_jit
@@ -1168,6 +1169,393 @@ class TestGatherAccumFusedJit:
             tod_without,
         )
         npt.assert_allclose(tod_with[0], tod_without[0], atol=1e-12)
+
+
+# ===========================================================================
+# TestSpin2SkipOptimisation
+# ===========================================================================
+
+
+class TestSpin2SkipOptimisation:
+    """Tests for the spin-2 equatorial-band skip optimisation.
+
+    Convention:
+      apply_spin2 = abs(bz) > z_skip_threshold
+      z_skip_threshold = -1.0  → never skip (always apply correction)
+      z_skip_threshold =  1.0  → always skip (never apply correction)
+    """
+
+    @staticmethod
+    def _run_fused(
+        vec_orig,
+        axes,
+        cos_a,
+        sin_a,
+        ax_pts,
+        cos_p,
+        sin_p,
+        nside,
+        mp_stacked,
+        beam_vals,
+        B,
+        S,
+        c_q,
+        c_u,
+        z_skip_threshold,
+    ):
+        tod = np.zeros((mp_stacked.shape[0], B), dtype=np.float64)
+        _gather_accum_fused_jit(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod,
+            c_q,
+            c_u,
+            float(z_skip_threshold),
+        )
+        return tod
+
+    def test_default_disabled_matches_unoptimised(self):
+        """z_skip_threshold = -1.0 (default) is bit-identical to omitting the kwarg."""
+        rng = np.random.default_rng(101)
+        nside, B, S = 16, 6, 10
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        tod_default = np.zeros((3, B), dtype=np.float64)
+        _gather_accum_fused_jit(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            tod_default,
+            1,
+            2,
+        )
+        tod_explicit = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            -1.0,
+        )
+        npt.assert_array_equal(tod_default, tod_explicit)
+
+    def test_skip_all_matches_no_correction(self):
+        """z_skip_threshold ≥ 1 forces apply_spin2 = False everywhere → scalar Q/U."""
+        rng = np.random.default_rng(102)
+        nside, B, S = 16, 6, 10
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        # With c_q = c_u = -1 the kernel never applies spin-2: that's the
+        # reference for "no rotation" Q/U accumulation.  We compare against it
+        # by reading the same map twice (once as I-only for Q's mp index,
+        # once for U) — easier: just compare to the kernel run with c_q/c_u
+        # set but z_skip_threshold = 1.0, vs. the same with the spin-2 disabled
+        # via a separate scalar reference.
+        tod_skip = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            1.0,
+        )
+
+        # Reference: scalar bilinear gather of Q and U (no rotation).
+        # Re-use the kernel but pass c_q = c_u = -1 so it treats Q/U as plain
+        # scalar channels via the no-Q/U fast path.
+        tod_scalar = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            -1,
+            -1,
+            -1.0,
+        )
+        npt.assert_allclose(tod_skip, tod_scalar, atol=1e-12)
+
+    def test_polar_boresight_unaffected_by_skip(self):
+        """For boresights with |bz| > z_skip_threshold the skip is not active."""
+        rng = np.random.default_rng(103)
+        nside, B, S = 16, 5, 8
+        # Force boresights near the north pole: θ ∈ [0.05, 0.2] → cos θ > 0.97
+        theta = rng.uniform(0.05, 0.2, B)
+        phi = rng.uniform(0.0, 2 * math.pi, B)
+        ax_pts = np.stack(
+            [np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)],
+            axis=-1,
+        ).astype(np.float32)
+        # Build the rest of the rotation params with these polar boresights.
+        vec_orig = _random_unit_vec((S, 3), rng)
+        angles_1 = rng.uniform(0.0, math.pi, B).astype(np.float32)
+        axes = _random_unit_vec((B, 3), rng)
+        cos_a = np.cos(angles_1).astype(np.float32)
+        sin_a = np.sin(angles_1).astype(np.float32)
+        angles_2 = rng.uniform(0.0, 2 * math.pi, B).astype(np.float32)
+        cos_p = np.cos(angles_2).astype(np.float32)
+        sin_p = np.sin(angles_2).astype(np.float32)
+
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        # z_skip_threshold = 0.5 — boresights have |cos θ| > 0.97 so all polar.
+        tod_skip = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            0.5,
+        )
+        tod_no_skip = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            -1.0,
+        )
+        npt.assert_allclose(tod_skip, tod_no_skip, atol=1e-12)
+
+    def test_equatorial_boresight_skip_active(self):
+        """For boresights with |bz| ≤ z_skip_threshold the skip is active.
+
+        Compare the kernel run with z_skip_threshold ≥ |bz_max| against the
+        scalar (no spin-2) reference: both should match.
+        """
+        rng = np.random.default_rng(104)
+        nside, B, S = 16, 5, 8
+        # Force boresights near the equator: θ ∈ [π/2 - 0.05, π/2 + 0.05].
+        theta = rng.uniform(math.pi / 2 - 0.05, math.pi / 2 + 0.05, B)
+        phi = rng.uniform(0.0, 2 * math.pi, B)
+        ax_pts = np.stack(
+            [np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)],
+            axis=-1,
+        ).astype(np.float32)
+        vec_orig = _random_unit_vec((S, 3), rng)
+        angles_1 = rng.uniform(0.0, math.pi, B).astype(np.float32)
+        axes = _random_unit_vec((B, 3), rng)
+        cos_a = np.cos(angles_1).astype(np.float32)
+        sin_a = np.sin(angles_1).astype(np.float32)
+        angles_2 = rng.uniform(0.0, 2 * math.pi, B).astype(np.float32)
+        cos_p = np.cos(angles_2).astype(np.float32)
+        sin_p = np.sin(angles_2).astype(np.float32)
+
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        # |bz| ≤ sin(0.05) ≈ 0.05; threshold = 0.1 ⇒ all skipped.
+        tod_skip = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            0.1,
+        )
+        tod_scalar = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            -1,
+            -1,
+            -1.0,
+        )
+        npt.assert_allclose(tod_skip, tod_scalar, atol=1e-12)
+
+    def test_intensity_channel_unchanged(self):
+        """Skip optimisation must not affect the I (non-Q/U) channel."""
+        rng = np.random.default_rng(105)
+        nside, B, S = 16, 5, 8
+        (vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, _) = (
+            _make_beam_and_rot_params(B, S, rng)
+        )
+        mp_stacked = rng.uniform(-1.0, 1.0, (3, hp.nside2npix(nside))).astype(
+            np.float32
+        )
+        beam_vals = rng.uniform(0.1, 1.0, S).astype(np.float32)
+        beam_vals /= beam_vals.sum()
+
+        # Run with skip aggressive (skips half the boresights randomly) and
+        # without skip; I channel must be identical.
+        tod_skip = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            0.5,
+        )
+        tod_no_skip = self._run_fused(
+            vec_orig,
+            axes,
+            cos_a,
+            sin_a,
+            ax_pts,
+            cos_p,
+            sin_p,
+            nside,
+            mp_stacked,
+            beam_vals,
+            B,
+            S,
+            1,
+            2,
+            -1.0,
+        )
+        npt.assert_allclose(tod_skip[0], tod_no_skip[0], atol=1e-12)
+
+
+# ===========================================================================
+# TestComputeSpin2SkipZThreshold
+# ===========================================================================
+
+
+class TestComputeSpin2SkipZThreshold:
+    """Tests for compute_spin2_skip_z_threshold."""
+
+    def test_disabled_when_tol_zero(self):
+        assert compute_spin2_skip_z_threshold(0.01, 0.0) == -1.0
+        assert compute_spin2_skip_z_threshold(0.01, None) == -1.0
+        assert compute_spin2_skip_z_threshold(0.01, -0.5) == -1.0
+
+    def test_zero_beam_radius(self):
+        """Zero-radius beam → no correction needed anywhere → z_threshold = 1."""
+        assert compute_spin2_skip_z_threshold(0.0, 0.01) == 1.0
+
+    def test_threshold_in_range(self):
+        """Returned z_threshold must lie in [-1, 1] and grow with tolerance."""
+        beam_radius = math.radians(1.0)  # ~1° beam
+        z_loose = compute_spin2_skip_z_threshold(beam_radius, 0.1)
+        z_tight = compute_spin2_skip_z_threshold(beam_radius, 0.001)
+        assert -1.0 <= z_tight <= z_loose <= 1.0
+
+    def test_within_tolerance_at_threshold(self):
+        """For boresights at exactly the returned threshold, sampled |2δ| ≤ tol."""
+        beam_radius = math.radians(1.5)
+        tol = 0.02
+        z_thresh = compute_spin2_skip_z_threshold(beam_radius, tol)
+        if z_thresh < 0.0:
+            pytest.skip("threshold disabled for this configuration")
+        # Sample beam-edge offsets at theta_pts = arccos(z_thresh) and check
+        # max |2δ| is below tol.
+        from tod_bilinear import _max_two_delta_at_boresight
+
+        theta_pts = math.acos(z_thresh)
+        max_2d = _max_two_delta_at_boresight(theta_pts, beam_radius, n_az=256)
+        assert max_2d <= tol * 1.05, (
+            f"max |2δ| = {max_2d:.6f} exceeds tol = {tol} (z_thresh={z_thresh:.4f})"
+        )
 
 
 # ---------------------------------------------------------------------------

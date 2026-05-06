@@ -10,6 +10,7 @@ import healpy as hp
 import tod_config as config
 from tod_io import load_beam, load_scan_information, open_scan_day
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
+from tod_bilinear import compute_spin2_skip_z_threshold
 from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
 from tod_utils import (
     _get_ncpus,
@@ -216,6 +217,7 @@ def tod_exact_gen_batched(
     mp,
     batch_size,
     process_name=None,
+    z_skip_threshold=-1.0,
 ):
     """Generate TOD for a single observation day using batched processing.
 
@@ -301,6 +303,7 @@ def tod_exact_gen_batched(
                 theta_b,
                 psis_b,
                 interp_mode=interp_mode,
+                z_skip_threshold=z_skip_threshold,
             )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
@@ -318,7 +321,7 @@ def tod_exact_gen_batched(
 # ── Per-day worker (used by multiprocessing pool) ─────────────────────────────
 
 
-def _process_day(day_index, batch_size, Nb):
+def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0):
     """
     Worker entry point.  beam_data and mp are *not* passed as arguments —
     they live in the module-level globals populated by _worker_init, so no
@@ -333,6 +336,7 @@ def _process_day(day_index, batch_size, Nb):
             _g_mp,
             batch_size,
             process_name=process_name,
+            z_skip_threshold=z_skip_threshold,
         )
         output_file = f"{folder_tod_output}tod_day_{day_index}.npy"
         np.save(output_file, tod_day)
@@ -459,6 +463,42 @@ def main(n_cpu_ceiling):
             np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
         )
 
+    # ── Spin-2 skip threshold ─────────────────────────────────────────────────
+    # When spin2_skip_tolerance is set, derive the cos(θ_pts) cutoff such that
+    # boresights in the equatorial band (|bz| ≤ cutoff) bypass the spin-2 Q/U
+    # rotation, with a worst-case |2δ| bounded by the configured tolerance over
+    # all beam-pixel positions within the beam radius.  -1.0 disables it.
+    z_skip_threshold = -1.0
+    if config.spin2_skip_tolerance and config.spin2_skip_tolerance > 0:
+        # Beam radius: max angular distance from beam-frame +z to any beam pixel,
+        # taken across all beam entries (conservative upper bound).
+        beam_radius = 0.0
+        for _data in beam_data.values():
+            vo = _data["vec_orig"]
+            # vec_orig is the unit vector in the beam frame; +z is the centre.
+            cos_off = np.clip(vo[:, 2].astype(np.float64), -1.0, 1.0)
+            r_max = float(np.max(np.arccos(cos_off)))
+            if r_max > beam_radius:
+                beam_radius = r_max
+        z_skip_threshold = compute_spin2_skip_z_threshold(
+            beam_radius, float(config.spin2_skip_tolerance)
+        )
+        if z_skip_threshold < 0.0:
+            print(
+                f"Spin-2 skip: tolerance={config.spin2_skip_tolerance} too tight "
+                f"for beam_radius={np.degrees(beam_radius):.3f}° — optimisation "
+                f"effectively disabled (no equatorial band)."
+            )
+        else:
+            theta_band_deg = np.degrees(np.arccos(z_skip_threshold))
+            print(
+                f"Spin-2 skip enabled: tol={config.spin2_skip_tolerance}, "
+                f"beam_radius={np.degrees(beam_radius):.3f}°, "
+                f"z_threshold={z_skip_threshold:.6f} "
+                f"(boresight band θ ∈ [{theta_band_deg:.2f}°, "
+                f"{180 - theta_band_deg:.2f}°] bypasses correction)"
+            )
+
     use_cached = not config.calibration_enabled
     if use_cached:
         ncpus = config.calibration_n_processes
@@ -480,6 +520,7 @@ def main(n_cpu_ceiling):
             max_processes_user=config.n_processes,
             interp_mode=interp_mode,
             center_idx=(_cx, _cy) if (_cx is not None and _cy is not None) else None,
+            z_skip_threshold=z_skip_threshold,
         )
         _save_calibration(ncpus, n_threads, batch_size)
     print(
@@ -518,7 +559,12 @@ def main(n_cpu_ceiling):
             for bf, data in beam_data.items()
         }
 
-        worker = partial(_process_day, batch_size=batch_size, Nb=Nb)
+        worker = partial(
+            _process_day,
+            batch_size=batch_size,
+            Nb=Nb,
+            z_skip_threshold=z_skip_threshold,
+        )
         try:
             with multiprocessing.Pool(
                 processes=ncpus,
@@ -550,6 +596,7 @@ def main(n_cpu_ceiling):
                 MP,
                 batch_size,
                 process_name="main",
+                z_skip_threshold=z_skip_threshold,
             )
             output_file = f"{folder_tod_output}/tod_day_{day_index}.npy"
             np.save(output_file, tod_day)

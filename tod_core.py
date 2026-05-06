@@ -58,6 +58,7 @@ def beam_tod_batch(
     theta_b,
     psis_b,
     interp_mode="bilinear",
+    z_skip_threshold=-1.0,
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
 
@@ -88,6 +89,14 @@ def beam_tod_batch(
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
             (``'gaussian'`` and ``'bicubic'`` are available on their respective branches.)
+        z_skip_threshold (float): Per-``b`` spin-2 skip cutoff on
+            ``|cos θ_pts|``.  Boresight samples with
+            ``|bz| > z_skip_threshold`` apply the full Q/U frame correction;
+            samples in the equatorial band (``|bz| <= z_skip_threshold``)
+            bypass it.  ``-1.0`` (default) disables the optimisation —
+            spin-2 is always applied, bit-identical to the un-optimised path.
+            Pass the value returned by
+            :func:`tod_bilinear.compute_spin2_skip_z_threshold` to enable.
 
     Returns:
         dict[int, numpy.ndarray]: Mapping from Stokes component index to a
@@ -143,6 +152,7 @@ def beam_tod_batch(
                 tod_arr,
                 c_q,
                 c_u,
+                float(z_skip_threshold),
             )
         else:
             _gather_accum_fused_jit(
@@ -161,6 +171,7 @@ def beam_tod_batch(
                 tod_arr,
                 c_q,
                 c_u,
+                float(z_skip_threshold),
             )
         return {
             comp: tod_arr[i].astype(np.float32) for i, comp in enumerate(comp_indices)

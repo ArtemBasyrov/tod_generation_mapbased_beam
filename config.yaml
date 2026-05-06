@@ -35,6 +35,14 @@
   # sigma and radius are only used for 'gaussian' and default to 1× and 3× the
   # HEALPix pixel resolution respectively.
   beam_interp_method: 'bilinear'
+  # Spin-2 Q/U correction skip optimisation.
+  # The spin-2 frame rotation is negligible near the equator and grows toward
+  # the poles. With this enabled (tol > 0), the correction is bypassed when
+  # the boresight is in the equatorial band, where the per-sample fractional
+  # Q/U error introduced by skipping is bounded by `spin2_skip_tolerance`.
+  # Set to null or 0 to disable (always apply the correction).
+  # Recommended: 0.01 (1%) — well below typical scan-noise levels.
+  spin2_skip_tolerance: null
   # beam pixel clustering — k-means on the unit sphere to reduce pixel count
   # before TOD generation.  Only the low-power tail is clustered; the main
   # lobe is kept pixel-exact.

@@ -102,6 +102,7 @@ def _run_one(
     bs,
     interp_mode,
     center_idx=None,
+    z_skip_threshold=-1.0,
 ):
     """Run probe at given batch size. Returns wall time."""
     n = len(phi_p)
@@ -124,6 +125,7 @@ def _run_one(
                 theta_b,
                 psis_b,
                 interp_mode=interp_mode,
+                z_skip_threshold=z_skip_threshold,
             )
     return time.perf_counter() - t0
 
@@ -142,6 +144,7 @@ def _measure_throughput(
     interp_mode,
     prefix="",
     center_idx=None,
+    z_skip_threshold=-1.0,
 ):
     """Set thread count, measure throughput at given batch size.
 
@@ -167,6 +170,7 @@ def _measure_throughput(
         bs,
         interp_mode,
         center_idx=center_idx,
+        z_skip_threshold=z_skip_threshold,
     )
     rate = len(phi_p) / max(pilot_t, 1e-6)
     target_n = int(rate * _PROBE_TARGET_SECONDS)
@@ -193,6 +197,7 @@ def _measure_throughput(
             bs,
             interp_mode,
             center_idx=center_idx,
+            z_skip_threshold=z_skip_threshold,
         )
         best_t = min(best_t, t)
     gc.collect()
@@ -240,6 +245,7 @@ def calibrate_runtime(
     interp_mode="bilinear",
     prefix="",
     center_idx=None,
+    z_skip_threshold=-1.0,
 ):
     """Joint (n_processes, numba_threads, batch_size) calibration.
 
@@ -306,6 +312,7 @@ def calibrate_runtime(
             interp_mode=interp_mode,
             prefix=prefix,
             center_idx=center_idx,
+            z_skip_threshold=z_skip_threshold,
         )
         tp_by_threads[t] = tp
 

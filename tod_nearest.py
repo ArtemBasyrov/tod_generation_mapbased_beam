@@ -35,6 +35,7 @@ def _gather_accum_nearest_jit(
     tod,
     c_q=-1,
     c_u=-1,
+    z_skip_threshold=-1.0,
 ):
     """
     Fully fused Rodrigues + HEALPix nearest-pixel lookup + beam accumulation.
@@ -87,6 +88,12 @@ def _gather_accum_nearest_jit(
         bphi_pts = math.atan2(by, bx)
         if bphi_pts < 0.0:
             bphi_pts += _TWO_PI
+
+        # Spin-2 skip: equatorial boresights have negligible Q/U frame
+        # rotation across the beam footprint.  z_skip_threshold = -1.0
+        # disables the optimisation (always apply correction).
+        bz_abs = bz if bz >= 0.0 else -bz
+        apply_spin2 = bz_abs > z_skip_threshold
 
         for s in range(S):
             vx, vy, vz = _rodrigues_apply_one_jit(
@@ -144,7 +151,7 @@ def _gather_accum_nearest_jit(
             if not has_qu:
                 for c in range(C):
                     tod[c, b] += mp_stacked[c, best_pix] * bv
-            else:
+            elif apply_spin2:
                 sth_n = math.sqrt(max(0.0, 1.0 - best_z_c * best_z_c))
                 c2d, s2d = _spin2_cos2d_sin2d_jit(
                     best_z_c, sth_n, best_phi_c, bz_pts, bsth_pts, bphi_pts
@@ -156,3 +163,7 @@ def _gather_accum_nearest_jit(
                 for c in range(C):
                     if c != c_q and c != c_u:
                         tod[c, b] += mp_stacked[c, best_pix] * bv
+            else:
+                # Equatorial boresight: skip spin-2 rotation; scalar Q/U.
+                for c in range(C):
+                    tod[c, b] += mp_stacked[c, best_pix] * bv

@@ -34,8 +34,123 @@ __all__ = (
     "_gather_accum_fused_jit",
     "_spin2_cos2d_sin2d_jit",
     "_spin2_lookup_cached",
+    "compute_spin2_skip_z_threshold",
     "get_interp_weights_numba",
 )
+
+
+def compute_spin2_skip_z_threshold(beam_radius_rad, tol, n_az=128, n_theta=2048):
+    """Largest |cos θ_pts| for which the spin-2 Q/U correction can be skipped.
+
+    The spin-2 correction angle |2δ| between a sky pixel and the boresight
+    grows as the boresight approaches the poles.  Near the equator |2δ| is
+    negligible and skipping the rotation introduces an error
+    ≈ |2δ| · max(|Q|, |U|).  This helper sweeps boresight colatitudes
+    θ_pts ∈ (0, π/2] and finds the largest |z| = |cos θ_pts| at which the
+    worst-case |2δ| over all beam-pixel positions within
+    ``beam_radius_rad`` of the boresight is still below ``tol``.
+
+    The returned value is intended for the kernel's per-``b`` skip test:
+
+        apply_spin2 = abs(bz) > z_skip_threshold
+
+    With this convention the spin-2 lookup runs near the poles (large |bz|)
+    and is bypassed in the equatorial band (small |bz|).  Returning ``-1.0``
+    means the optimisation is disabled — the test never succeeds and the
+    correction is always applied (bit-identical to the un-optimised path).
+
+    Parameters
+    ----------
+    beam_radius_rad : float   maximum angular distance from the boresight to
+                              any beam pixel that can contribute (radians).
+    tol             : float   tolerance on |2δ| in radians; interpreted as a
+                              fractional Q/U accuracy bound (e.g. 0.01 → 1%).
+                              Set ``tol <= 0`` to disable the optimisation.
+    n_az            : int     azimuth samples on the beam-edge ring used to
+                              find the worst-case |2δ| at each boresight.
+    n_theta         : int     boresight colatitude samples between equator
+                              and pole; finer → tighter (closer-to-pole)
+                              threshold within the same tolerance.
+
+    Returns
+    -------
+    z_threshold : float in [-1.0, 1.0]
+        ``-1.0`` when the optimisation is disabled; otherwise the largest
+        ``|cos θ_pts|`` for which |2δ| stays under ``tol``.
+    """
+    import math
+
+    if tol is None or tol <= 0.0:
+        return -1.0
+    if beam_radius_rad <= 0.0:
+        return 1.0  # no beam → no correction needed anywhere
+
+    # Sweep θ_pts from equator (max |z| = 0) toward pole.  Stop when the
+    # worst-case |2δ| crosses ``tol``; the previous (closer-to-equator) θ_pts
+    # is the safest bound.
+    z_threshold = -1.0
+    # Skip the equator point itself (cos θ_pts = 0 → z_threshold = 0 means
+    # a useless test); start one step in.
+    for i in range(1, n_theta + 1):
+        theta_pts = math.pi * 0.5 * (1.0 - i / n_theta)  # → 0 at i = n_theta
+        if theta_pts <= 0.0:
+            break
+        max_2d = _max_two_delta_at_boresight(theta_pts, beam_radius_rad, n_az)
+        if max_2d > tol:
+            break
+        z_threshold = abs(math.cos(theta_pts))
+
+    return z_threshold
+
+
+def _max_two_delta_at_boresight(theta_pts, R, n_az):
+    """Worst-case |2δ| at boresight colatitude ``theta_pts`` over a beam edge ring.
+
+    Samples sky positions at angular distance ``R`` from the boresight on a
+    ring of ``n_az`` azimuths and returns the maximum |2δ|, where
+    2δ is the spin-2 frame-rotation angle returned by
+    :func:`_spin2_cos2d_sin2d_jit`.  Pure-equator boresight (sin θ_pts = 0)
+    is not handled — the caller passes θ_pts > 0 only.
+    """
+    import math
+
+    z_pts = math.cos(theta_pts)
+    sth_pts = math.sin(theta_pts)
+    phi_pts = 0.0  # arbitrary; rotational symmetry in φ
+
+    cos_R = math.cos(R)
+    sin_R = math.sin(R)
+
+    max_two_d = 0.0
+    for i in range(n_az):
+        alpha = 2.0 * math.pi * i / n_az
+        # Spherical destination: from boresight (θ_pts, 0), step R along bearing α.
+        z_pix = cos_R * z_pts + sin_R * sth_pts * math.cos(alpha)
+        if z_pix > 1.0:
+            z_pix = 1.0
+        elif z_pix < -1.0:
+            z_pix = -1.0
+        sth_pix = math.sqrt(max(0.0, 1.0 - z_pix * z_pix))
+        if sth_pix < 1e-12:
+            continue  # destination at pole — δ undefined, skip
+        sin_dphi = sin_R * math.sin(alpha) / sth_pix
+        # cos(Δφ) from spherical-trig: cos(R) = z_pix·z_pts + sth_pix·sth_pts·cos(Δφ)
+        cos_dphi = (cos_R - z_pix * z_pts) / (sth_pix * sth_pts)
+        # Numerical safety
+        if cos_dphi > 1.0:
+            cos_dphi = 1.0
+        elif cos_dphi < -1.0:
+            cos_dphi = -1.0
+        phi_pix = math.atan2(sin_dphi, cos_dphi)
+
+        c2d, s2d = _spin2_cos2d_sin2d_jit(
+            z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts
+        )
+        two_d = abs(math.atan2(s2d, c2d))
+        if two_d > max_two_d:
+            max_two_d = two_d
+
+    return max_two_d
 
 
 @numba.jit(nopython=True, cache=True)
@@ -219,6 +334,7 @@ def _gather_accum_fused_jit(
     tod,
     c_q=-1,
     c_u=-1,
+    z_skip_threshold=-1.0,
 ):
     """Fully fused Rodrigues + HEALPix bilinear gather + spin-2 + accumulation.
 
@@ -286,10 +402,6 @@ def _gather_accum_fused_jit(
 
     if has_qu:
         for b in numba.prange(B):
-            cache_pix = np.full(_SPIN2_CACHE_SIZE, -1, dtype=np.int64)
-            cache_c2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
-            cache_s2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
-
             # Per-b rotation scalars — hoisted out of the inner s-loop.
             kx = float(axes[b, 0])
             ky = float(axes[b, 1])
@@ -302,6 +414,23 @@ def _gather_accum_fused_jit(
             cp_ = float(cos_p[b])
             sp_ = float(sin_p[b])
 
+            # Spin-2 skip test: equatorial boresights (small |bz|) have
+            # negligible Q/U frame rotation across the beam footprint, so the
+            # spin-2 lookup can be bypassed.  z_skip_threshold = -1.0
+            # disables the optimisation (always apply correction).
+            bz_abs = bz if bz >= 0.0 else -bz
+            apply_spin2 = bz_abs > z_skip_threshold
+
+            # Cache only allocated when actually used.  ~24 KiB per active b.
+            if apply_spin2:
+                cache_pix = np.full(_SPIN2_CACHE_SIZE, -1, dtype=np.int64)
+                cache_c2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
+                cache_s2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
+            else:
+                cache_pix = np.empty(0, dtype=np.int64)
+                cache_c2d = np.empty(0, dtype=np.float64)
+                cache_s2d = np.empty(0, dtype=np.float64)
+
             # Boresight (z, sin θ, φ) for spin-2 — computed once per b.
             z_pts = max(-1.0, min(1.0, bz))
             sth_pts = math.sqrt(max(0.0, 1.0 - bz * bz))
@@ -309,127 +438,178 @@ def _gather_accum_fused_jit(
             if phi_pts < 0.0:
                 phi_pts += _TWO_PI
 
-            for s in range(S):
-                # Rodrigues in registers — no (B, S, 3) intermediate.
-                vx, vy, vz = _rodrigues_apply_one_jit(
-                    float(vec_orig[s, 0]),
-                    float(vec_orig[s, 1]),
-                    float(vec_orig[s, 2]),
-                    kx,
-                    ky,
-                    kz,
-                    ca,
-                    sa,
-                    bx,
-                    by,
-                    bz,
-                    cp_,
-                    sp_,
-                )
-                z = max(-1.0, min(1.0, vz))
-                phi_w = math.atan2(vy, vx)
-                if phi_w < 0.0:
-                    phi_w += _TWO_PI
-                bv = float(beam_vals[s])
+            if apply_spin2:
+                for s in range(S):
+                    # Rodrigues in registers — no (B, S, 3) intermediate.
+                    vx, vy, vz = _rodrigues_apply_one_jit(
+                        float(vec_orig[s, 0]),
+                        float(vec_orig[s, 1]),
+                        float(vec_orig[s, 2]),
+                        kx,
+                        ky,
+                        kz,
+                        ca,
+                        sa,
+                        bx,
+                        by,
+                        bz,
+                        cp_,
+                        sp_,
+                    )
+                    z = max(-1.0, min(1.0, vz))
+                    phi_w = math.atan2(vy, vx)
+                    if phi_w < 0.0:
+                        phi_w += _TWO_PI
+                    bv = float(beam_vals[s])
 
-                (
-                    p0,
-                    p1,
-                    p2,
-                    p3,
-                    w0,
-                    w1,
-                    w2,
-                    w3,
-                    z_n0,
-                    z_n1,
-                    z_n2,
-                    z_n3,
-                    phi_n0,
-                    phi_n1,
-                    phi_n2,
-                    phi_n3,
-                ) = _ring_interp_with_angles_jit(nside, z, phi_w, npix_total)
+                    (
+                        p0,
+                        p1,
+                        p2,
+                        p3,
+                        w0,
+                        w1,
+                        w2,
+                        w3,
+                        z_n0,
+                        z_n1,
+                        z_n2,
+                        z_n3,
+                        phi_n0,
+                        phi_n1,
+                        phi_n2,
+                        phi_n3,
+                    ) = _ring_interp_with_angles_jit(nside, z, phi_w, npix_total)
 
-                c2d0, s2d0 = _spin2_lookup_cached(
-                    p0,
-                    z_n0,
-                    phi_n0,
-                    z_pts,
-                    sth_pts,
-                    phi_pts,
-                    cache_pix,
-                    cache_c2d,
-                    cache_s2d,
-                    _SPIN2_CACHE_MASK,
-                )
-                c2d1, s2d1 = _spin2_lookup_cached(
-                    p1,
-                    z_n1,
-                    phi_n1,
-                    z_pts,
-                    sth_pts,
-                    phi_pts,
-                    cache_pix,
-                    cache_c2d,
-                    cache_s2d,
-                    _SPIN2_CACHE_MASK,
-                )
-                c2d2, s2d2 = _spin2_lookup_cached(
-                    p2,
-                    z_n2,
-                    phi_n2,
-                    z_pts,
-                    sth_pts,
-                    phi_pts,
-                    cache_pix,
-                    cache_c2d,
-                    cache_s2d,
-                    _SPIN2_CACHE_MASK,
-                )
-                c2d3, s2d3 = _spin2_lookup_cached(
-                    p3,
-                    z_n3,
-                    phi_n3,
-                    z_pts,
-                    sth_pts,
-                    phi_pts,
-                    cache_pix,
-                    cache_c2d,
-                    cache_s2d,
-                    _SPIN2_CACHE_MASK,
-                )
+                    c2d0, s2d0 = _spin2_lookup_cached(
+                        p0,
+                        z_n0,
+                        phi_n0,
+                        z_pts,
+                        sth_pts,
+                        phi_pts,
+                        cache_pix,
+                        cache_c2d,
+                        cache_s2d,
+                        _SPIN2_CACHE_MASK,
+                    )
+                    c2d1, s2d1 = _spin2_lookup_cached(
+                        p1,
+                        z_n1,
+                        phi_n1,
+                        z_pts,
+                        sth_pts,
+                        phi_pts,
+                        cache_pix,
+                        cache_c2d,
+                        cache_s2d,
+                        _SPIN2_CACHE_MASK,
+                    )
+                    c2d2, s2d2 = _spin2_lookup_cached(
+                        p2,
+                        z_n2,
+                        phi_n2,
+                        z_pts,
+                        sth_pts,
+                        phi_pts,
+                        cache_pix,
+                        cache_c2d,
+                        cache_s2d,
+                        _SPIN2_CACHE_MASK,
+                    )
+                    c2d3, s2d3 = _spin2_lookup_cached(
+                        p3,
+                        z_n3,
+                        phi_n3,
+                        z_pts,
+                        sth_pts,
+                        phi_pts,
+                        cache_pix,
+                        cache_c2d,
+                        cache_s2d,
+                        _SPIN2_CACHE_MASK,
+                    )
 
-                q0 = float(mp_stacked[c_q, p0])
-                u0 = float(mp_stacked[c_u, p0])
-                q1 = float(mp_stacked[c_q, p1])
-                u1 = float(mp_stacked[c_u, p1])
-                q2 = float(mp_stacked[c_q, p2])
-                u2 = float(mp_stacked[c_u, p2])
-                q3 = float(mp_stacked[c_q, p3])
-                u3 = float(mp_stacked[c_u, p3])
+                    q0 = float(mp_stacked[c_q, p0])
+                    u0 = float(mp_stacked[c_u, p0])
+                    q1 = float(mp_stacked[c_q, p1])
+                    u1 = float(mp_stacked[c_u, p1])
+                    q2 = float(mp_stacked[c_q, p2])
+                    u2 = float(mp_stacked[c_u, p2])
+                    q3 = float(mp_stacked[c_q, p3])
+                    u3 = float(mp_stacked[c_u, p3])
 
-                tod[c_q, b] += (
-                    w0 * (q0 * c2d0 + u0 * s2d0)
-                    + w1 * (q1 * c2d1 + u1 * s2d1)
-                    + w2 * (q2 * c2d2 + u2 * s2d2)
-                    + w3 * (q3 * c2d3 + u3 * s2d3)
-                ) * bv
-                tod[c_u, b] += (
-                    w0 * (-q0 * s2d0 + u0 * c2d0)
-                    + w1 * (-q1 * s2d1 + u1 * c2d1)
-                    + w2 * (-q2 * s2d2 + u2 * c2d2)
-                    + w3 * (-q3 * s2d3 + u3 * c2d3)
-                ) * bv
-
-                for _oi in range(n_other):
-                    c = _other_ch[_oi]
-                    tod[c, b] += (
-                        w0 * float(mp_stacked[c, p0])
-                        + w1 * float(mp_stacked[c, p1])
-                        + w2 * float(mp_stacked[c, p2])
-                        + w3 * float(mp_stacked[c, p3])
+                    tod[c_q, b] += (
+                        w0 * (q0 * c2d0 + u0 * s2d0)
+                        + w1 * (q1 * c2d1 + u1 * s2d1)
+                        + w2 * (q2 * c2d2 + u2 * s2d2)
+                        + w3 * (q3 * c2d3 + u3 * s2d3)
                     ) * bv
+                    tod[c_u, b] += (
+                        w0 * (-q0 * s2d0 + u0 * c2d0)
+                        + w1 * (-q1 * s2d1 + u1 * c2d1)
+                        + w2 * (-q2 * s2d2 + u2 * c2d2)
+                        + w3 * (-q3 * s2d3 + u3 * c2d3)
+                    ) * bv
+
+                    for _oi in range(n_other):
+                        c = _other_ch[_oi]
+                        tod[c, b] += (
+                            w0 * float(mp_stacked[c, p0])
+                            + w1 * float(mp_stacked[c, p1])
+                            + w2 * float(mp_stacked[c, p2])
+                            + w3 * float(mp_stacked[c, p3])
+                        ) * bv
+            else:
+                # Equatorial boresight: skip spin-2 rotation.  Q/U accumulate
+                # as scalars, identical to I in the bilinear gather.
+                for s in range(S):
+                    vx, vy, vz = _rodrigues_apply_one_jit(
+                        float(vec_orig[s, 0]),
+                        float(vec_orig[s, 1]),
+                        float(vec_orig[s, 2]),
+                        kx,
+                        ky,
+                        kz,
+                        ca,
+                        sa,
+                        bx,
+                        by,
+                        bz,
+                        cp_,
+                        sp_,
+                    )
+                    z = max(-1.0, min(1.0, vz))
+                    phi_w = math.atan2(vy, vx)
+                    if phi_w < 0.0:
+                        phi_w += _TWO_PI
+                    bv = float(beam_vals[s])
+
+                    p0, p1, p2, p3, w0, w1, w2, w3 = _ring_interp_single_jit(
+                        nside, z, phi_w, npix_total
+                    )
+
+                    tod[c_q, b] += (
+                        w0 * float(mp_stacked[c_q, p0])
+                        + w1 * float(mp_stacked[c_q, p1])
+                        + w2 * float(mp_stacked[c_q, p2])
+                        + w3 * float(mp_stacked[c_q, p3])
+                    ) * bv
+                    tod[c_u, b] += (
+                        w0 * float(mp_stacked[c_u, p0])
+                        + w1 * float(mp_stacked[c_u, p1])
+                        + w2 * float(mp_stacked[c_u, p2])
+                        + w3 * float(mp_stacked[c_u, p3])
+                    ) * bv
+
+                    for _oi in range(n_other):
+                        c = _other_ch[_oi]
+                        tod[c, b] += (
+                            w0 * float(mp_stacked[c, p0])
+                            + w1 * float(mp_stacked[c, p1])
+                            + w2 * float(mp_stacked[c, p2])
+                            + w3 * float(mp_stacked[c, p3])
+                        ) * bv
     else:
         # ── No Q/U: no spin-2 to amortise; skip the cache and go direct.
         for b in numba.prange(B):

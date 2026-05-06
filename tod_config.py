@@ -46,6 +46,13 @@ if _interp_method_raw not in _VALID_INTERP:
     )
 beam_interp_method = _interp_method_raw
 
+# Spin-2 Q/U correction skip optimisation.
+# When > 0, the spin-2 frame rotation is bypassed for boresight samples in the
+# equatorial band, where its angular magnitude is small.  The tolerance is the
+# maximum |2δ| (≈ fractional Q/U error) the optimisation is allowed to introduce.
+# null or 0 → disabled.
+spin2_skip_tolerance = _cfg.get("spin2_skip_tolerance", None)
+
 # Beam pixel clustering (k-means on the unit sphere before TOD generation).
 #
 # n_beam_clusters    : int | None — max clusters for the tail (or all pixels
