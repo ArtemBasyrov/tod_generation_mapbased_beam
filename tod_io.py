@@ -3,18 +3,21 @@ import numpy as np
 from pixell import enmap
 
 
-def load_beam(folder_beam, filename):
+def load_beam(folder_beam, filename, center_x=None, center_y=None):
     """Load a beam map and return RA/Dec offsets and pixel amplitudes.
 
     Reads a pixell/enmap FITS beam map, extracts the WCS-based sky coordinates,
-    and returns them as offsets relative to the beam centre pixel (the grid
-    centre, computed as ``(H // 2, W // 2)`` from the map shape ``(H, W)``).
+    and returns them as offsets relative to the beam centre pixel.
 
     Args:
         folder_beam (str): Path to the directory containing beam FITS files.
             Must end with a path separator.
         filename (str): Filename of the beam FITS file relative to
             ``folder_beam``.
+        center_x (int or None): Row index of the beam centre pixel in the
+            matrix. When ``None`` (default), ``H // 2`` is used.
+        center_y (int or None): Column index of the beam centre pixel in the
+            matrix. When ``None`` (default), ``W // 2`` is used.
 
     Returns:
         tuple:
@@ -29,7 +32,9 @@ def load_beam(folder_beam, filename):
     ra, dec = beam_map.posmap()
     ra = np.array(ra)
     dec = np.array(dec)
-    center_idx = (ra.shape[0] // 2, ra.shape[1] // 2)
+    cx = center_x if center_x is not None else ra.shape[0] // 2
+    cy = center_y if center_y is not None else ra.shape[1] // 2
+    center_idx = (cx, cy)
     ra = ra - ra[center_idx]
     dec = dec - dec[center_idx]
     pixel_map = np.array(beam_map[0])

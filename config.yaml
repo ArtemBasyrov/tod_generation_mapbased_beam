@@ -11,6 +11,10 @@
   power_fraction_threshold_I: 1.00 # threshold for including beam pixels in the convolution
   power_fraction_threshold_Q: 1.00
   power_fraction_threshold_U: 1.00
+  # Row (x) and column (y) index of the beam centre pixel in the beam matrix.
+  # null → use H // 2 and W // 2 (centre of the array).
+  beam_center_x: null
+  beam_center_y: null
 
   start_day: 0
   end_day: 366

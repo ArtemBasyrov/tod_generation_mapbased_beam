@@ -46,7 +46,12 @@ def _prepare_beam_data():
 
     beam_data = {}
     for bf, comp_indices in beam_groups.items():
-        ra, dec, pixel_map = load_beam(config.FOLDER_BEAM, bf)
+        ra, dec, pixel_map = load_beam(
+            config.FOLDER_BEAM,
+            bf,
+            center_x=config.beam_center_x,
+            center_y=config.beam_center_y,
+        )
         db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
         sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
         beam_vals = pixel_map[sel].astype(np.float32)
@@ -207,6 +212,7 @@ def main():
         print(
             "Running runtime calibration (n_processes × numba_threads × batch_size)..."
         )
+        _cx, _cy = config.beam_center_x, config.beam_center_y
         n_processes, n_threads, batch_size = calibrate_runtime(
             beam_data,
             config.FOLDER_SCAN,
@@ -215,6 +221,7 @@ def main():
             n_cpu_ceiling=n_cpu_ceiling,
             max_processes_user=config.n_processes,
             interp_mode=config.beam_interp_method,
+            center_idx=(_cx, _cy) if (_cx is not None and _cy is not None) else None,
         )
         _save_runtime_calibration(n_processes, n_threads, batch_size)
 

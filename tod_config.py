@@ -77,3 +77,8 @@ clustering_error_threshold = _cfg.get("clustering_error_threshold", 1e-3)
 # 'fork': faster worker startup on Linux (Numba cache already compiled); may cause
 #         deadlocks on macOS with some system libraries.
 mp_start_method = _cfg.get("mp_start_method", "spawn")
+
+# Beam centre coordinates (row index, column index) in the beam matrix.
+# None → use H // 2 and W // 2 (centre of the array).
+beam_center_x = _cfg.get("beam_center_x", None)
+beam_center_y = _cfg.get("beam_center_y", None)

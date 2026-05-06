@@ -126,7 +126,12 @@ def prepare_beam_data(beam_filenames):
 
     beam_data = {}
     for bf, comp_indices in beam_groups.items():
-        ra, dec, pixel_map = load_beam(folder_beam, bf)
+        ra, dec, pixel_map = load_beam(
+            folder_beam,
+            bf,
+            center_x=config.beam_center_x,
+            center_y=config.beam_center_y,
+        )
 
         db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
         sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
@@ -246,6 +251,9 @@ def tod_exact_gen_batched(
     first_bf = next(iter(beam_data))
     ra0, dec0 = beam_data[first_bf]["ra"], beam_data[first_bf]["dec"]
 
+    _cx, _cy = config.beam_center_x, config.beam_center_y
+    beam_center_idx = (_cx, _cy) if (_cx is not None and _cy is not None) else None
+
     batch_size = max(1, min(batch_size, n_samples))
     n_batches = (n_samples + batch_size - 1) // batch_size
     print(
@@ -277,7 +285,9 @@ def tod_exact_gen_batched(
         theta_b = np.array(theta_mmap[bs:be], dtype=np.float32)
         phi_b = np.array(phi_mmap[bs:be], dtype=np.float32)
         psi_b = np.array(psi_mmap[bs:be], dtype=np.float32)
-        rot_vecs, betas = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
+        rot_vecs, betas = precompute_rotation_vector_batch(
+            ra0, dec0, phi_b, theta_b, center_idx=beam_center_idx
+        )
         psis_b = -betas + psi_b
 
         tod_batch = np.zeros((3, be - bs))
@@ -460,6 +470,7 @@ def main(n_cpu_ceiling):
         )
     else:
         print("Calibrating runtime (n_processes × numba_threads × batch_size)...")
+        _cx, _cy = config.beam_center_x, config.beam_center_y
         ncpus, n_threads, batch_size = calibrate_runtime(
             beam_data,
             folder_scan,
@@ -468,6 +479,7 @@ def main(n_cpu_ceiling):
             n_cpu_ceiling=n_cpu_ceiling,
             max_processes_user=config.n_processes,
             interp_mode=interp_mode,
+            center_idx=(_cx, _cy) if (_cx is not None and _cy is not None) else None,
         )
         _save_calibration(ncpus, n_threads, batch_size)
     print(

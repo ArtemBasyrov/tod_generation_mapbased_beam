@@ -90,7 +90,19 @@ def _make_probe_data(beam_data, folder_scan, probe_day, n_samples):
     return phi_p[:n], theta_p[:n], psi_p[:n]
 
 
-def _run_one(nside, mp, beam_data, ra0, dec0, phi_p, theta_p, psi_p, bs, interp_mode):
+def _run_one(
+    nside,
+    mp,
+    beam_data,
+    ra0,
+    dec0,
+    phi_p,
+    theta_p,
+    psi_p,
+    bs,
+    interp_mode,
+    center_idx=None,
+):
     """Run probe at given batch size. Returns wall time."""
     n = len(phi_p)
     n_batches = (n + bs - 1) // bs
@@ -98,7 +110,9 @@ def _run_one(nside, mp, beam_data, ra0, dec0, phi_p, theta_p, psi_p, bs, interp_
     for b in range(n_batches):
         s, e = b * bs, min((b + 1) * bs, n)
         phi_b, theta_b, psi_b = phi_p[s:e], theta_p[s:e], psi_p[s:e]
-        rot_vecs, betas = precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b)
+        rot_vecs, betas = precompute_rotation_vector_batch(
+            ra0, dec0, phi_b, theta_b, center_idx=center_idx
+        )
         psis_b = -betas + psi_b
         for data in beam_data.values():
             beam_tod_batch(
@@ -127,6 +141,7 @@ def _measure_throughput(
     n_threads,
     interp_mode,
     prefix="",
+    center_idx=None,
 ):
     """Set thread count, measure throughput at given batch size.
 
@@ -141,7 +156,17 @@ def _measure_throughput(
     pilot_n = min(pilot_n, len(phi_full))
     phi_p, theta_p, psi_p = phi_full[:pilot_n], theta_full[:pilot_n], psi_full[:pilot_n]
     pilot_t = _run_one(
-        nside, mp, beam_data, ra0, dec0, phi_p, theta_p, psi_p, bs, interp_mode
+        nside,
+        mp,
+        beam_data,
+        ra0,
+        dec0,
+        phi_p,
+        theta_p,
+        psi_p,
+        bs,
+        interp_mode,
+        center_idx=center_idx,
     )
     rate = len(phi_p) / max(pilot_t, 1e-6)
     target_n = int(rate * _PROBE_TARGET_SECONDS)
@@ -157,7 +182,17 @@ def _measure_throughput(
     best_t = float("inf")
     for _ in range(2):
         t = _run_one(
-            nside, mp, beam_data, ra0, dec0, phi_p, theta_p, psi_p, bs, interp_mode
+            nside,
+            mp,
+            beam_data,
+            ra0,
+            dec0,
+            phi_p,
+            theta_p,
+            psi_p,
+            bs,
+            interp_mode,
+            center_idx=center_idx,
         )
         best_t = min(best_t, t)
     gc.collect()
@@ -204,6 +239,7 @@ def calibrate_runtime(
     max_processes_user,
     interp_mode="bilinear",
     prefix="",
+    center_idx=None,
 ):
     """Joint (n_processes, numba_threads, batch_size) calibration.
 
@@ -269,6 +305,7 @@ def calibrate_runtime(
             n_threads=t,
             interp_mode=interp_mode,
             prefix=prefix,
+            center_idx=center_idx,
         )
         tp_by_threads[t] = tp
 
@@ -311,6 +348,7 @@ def calibrate_runtime(
                     n_threads=t,
                     interp_mode=interp_mode,
                     prefix=prefix,
+                    center_idx=center_idx,
                 )
             tp_at_bs[(t, b)] = tp
             if tp > best_tp:
