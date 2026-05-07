@@ -50,6 +50,7 @@ from numba_healpy import (
     _ang2pix_ring_jit,
     _ring_interp_single_jit,
     _ring_interp_with_angles_jit,
+    _gather_ring_stencil_jit,
 )
 
 
@@ -1097,6 +1098,89 @@ class TestAng2PixRingJit:
         assert p == p_hp, (
             f"nside={nside}: expected healpy pix {p_hp} near south pole, got {p}"
         )
+
+
+# ===========================================================================
+# TestGatherRingStencilJit
+# ===========================================================================
+
+
+class TestGatherRingStencilJit:
+    """Tests for _gather_ring_stencil_jit (Keys/Catmull-Rom bicubic stencil gather).
+
+    Contract:
+      - Returns M = number of pixel indices written into out_buf[:M].
+      - For typical (nside ≥ 2) queries with the central ring well inside
+        the equatorial belt, M == 7 rings × 5 phi pixels = 35.
+      - All gathered pixel indices are valid (0 ≤ pix < npix).
+      - Each (z_buf[k], phi_buf[k]) entry agrees with hp.pix2ang for the
+        corresponding pixel (this is the "no second pass" invariant the
+        function exists to maintain).
+    """
+
+    def _empty_buffers(self, size=64):
+        return (
+            np.zeros(size, dtype=np.int64),
+            np.zeros(size, dtype=np.float64),
+            np.zeros(size, dtype=np.float64),
+        )
+
+    @pytest.mark.parametrize("nside", [16, 64])
+    def test_pixels_match_hp_pix2ang(self, nside):
+        """Gathered (z, phi) per pixel matches healpy.pix2ang(nside, pix)."""
+        # Equatorial query (z = 0, phi = π/2).
+        out_buf, z_buf, phi_buf = self._empty_buffers()
+        M = _gather_ring_stencil_jit(
+            nside, vz=0.0, ph=math.pi / 2, out_buf=out_buf, z_buf=z_buf, phi_buf=phi_buf
+        )
+        assert M > 0
+        npix = 12 * nside * nside
+        for k in range(M):
+            p = int(out_buf[k])
+            assert 0 <= p < npix
+            theta_hp, phi_hp = hp.pix2ang(nside, p)
+            npt.assert_allclose(z_buf[k], math.cos(theta_hp), atol=1e-12)
+            # phi may differ by 0 or 2π (helper uses [0, 2π), healpy uses
+            # the same convention) — compare modulo 2π via a complex form.
+            ang_diff = (phi_buf[k] - phi_hp) % (2 * math.pi)
+            assert ang_diff < 1e-12 or 2 * math.pi - ang_diff < 1e-12
+
+    @pytest.mark.parametrize("nside", [16, 64])
+    def test_equatorial_gathers_full_stencil(self, nside):
+        """At an equatorial query, the 7×5 stencil is fully populated (M = 35)."""
+        out_buf, z_buf, phi_buf = self._empty_buffers()
+        M = _gather_ring_stencil_jit(
+            nside, vz=0.0, ph=math.pi / 2, out_buf=out_buf, z_buf=z_buf, phi_buf=phi_buf
+        )
+        # 7 rings × 5 phi pixels each.
+        assert M == 35
+
+    def test_polar_cap_query_returns_valid_indices(self):
+        """Near the north pole the stencil clips at ir=1; M is positive but
+        the gathered pixel indices are still valid."""
+        nside = 16
+        out_buf, z_buf, phi_buf = self._empty_buffers()
+        # vz close to 1 → very close to the pole.
+        M = _gather_ring_stencil_jit(
+            nside, vz=0.9999, ph=0.0, out_buf=out_buf, z_buf=z_buf, phi_buf=phi_buf
+        )
+        npix = 12 * nside * nside
+        assert M > 0
+        for k in range(M):
+            assert 0 <= int(out_buf[k]) < npix
+
+    def test_short_polar_ring_includes_all_pixels(self):
+        """When ir = 1 the ring has 4 pixels; the helper includes them all
+        (avoids modulo-induced duplicates)."""
+        nside = 16
+        out_buf, z_buf, phi_buf = self._empty_buffers()
+        M = _gather_ring_stencil_jit(
+            nside, vz=0.99999, ph=1.0, out_buf=out_buf, z_buf=z_buf, phi_buf=phi_buf
+        )
+        # ir=1 contributes its 4 pixels; subsequent rings contribute up to
+        # 5 each. No duplicate pixel indices either way.
+        seen = set(int(out_buf[k]) for k in range(M))
+        assert len(seen) == M
 
 
 # ---------------------------------------------------------------------------

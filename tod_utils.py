@@ -1,13 +1,27 @@
 """
-CPU / process count and memory detection for HPC and local environments.
+CPU / process count, memory detection, and progress utilities for HPC and
+local environments.
 
-Falls back to `n_processes` from config if SLURM is unavailable. Requires psutil.
+Falls back to ``n_processes`` from config if SLURM is unavailable. Requires
+psutil.
 """
 
 import os
-import multiprocessing
 import tod_config as config
-import numpy as np
+
+
+# Fraction of available RAM reserved for the OS and other user processes
+# when running locally. On a cluster the job owns the node, so we use 1.0.
+_LOCAL_RAM_FRACTION = 0.75
+
+# HPC scheduler env vars whose presence indicates a batch/cluster job.
+_CLUSTER_ENV_VARS = (
+    "SLURM_JOB_ID",
+    "PBS_JOBID",
+    "LSB_JOBID",
+    "SGE_TASK_ID",
+    "SLURM_CPUS_PER_TASK",
+)
 
 
 def _cpu_ceiling():
@@ -40,6 +54,11 @@ def _cpu_ceiling():
     return os.cpu_count() or config.n_processes
 
 
+def _is_cluster():
+    """Return True when running inside a recognised HPC batch scheduler."""
+    return any(os.environ.get(v) for v in _CLUSTER_ENV_VARS)
+
+
 def _get_ncpus():
     """Return the CPU ceiling for this job.
 
@@ -48,7 +67,7 @@ def _get_ncpus():
     capped at ``config.n_processes`` to keep the machine responsive.
 
     The actual number of worker processes to launch is determined later by
-    :func:`~tod_calibrate._calibrate_n_processes`, which balances CPU count
+    :func:`~tod_calibrate.calibrate_runtime`, which balances CPU count
     against per-process memory to maximise total throughput.
 
     Returns:
@@ -69,25 +88,6 @@ def _get_ncpus():
         )
 
     return n_cpu
-
-
-# Fraction of available RAM reserved for the OS and other user processes
-# when running locally. On a cluster the job owns the node, so we use 1.0.
-_LOCAL_RAM_FRACTION = 0.75
-
-# HPC scheduler env vars whose presence indicates a batch/cluster job.
-_CLUSTER_ENV_VARS = (
-    "SLURM_JOB_ID",
-    "PBS_JOBID",
-    "LSB_JOBID",
-    "SGE_TASK_ID",
-    "SLURM_CPUS_PER_TASK",
-)
-
-
-def _is_cluster():
-    """Return True when running inside a recognised HPC batch scheduler."""
-    return any(os.environ.get(v) for v in _CLUSTER_ENV_VARS)
 
 
 def _get_memory_per_process(n_processes):
@@ -142,156 +142,3 @@ def _should_print_batch(batch_idx, n_batches, max_prints=100):
         return True
     step = n_batches // max_prints
     return batch_idx % step == 0
-
-
-def compute_bell(
-    ra, dec, pixel_map, lmax=1000, power_cut=0.99, normalise=True, verbose=True
-):
-    """Compute the effective beam transfer function B_ell from a pixelised beam.
-
-    Evaluates
-
-        B_ell = sum_i [ w_i * P_ell(cos θ_i) ]
-
-    where ``w_i`` are the normalised beam weights, ``θ_i`` is the angular
-    distance of pixel *i* from the beam centre, and ``P_ell`` are Legendre
-    polynomials computed via the three-term recurrence (O(N) memory).
-
-    The beam centre is taken to be the point with zero offset, i.e.
-    ``ra_offset = 0, dec_offset = 0``, and the angular distance to each
-    pixel is
-
-        cos θ_i = cos(dec_i) * cos(ra_i)
-
-    which is the standard haversine approximation for small-angle offsets.
-
-    Args:
-        ra (array-like): RA offsets from beam centre [rad].  Can be any
-            shape; flattened internally.
-        dec (array-like): Dec offsets from beam centre [rad].  Same shape
-            as ``ra``.
-        pixel_map (array-like): Beam power values (linear, **not** dB).
-            Same shape as ``ra`` and ``dec``.
-        lmax (int): Maximum multipole ℓ (inclusive).
-        power_cut (float): Fraction of total power for hard pixel selection.
-            ``1.0`` selects all pixels (fast path, no sorting needed).
-        normalise (bool): If ``True`` (default) normalise so that B_0 = 1.
-        verbose (bool): Print selection and pixel-count diagnostics.
-
-    Returns:
-        tuple[numpy.ndarray, numpy.ndarray]:
-            - **ell**  – integer array ``[0, 1, …, lmax]``
-            - **bell** – float64 array of B_ell values, length ``lmax + 1``
-    """
-    pixel_map = np.asarray(pixel_map, dtype=np.float64)
-    ra = np.asarray(ra, dtype=np.float64).ravel()
-    dec = np.asarray(dec, dtype=np.float64).ravel()
-    flat = pixel_map.ravel()
-
-    # ── 1. Pixel selection ────────────────────────────────────────────────────
-    if power_cut >= 1.0:
-        # Fast path: include all pixels, skip the O(N log N) threshold sort.
-        sel = np.ones(flat.shape, dtype=bool)
-        if verbose:
-            print(f"  power_cut=1.0: selecting all {len(flat)} pixels")
-    else:
-        dB_cut = _compute_dB_threshold_from_power(flat, power_cut)
-        log_map = 10.0 * np.log10(np.abs(flat) + 1e-30)
-        sel = log_map > dB_cut
-        if verbose:
-            print(
-                f"  power_cut={power_cut}: "
-                f"{np.sum(sel)}/{len(flat)} pixels selected "
-                f"(dB_cut={dB_cut:.2f})"
-            )
-
-    if not np.any(sel):
-        raise ValueError(
-            "No pixels survive the power-cut selection. "
-            "Check that pixel_map is in linear (not dB) units."
-        )
-
-    beam_vals = flat[sel]
-    ra_sel = ra[sel]
-    dec_sel = dec[sel]
-
-    # ── 2. Normalise ──────────────────────────────────────────────────────────
-    norm = beam_vals.sum()
-    if norm <= 0:
-        raise ValueError("Sum of beam values is non-positive after selection.")
-    beam_vals = beam_vals / norm
-
-    # ── 3. Angular distance cos θ from beam centre ────────────────────────────
-    cos_theta = np.cos(dec_sel) * np.cos(ra_sel)
-    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-
-    # ── 4. Legendre recurrence ────────────────────────────────────────────────
-    N = len(cos_theta)
-    bell = np.empty(lmax + 1, dtype=np.float64)
-
-    P_prev2 = np.ones(N, dtype=np.float64)  # P_0 = 1
-    P_prev1 = cos_theta.copy()  # P_1 = x
-
-    bell[0] = np.dot(beam_vals, P_prev2)
-    if lmax >= 1:
-        bell[1] = np.dot(beam_vals, P_prev1)
-
-    for ell_idx in range(1, lmax):
-        l = float(ell_idx)
-        P_curr = ((2.0 * l + 1.0) * cos_theta * P_prev1 - l * P_prev2) / (l + 1.0)
-        bell[ell_idx + 1] = np.dot(beam_vals, P_curr)
-        P_prev2 = P_prev1
-        P_prev1 = P_curr
-
-    # ── 5. Normalise B_0 = 1 ─────────────────────────────────────────────────
-    if normalise and bell[0] != 0.0:
-        bell /= bell[0]
-
-    ell = np.arange(lmax + 1, dtype=np.int64)
-    return ell, np.abs(bell)
-
-
-def _compute_dB_threshold_from_power(beam_vals, power_cut):
-    """Compute the dB threshold that retains a given fraction of total beam power.
-
-    Finds the dB level such that the sum of all pixel amplitudes whose dB value
-    exceeds that level equals ``power_cut × total_power``. Used to select the
-    smallest set of beam pixels that accounts for the requested power fraction.
-
-    Args:
-        beam_vals (numpy.ndarray): Beam pixel amplitude values (linear, not dB).
-            Can be any shape; flattened internally.
-        power_cut (float): Fraction of total power to retain, e.g. ``0.99`` to
-            keep 99 % of the beam power.
-
-    Returns:
-        float: dB threshold. Pixels whose ``10 log10(|val|)`` exceeds this
-            value collectively contribute ``≈ power_cut × total_power``.
-    """
-    # Flatten and ensure array
-    prof = np.asarray(beam_vals).flatten()
-
-    # Calculate target power
-    target_power = np.sum(prof) * power_cut
-
-    # Convert to dB
-    prof_dB = 10 * np.log10(prof)
-
-    # Sort by dB values and get corresponding linear values
-    sort_idx = np.argsort(prof_dB)
-    sorted_dB = prof_dB[sort_idx]
-    sorted_prof = prof[sort_idx]
-
-    # Calculate cumulative sum from highest to lowest (reverse order)
-    # This gives the sum of all pixels with dB >= threshold
-    cumulative_sums = np.cumsum(sorted_prof[::-1])[::-1]
-
-    # Find last index where retained power >= target_power.
-    # cumulative_sums is decreasing; flip to ascending for searchsorted.
-    # searchsorted returns the first position in the reversed array where
-    # cumulative_sums >= target_power; convert back to original index.
-    rev_idx = np.searchsorted(cumulative_sums[::-1], target_power, side="left")
-    idx = max(0, len(cumulative_sums) - 1 - rev_idx)
-
-    # Return the threshold value
-    return sorted_dB[idx]

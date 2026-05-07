@@ -15,7 +15,7 @@ from numba_healpy import (
     _ring_z_jit,
 )
 from tod_rotations import _rodrigues_apply_one_jit
-from tod_bilinear import _spin2_cos2d_sin2d_jit
+from tod_spin2 import _spin2_cos2d_sin2d_jit
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)

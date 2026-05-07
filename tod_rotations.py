@@ -11,9 +11,6 @@ _rodrigues_apply_one_jit    — scalar per-(b, s) version: takes one input vecto
                               to be inlined into gather kernels so the
                               (B, S, 3) intermediate is never materialised.
 
-_spin2_rodrigues_cos2d_sin2d — cos(2δ) and sin(2δ) for spin-2 frame rotation via
-                               inlined Rodrigues parallel transport.
-
 Public numpy functions
 ----------------------
 precompute_rotation_vector_batch — Rodrigues rotation vectors and pol. angle offsets
@@ -132,85 +129,6 @@ def _rodrigues_apply_one_jit(
     vy = ry * cp_ + (pz * rx - px * rz) * sp_ + py * dpr * omp
     vz = rz * cp_ + (px * ry - py * rx) * sp_ + pz * dpr * omp
     return vx, vy, vz
-
-
-@numba.jit(nopython=True, cache=True)
-def _spin2_rodrigues_cos2d_sin2d(
-    ri_x,
-    ri_y,
-    ri_z,
-    ni_x,
-    ni_y,
-    ni_z,
-    rq_x,
-    rq_y,
-    rq_z,
-    nq_x,
-    nq_y,
-    nq_z,
-):
-    """Compute cos(2δ) and sin(2δ) for spin-2 frame rotation.
-
-    Uses inlined Rodrigues parallel transport with the double-angle trick
-    to avoid both sqrt and atan2.  δ is the angle by which the local-north
-    frame at neighbour (ri) rotates when parallel-transported along the
-    geodesic to query point (rq).
-
-    Unnormalised Rodrigues formula (valid for non-antipodal pairs):
-        v = r̂_i × r̂_q
-        c = r̂_i · r̂_q
-        t = n_i·c + (v × n_i) + v·(v·n_i)/(1+c)
-
-    Then cos(δ) = t · ê_θ(q), sin(δ) = (ê_θ(q) × t) · r̂_q, and
-    cos(2δ), sin(2δ) follow from double-angle identities.
-
-    Parameters
-    ----------
-    ri_x, ri_y, ri_z : float   Neighbour position unit vector
-    ni_x, ni_y, ni_z : float   Neighbour north direction ê_θ(i)
-    rq_x, rq_y, rq_z : float   Query position unit vector
-    nq_x, nq_y, nq_z : float   Query north direction ê_θ(q)
-
-    Returns
-    -------
-    cos_2d, sin_2d : float
-    """
-    # v = r̂_i × r̂_q (unnormalised)
-    vvx = ri_y * rq_z - ri_z * rq_y
-    vvy = ri_z * rq_x - ri_x * rq_z
-    vvz = ri_x * rq_y - ri_y * rq_x
-
-    # c = r̂_i · r̂_q
-    cc = ri_x * rq_x + ri_y * rq_y + ri_z * rq_z
-
-    denom = 1.0 + cc
-    if denom < 1.0e-15:
-        return 1.0, 0.0  # antipodal / coincident — identity
-
-    # Transported north: t = n_i·c + (v × n_i) + v·(v·n_i)/(1+c)
-    vdn = vvx * ni_x + vvy * ni_y + vvz * ni_z
-    fac = vdn / denom
-
-    vxn_x = vvy * ni_z - vvz * ni_y
-    vxn_y = vvz * ni_x - vvx * ni_z
-    vxn_z = vvx * ni_y - vvy * ni_x
-
-    tx = ni_x * cc + vxn_x + vvx * fac
-    ty = ni_y * cc + vxn_y + vvy * fac
-    tz = ni_z * cc + vxn_z + vvz * fac
-
-    # cos δ = t · ê_θ(q)
-    cos_d = tx * nq_x + ty * nq_y + tz * nq_z
-
-    # sin δ = (ê_θ(q) × t) · r̂_q
-    sin_d = (
-        (nq_y * tz - nq_z * ty) * rq_x
-        + (nq_z * tx - nq_x * tz) * rq_y
-        + (nq_x * ty - nq_y * tx) * rq_z
-    )
-
-    # Double-angle identities — no atan2 needed
-    return cos_d * cos_d - sin_d * sin_d, 2.0 * cos_d * sin_d
 
 
 # ── Public numpy functions ────────────────────────────────────────────────────

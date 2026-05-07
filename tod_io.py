@@ -81,7 +81,7 @@ def open_scan_day(folder_scan, day_index):
     read stale or zeroed memory — keep at least one live reference per day
     for the entire processing window of that day.  Keeping the mmaps open
     across all batches avoids the repeated open/header-parse/mmap syscalls
-    that :func:`_load_scan_data_batch` would otherwise incur on every batch call.
+    that :func:`load_scan_data_batch` would otherwise incur on every batch call.
 
     Args:
         folder_scan (str): Path to the scan data directory. Must end with a
@@ -100,7 +100,7 @@ def open_scan_day(folder_scan, day_index):
     return theta_mmap, phi_mmap, psi_mmap
 
 
-def _load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
+def load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
     """Load a contiguous batch of scan samples for one day into RAM.
 
     Opens the three scan files for ``day_index`` as memory-maps, slices the
@@ -131,18 +131,3 @@ def _load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
     phi = np.array(phi_mmap[start_idx:end_idx], dtype=np.float32)
     psi = np.array(psi_mmap[start_idx:end_idx], dtype=np.float32)
     return theta, phi, psi
-
-
-def _count_scan_samples(folder_scan, day_index):
-    """Return the total number of detector samples for one observation day.
-
-    Args:
-        folder_scan (str): Path to the scan data directory. Must end with a
-            path separator.
-        day_index (int): Zero-based index of the observation day.
-
-    Returns:
-        int: Number of samples in ``phi_{day_index}.npy``.
-    """
-    phi_mmap = np.load(folder_scan + f"phi_{day_index}.npy", mmap_mode="r")
-    return len(phi_mmap)

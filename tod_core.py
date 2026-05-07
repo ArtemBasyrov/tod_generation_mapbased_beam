@@ -111,14 +111,10 @@ def beam_tod_batch(
     C = len(comp_indices)
     mp_stacked = data.get("mp_stacked")  # (C, N) float32, or None
 
-    # Q and U channel positions within the C-dim of mp_stacked
-    c_q = -1
-    c_u = -1
-    for _ci, _comp in enumerate(comp_indices):
-        if _comp == 1:
-            c_q = _ci
-        elif _comp == 2:
-            c_u = _ci
+    # Q and U channel positions within the C-dim of mp_stacked.
+    # Convention: input map fields are [T, Q, U] at indices [0, 1, 2].
+    c_q = comp_indices.index(1) if 1 in comp_indices else -1
+    c_u = comp_indices.index(2) if 2 in comp_indices else -1
 
     use_nearest = interp_mode == "nearest"
     if interp_mode not in ("nearest", "bilinear"):

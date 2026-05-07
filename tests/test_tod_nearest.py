@@ -30,7 +30,7 @@ import healpy as hp
 import pytest
 
 from tod_nearest import _gather_accum_nearest_jit
-from tod_bilinear import _spin2_cos2d_sin2d_jit
+from tod_spin2 import _spin2_cos2d_sin2d_jit
 from tod_rotations import _rodrigues_jit
 
 

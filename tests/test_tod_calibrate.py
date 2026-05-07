@@ -40,7 +40,11 @@ from tod_calibrate import (
     _thread_candidates,
     _process_thread_pairs,
     _run_clustering_probe,
+    _make_probe_data,
+    _run_one,
+    _measure_throughput,
     calibrate_beam_clustering,
+    calibrate_runtime,
 )
 
 
@@ -450,7 +454,8 @@ class TestCalibrateBeamClustering:
         def _ctx(bell_se):
             with (
                 patch(
-                    "beam_cluster.cluster_beam_pixels", side_effect=_mock_cluster_pixels
+                    "tod_calibrate.cluster_beam_pixels",
+                    side_effect=_mock_cluster_pixels,
                 ) as m_cl,
                 patch(
                     "tod_calibrate.compute_bell",
@@ -604,10 +609,314 @@ class TestCalibrateBeamClustering:
         assert isinstance(tf, float) and isinstance(K, int)
 
 
+# ===========================================================================
+# Runtime calibrator: probe-data, single-pass runner, throughput, and the
+# top-level orchestrator.
+# ===========================================================================
+
+
+def _runtime_beam_data(S=10, nside=8):
+    """Single-entry beam_data with the keys the runtime calibrator needs.
+
+    Includes ``mp_stacked`` (used by `_per_proc_static_bytes` /
+    `_max_batch_for_memory`) and the fields read by `calibrate_runtime`
+    (`ra`, `dec`).
+    """
+    npix = 12 * nside * nside
+    return {
+        "b": {
+            "beam_vals": np.ones(S, dtype=np.float64) / S,
+            "vec_orig": np.tile([1.0, 0.0, 0.0], (S, 1)).astype(np.float32),
+            "n_sel": S,
+            "comp_indices": [0],
+            "mp_stacked": np.zeros((1, npix), dtype=np.float32),
+            "ra": 0.0,
+            "dec": 0.0,
+        }
+    }
+
+
+def _fake_load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
+    """Stub of tod_io.load_scan_data_batch — returns deterministic float32 ramps."""
+    n = end_idx - start_idx
+    return (
+        (np.arange(n) + start_idx).astype(np.float32),
+        (np.arange(n) + start_idx + 1000).astype(np.float32),
+        (np.arange(n) + start_idx + 2000).astype(np.float32),
+    )
+
+
+def _fake_precompute_rotation_vector_batch(ra0, dec0, phi_b, theta_b, center_idx=None):
+    """Stub: returns trivial rot_vecs and zero betas of the right length."""
+    n = len(phi_b)
+    rot_vecs = np.zeros((n, 3, 3), dtype=np.float32)
+    betas = np.zeros(n, dtype=np.float32)
+    return rot_vecs, betas
+
+
+class TestMakeProbeData:
+    def test_returns_three_arrays_of_requested_length(self):
+        bd = _runtime_beam_data()
+        with patch(
+            "tod_calibrate.load_scan_data_batch",
+            side_effect=_fake_load_scan_data_batch,
+        ):
+            phi, theta, psi = _make_probe_data(bd, "/scan/", probe_day=0, n_samples=128)
+        # _make_probe_data returns the (phi, theta, psi) ordering — note the
+        # source unpacks load_scan_data_batch as (theta, phi, psi).
+        assert phi.shape == (128,)
+        assert theta.shape == (128,)
+        assert psi.shape == (128,)
+
+    def test_caps_to_loader_length(self):
+        """If the loader returns fewer samples than requested, output is capped."""
+        bd = _runtime_beam_data()
+
+        def short_loader(folder, day, s, e):
+            n = max(0, (e - s) // 2)
+            return (
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=np.float32),
+            )
+
+        with patch("tod_calibrate.load_scan_data_batch", side_effect=short_loader):
+            phi, theta, psi = _make_probe_data(bd, "/scan/", 0, 100)
+        assert len(phi) == 50
+        assert len(theta) == 50
+        assert len(psi) == 50
+
+
+class TestRunOne:
+    def _run(self, beam_data, mp, phi, theta, psi, bs, **kw):
+        nside = 8
+        with (
+            patch(
+                "tod_calibrate.precompute_rotation_vector_batch",
+                side_effect=_fake_precompute_rotation_vector_batch,
+            ),
+            patch("tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones),
+        ):
+            return _run_one(
+                nside,
+                mp,
+                beam_data,
+                ra0=0.0,
+                dec0=0.0,
+                phi_p=phi,
+                theta_p=theta,
+                psi_p=psi,
+                bs=bs,
+                interp_mode="bilinear",
+                **kw,
+            )
+
+    def test_returns_positive_wall_time(self):
+        bd = _runtime_beam_data()
+        mp = _fake_mp()
+        n = 64
+        phi = np.zeros(n, dtype=np.float32)
+        theta = np.zeros(n, dtype=np.float32)
+        psi = np.zeros(n, dtype=np.float32)
+        t = self._run(bd, mp, phi, theta, psi, bs=16)
+        assert t >= 0.0
+
+    def test_calls_beam_tod_batch_in_correct_number_of_batches(self):
+        bd = _runtime_beam_data()
+        mp = _fake_mp()
+        n = 100
+        bs = 32
+        # ceil(100 / 32) == 4
+        phi = np.zeros(n, dtype=np.float32)
+        theta = np.zeros(n, dtype=np.float32)
+        psi = np.zeros(n, dtype=np.float32)
+
+        with (
+            patch(
+                "tod_calibrate.precompute_rotation_vector_batch",
+                side_effect=_fake_precompute_rotation_vector_batch,
+            ),
+            patch(
+                "tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones
+            ) as btb_mock,
+        ):
+            _run_one(
+                8,
+                mp,
+                bd,
+                ra0=0.0,
+                dec0=0.0,
+                phi_p=phi,
+                theta_p=theta,
+                psi_p=psi,
+                bs=bs,
+                interp_mode="bilinear",
+            )
+        # One beam entry × ceil(n/bs) batches = 4 calls.
+        assert btb_mock.call_count == 4
+
+    def test_z_skip_threshold_propagated(self):
+        bd = _runtime_beam_data()
+        mp = _fake_mp()
+        n = 32
+        phi = np.zeros(n, dtype=np.float32)
+        theta = np.zeros(n, dtype=np.float32)
+        psi = np.zeros(n, dtype=np.float32)
+
+        with (
+            patch(
+                "tod_calibrate.precompute_rotation_vector_batch",
+                side_effect=_fake_precompute_rotation_vector_batch,
+            ),
+            patch(
+                "tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones
+            ) as btb_mock,
+        ):
+            _run_one(
+                8,
+                mp,
+                bd,
+                ra0=0.0,
+                dec0=0.0,
+                phi_p=phi,
+                theta_p=theta,
+                psi_p=psi,
+                bs=16,
+                interp_mode="bilinear",
+                z_skip_threshold=0.42,
+            )
+        # Every call must have z_skip_threshold=0.42 forwarded as a kwarg.
+        for call in btb_mock.call_args_list:
+            assert call.kwargs["z_skip_threshold"] == 0.42
+
+
+class TestMeasureThroughput:
+    def test_returns_finite_positive_throughput(self):
+        bd = _runtime_beam_data()
+        mp = _fake_mp()
+        n = 8000
+        phi_full = np.zeros(n, dtype=np.float32)
+        theta_full = np.zeros(n, dtype=np.float32)
+        psi_full = np.zeros(n, dtype=np.float32)
+        with (
+            patch(
+                "tod_calibrate.precompute_rotation_vector_batch",
+                side_effect=_fake_precompute_rotation_vector_batch,
+            ),
+            patch("tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones),
+            patch("tod_calibrate.numba.set_num_threads") as set_thr,
+        ):
+            tp = _measure_throughput(
+                8,
+                mp,
+                bd,
+                ra0=0.0,
+                dec0=0.0,
+                phi_full=phi_full,
+                theta_full=theta_full,
+                psi_full=psi_full,
+                bs=512,
+                n_threads=2,
+                interp_mode="bilinear",
+            )
+        assert math.isfinite(tp) and tp > 0.0
+        set_thr.assert_called_with(2)
+
+    def test_floors_n_threads_at_one(self):
+        """n_threads=0 must still be passed as max(1, …) to set_num_threads."""
+        bd = _runtime_beam_data()
+        mp = _fake_mp()
+        phi_full = np.zeros(2000, dtype=np.float32)
+        theta_full = np.zeros(2000, dtype=np.float32)
+        psi_full = np.zeros(2000, dtype=np.float32)
+        with (
+            patch(
+                "tod_calibrate.precompute_rotation_vector_batch",
+                side_effect=_fake_precompute_rotation_vector_batch,
+            ),
+            patch("tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones),
+            patch("tod_calibrate.numba.set_num_threads") as set_thr,
+        ):
+            _measure_throughput(
+                8,
+                mp,
+                bd,
+                ra0=0.0,
+                dec0=0.0,
+                phi_full=phi_full,
+                theta_full=theta_full,
+                psi_full=psi_full,
+                bs=128,
+                n_threads=0,
+                interp_mode="bilinear",
+            )
+        set_thr.assert_called_with(1)
+
+
+# Import math here for TestMeasureThroughput (avoid touching the original
+# import block at the top of the file).
+import math  # noqa: E402
+
+
+class TestCalibrateRuntime:
+    """Smoke test for the joint (P, T, B) orchestrator.
+
+    All numeric kernels and scan I/O are stubbed so the test is fast and
+    deterministic. We verify the contract: returns three positive integers,
+    obeys max_processes_user, and respects n_cpu_ceiling.
+    """
+
+    def _run(self, *, n_cpu_ceiling=4, max_processes_user=4, mem_gb=64.0):
+        bd = _runtime_beam_data()
+        mp = _fake_mp()
+
+        with (
+            patch(
+                "tod_calibrate.load_scan_data_batch",
+                side_effect=_fake_load_scan_data_batch,
+            ),
+            patch(
+                "tod_calibrate.precompute_rotation_vector_batch",
+                side_effect=_fake_precompute_rotation_vector_batch,
+            ),
+            patch("tod_calibrate.beam_tod_batch", side_effect=_mock_btb_ones),
+            patch("tod_calibrate.numba.set_num_threads"),
+            patch("tod_calibrate._get_memory_per_process", return_value=mem_gb),
+        ):
+            return calibrate_runtime(
+                bd,
+                folder_scan="/scan/",
+                probe_day=0,
+                mp=mp,
+                n_cpu_ceiling=n_cpu_ceiling,
+                max_processes_user=max_processes_user,
+            )
+
+    def test_returns_three_positive_ints(self):
+        P, T, B = self._run()
+        assert isinstance(P, int) and P >= 1
+        assert isinstance(T, int) and T >= 1
+        assert isinstance(B, int) and B >= 1
+
+    def test_p_capped_by_max_processes_user(self):
+        P, _, _ = self._run(n_cpu_ceiling=8, max_processes_user=2)
+        assert P <= 2
+
+    def test_p_capped_by_n_cpu_ceiling(self):
+        P, T, _ = self._run(n_cpu_ceiling=2, max_processes_user=8)
+        assert P <= 2
+        assert T <= 2
+        assert P * T <= 2
+
+    def test_raises_when_memory_too_tight(self):
+        """A laughably small per-process memory budget can't fit static beams."""
+        # mem_gb=0.0001 → static bytes alone exceed budget → bs_cap_p1 < 256.
+        with pytest.raises(RuntimeError, match="memory too tight"):
+            self._run(mem_gb=0.0001)
+
+
 # ---------------------------------------------------------------------------
 # Standalone entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import pytest
-
     sys.exit(pytest.main([__file__, "-v"]))

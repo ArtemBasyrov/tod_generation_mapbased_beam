@@ -19,8 +19,6 @@ _ring_interp_with_angles_jit — same as _ring_interp_single_jit but also return
                                callers that need the neighbour sky positions
                                (e.g. the spin-2 Q/U frame-rotation kernel).
 _pix2ang_ring_jit           — scalar (theta, phi) from RING pixel index (nopython).
-_pix2zphi_ring_jit          — scalar (z, phi), avoids acos.
-_pix2z_cosphi_sinphi_jit    — scalar (z, cos φ, sin φ), no trig in caller needed.
 _pix2ang_ring_batch         — parallel batch kernel over an array of pixel indices.
 pix2ang_numba               — public wrapper; drop-in for hp.pix2ang(nest=False).
 
@@ -362,7 +360,7 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
     Identical math to :func:`_ring_interp_single_jit` but additionally returns
     ``(z_n, phi_n)`` for each of the four neighbours.  Intended for callers
     (e.g. the spin-2 Q/U kernel) that need the neighbour sky positions and
-    would otherwise have to re-derive them via :func:`_pix2zphi_ring_jit`.
+    would otherwise have to re-derive them from the pixel index.
 
     Parameters
     ----------
@@ -547,69 +545,6 @@ def _pix2ang_ring_jit(nside, pix):
     phi = phi0 + ip_in * dphi
     z = _ring_z_jit(nside, iring)
     return math.acos(z), phi
-
-
-@numba.jit(nopython=True, cache=True)
-def _pix2zphi_ring_jit(nside, pix):
-    """(z, phi) for a single RING-scheme pixel, where z = cos(theta).
-
-    Identical logic to _pix2ang_ring_jit but returns the ring's z = cos(theta)
-    directly instead of acos(z).  Callers that need sin(theta) compute it as
-    sqrt(max(0, 1 - z²)) — one sqrt instead of one acos + one sin + one cos.
-    """
-    npix = 12 * nside * nside
-    ncap = 2 * nside * (nside - 1)
-
-    if pix < ncap:
-        iring = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * pix)))
-        ip_in = pix - 2 * iring * (iring - 1)
-    elif pix < npix - ncap:
-        ip = pix - ncap
-        iring = ip // (4 * nside) + nside
-        ip_in = ip % (4 * nside)
-    else:
-        ip_s = npix - pix - 1
-        iring_s = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * ip_s)))
-        iring = 4 * nside - iring_s
-        first_s = npix - 2 * iring_s * (iring_s + 1)
-        ip_in = pix - first_s
-
-    _n, _fp, phi0, dphi_r = _ring_info_jit(nside, iring, npix)
-    phi = phi0 + ip_in * dphi_r
-    z = _ring_z_jit(nside, iring)
-    return z, phi
-
-
-@numba.jit(nopython=True, cache=True)
-def _pix2z_cosphi_sinphi_jit(nside, pix):
-    """(z, cos φ, sin φ) for a single RING-scheme pixel.
-
-    Extends _pix2zphi_ring_jit by returning cos and sin of the pixel longitude
-    directly, so the caller never needs to call math.cos/math.sin on the result.
-    Provided as a trig-saving alternative to _pix2zphi_ring_jit when the caller
-    needs cos φ / sin φ rather than φ itself.
-    """
-    npix = 12 * nside * nside
-    ncap = 2 * nside * (nside - 1)
-
-    if pix < ncap:
-        iring = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * pix)))
-        ip_in = pix - 2 * iring * (iring - 1)
-    elif pix < npix - ncap:
-        ip = pix - ncap
-        iring = ip // (4 * nside) + nside
-        ip_in = ip % (4 * nside)
-    else:
-        ip_s = npix - pix - 1
-        iring_s = int(0.5 * (1.0 + math.sqrt(1.0 + 2.0 * ip_s)))
-        iring = 4 * nside - iring_s
-        first_s = npix - 2 * iring_s * (iring_s + 1)
-        ip_in = pix - first_s
-
-    _n, _fp, phi0, dphi_r = _ring_info_jit(nside, iring, npix)
-    phi = phi0 + ip_in * dphi_r
-    z = _ring_z_jit(nside, iring)
-    return z, math.cos(phi), math.sin(phi)
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
@@ -894,7 +829,7 @@ def _gather_ring_stencil_jit(nside, vz, ph, out_buf, z_buf, phi_buf):
     """
     Gather RING pixel indices for the Keys/Catmull-Rom bicubic stencil,
     and simultaneously populate z_buf / phi_buf with (cos θ, φ) for each
-    gathered pixel — eliminating the need to call _pix2zphi_ring_jit in the
+    gathered pixel — avoiding a second pass over the pixel index in the
     hot loop.
 
     While building the stencil this function already has ring geometry in hand

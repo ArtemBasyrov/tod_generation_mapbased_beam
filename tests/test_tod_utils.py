@@ -41,6 +41,7 @@ from tod_utils import (
     _is_cluster,
     _get_memory_per_process,
     _get_ncpus,
+    _cpu_ceiling,
 )
 import tod_config as config
 
@@ -288,6 +289,108 @@ class TestGetNcpus:
                 result = _tu._get_ncpus()
 
         assert result == config.n_processes
+
+
+# ===========================================================================
+# TestCpuCeiling
+# ===========================================================================
+
+
+class TestCpuCeiling:
+    """Tests for tod_utils._cpu_ceiling.
+
+    Priority order (per docstring):
+      1. SLURM_CPUS_PER_TASK env var
+      2. psutil affinity-aware physical core count
+      3. os.cpu_count()
+    """
+
+    _HPC_VARS = ("SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID")
+
+    def _clear_env(self):
+        return {v: "" for v in self._HPC_VARS}
+
+    def test_slurm_env_var_wins(self):
+        """SLURM_CPUS_PER_TASK is preferred over both psutil and os.cpu_count."""
+        env_patch = self._clear_env()
+        env_patch["SLURM_CPUS_PER_TASK"] = "5"
+
+        with patch.dict(os.environ, env_patch, clear=False):
+            os.environ["SLURM_CPUS_PER_TASK"] = "5"
+            for v in self._HPC_VARS:
+                os.environ.pop(v, None)
+            # Provide a psutil that would otherwise return a different number;
+            # SLURM should still win.
+            mock_psutil = MagicMock()
+            mock_psutil.cpu_count.side_effect = lambda logical: 32 if logical else 16
+            with patch.dict(sys.modules, {"psutil": mock_psutil}):
+                import tod_utils as _tu
+
+                importlib.reload(_tu)
+                with patch.object(
+                    _tu.os,
+                    "sched_getaffinity",
+                    return_value=set(range(32)),
+                    create=True,
+                ):
+                    assert _tu._cpu_ceiling() == 5
+
+    def test_slurm_invalid_value_falls_through(self):
+        """Non-integer SLURM_CPUS_PER_TASK is ignored — psutil path takes over."""
+        env_patch = self._clear_env()
+        env_patch["SLURM_CPUS_PER_TASK"] = "not-an-int"
+
+        with patch.dict(os.environ, env_patch, clear=False):
+            os.environ["SLURM_CPUS_PER_TASK"] = "not-an-int"
+            for v in self._HPC_VARS:
+                os.environ.pop(v, None)
+            mock_psutil = MagicMock()
+            # 8 logical, 4 physical → 2 hyperthreads/core
+            mock_psutil.cpu_count.side_effect = lambda logical: 8 if logical else 4
+            with patch.dict(sys.modules, {"psutil": mock_psutil}):
+                import tod_utils as _tu
+
+                importlib.reload(_tu)
+                with patch.object(
+                    _tu.os,
+                    "sched_getaffinity",
+                    return_value=set(range(8)),
+                    create=True,
+                ):
+                    # 8 logical / (8/4)=2 hyperthreads = 4 cores
+                    assert _tu._cpu_ceiling() == 4
+
+    def test_psutil_path_no_slurm(self):
+        """No SLURM env var, psutil present → affinity_size // hyperthreads_per_core."""
+        env_patch = self._clear_env()
+        with patch.dict(os.environ, env_patch, clear=False):
+            os.environ.pop("SLURM_CPUS_PER_TASK", None)
+            mock_psutil = MagicMock()
+            # 16 logical, 8 physical → 2 ht/core; affinity has 12 logical CPUs.
+            mock_psutil.cpu_count.side_effect = lambda logical: 16 if logical else 8
+            with patch.dict(sys.modules, {"psutil": mock_psutil}):
+                import tod_utils as _tu
+
+                importlib.reload(_tu)
+                with patch.object(
+                    _tu.os,
+                    "sched_getaffinity",
+                    return_value=set(range(12)),
+                    create=True,
+                ):
+                    assert _tu._cpu_ceiling() == 6  # 12 / 2
+
+    def test_falls_back_to_os_cpu_count(self):
+        """Without SLURM and with psutil failing, falls back to os.cpu_count()."""
+        env_patch = self._clear_env()
+        with patch.dict(os.environ, env_patch, clear=False):
+            os.environ.pop("SLURM_CPUS_PER_TASK", None)
+            with patch.dict(sys.modules, {"psutil": None}):
+                import tod_utils as _tu
+
+                importlib.reload(_tu)
+                with patch.object(_tu.os, "cpu_count", return_value=11):
+                    assert _tu._cpu_ceiling() == 11
 
 
 # ---------------------------------------------------------------------------

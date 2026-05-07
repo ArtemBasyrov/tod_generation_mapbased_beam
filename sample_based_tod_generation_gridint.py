@@ -8,23 +8,22 @@ import numpy as np
 import healpy as hp
 
 import tod_config as config
-from tod_io import load_beam, load_scan_information, open_scan_day
+from tod_io import load_scan_information, open_scan_day
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
-from tod_bilinear import compute_spin2_skip_z_threshold
 from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
-from tod_utils import (
-    _get_ncpus,
-    _fmt_time,
-    _should_print_batch,
-    _compute_dB_threshold_from_power,
+from tod_utils import _get_ncpus, _fmt_time, _should_print_batch
+from tod_pipeline_helpers import (
+    prepare_beam_data,
+    apply_beam_clustering,
+    resolve_spin2_skip_threshold,
+    save_runtime_calibration,
+    save_clustering_calibration,
 )
-from beam_cluster import cluster_beam_pixels, cluster_cached_arrays
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-folder_beam = config.FOLDER_BEAM
 folder_scan = config.FOLDER_SCAN
 folder_tod_output = config.FOLDER_TOD_OUTPUT
 beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
@@ -85,127 +84,6 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, n_threads):
         entry = dict(static)
         entry["mp_stacked"] = ms
         _g_beam_data[bf] = entry
-
-
-# ── Beam preparation ──────────────────────────────────────────────────────────
-
-
-def prepare_beam_data(beam_filenames):
-    """Load and preprocess all unique beam files into a beam-data dictionary.
-
-    For each unique beam filename, loads the FITS map, selects pixels by power
-    threshold, normalises beam weights, and precomputes unit vectors.
-
-    Args:
-        beam_filenames (list[str]): List of beam filenames (one per Stokes
-            component, in the order ``[I, Q, U]``). Duplicate filenames are
-            de-duplicated; the corresponding ``comp_indices`` lists which Stokes
-            components share a given beam file.
-
-    Returns:
-        dict[str, dict]: Beam-data dictionary keyed by beam filename. Each
-            value is a dict with the following entries:
-
-            - ``'ra'`` – RA offset grid [rad]
-            - ``'dec'`` – Dec offset grid [rad]
-            - ``'beam_vals'`` – Normalised beam weights, shape ``(S,)``
-            - ``'sel'`` – Boolean selection mask over the full beam map
-            - ``'comp_indices'`` – List of Stokes component indices using this
-              beam (e.g. ``[0]`` for I-only, ``[1, 2]`` if Q and U share a map)
-            - ``'n_sel'`` – Number of selected pixels ``S``
-            - ``'vec_orig'`` – Beam-pixel unit vectors, shape ``(S, 3)``
-    """
-    beam_groups = {}
-    for i, bf in enumerate(beam_filenames):
-        beam_groups.setdefault(bf, []).append(i)
-
-    beam_threshold_map = {
-        config.beam_file_I: config.power_threshold_I,
-        config.beam_file_Q: config.power_threshold_Q,
-        config.beam_file_U: config.power_threshold_U,
-    }
-
-    beam_data = {}
-    for bf, comp_indices in beam_groups.items():
-        ra, dec, pixel_map = load_beam(
-            folder_beam,
-            bf,
-            center_x=config.beam_center_x,
-            center_y=config.beam_center_y,
-        )
-
-        db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
-        sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
-        beam_vals = pixel_map[sel].astype(np.float32)
-        norm = beam_vals.sum()
-        if norm != 0:
-            beam_vals /= norm
-
-        theta_orig = np.pi / 2 - dec
-        vec_orig = np.stack(
-            [
-                np.sin(theta_orig) * np.cos(ra),
-                np.sin(theta_orig) * np.sin(ra),
-                np.cos(theta_orig),
-            ],
-            axis=-1,
-        )[sel].astype(np.float32)
-
-        beam_data[bf] = {
-            "ra": ra,
-            "dec": dec,
-            "beam_vals": beam_vals,
-            "sel": sel,
-            "comp_indices": comp_indices,
-            "n_sel": int(sel.sum()),
-            "vec_orig": vec_orig,
-        }
-        print(f"  Beam {bf}: {sel.sum()} selected pixels")
-
-    return beam_data
-
-
-def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
-    """Apply weighted spherical k-means clustering to beam_data in-place.
-
-    Called after prepare_beam_data() and, if used, after calibrate_beam_clustering().
-    The pre-clustering beam_vals serve as pixel weights for both the k-means
-    and the subsequent cache-array reduction.
-
-    Args:
-        beam_data (dict): Beam data from prepare_beam_data (exact, unclustered).
-            Modified in-place. Cache arrays (vec_rolled, dtheta, dphi) are
-            reduced from (N_psi, S, *) to (N_psi, K_out, *) if present.
-        n_clusters (int): Max clusters for the tail (or all pixels in full mode).
-        tail_fraction (float | None): Fraction of power to treat as tail.
-            None → full mode (cluster all pixels).
-    """
-    _CACHE_KEYS = ("vec_rolled", "dtheta", "dphi")
-    for bf, data in beam_data.items():
-        bv_pre = data["beam_vals"]  # (S,) — needed as weights before overwrite
-        vo_pre = data["vec_orig"]  # (S, 3)
-        S = data["n_sel"]
-
-        vec_out, bv_out, labels = cluster_beam_pixels(
-            vo_pre,
-            bv_pre,
-            n_clusters=n_clusters,
-            tail_fraction=tail_fraction,
-        )
-        K = len(bv_out)
-
-        # Cluster cache arrays with pre-clustering weights before overwriting beam_vals
-        cache_sub = {k: data[k] for k in _CACHE_KEYS if k in data}
-        if cache_sub:
-            print(f"    [{bf}] Clustering cache arrays …")
-            clustered = cluster_cached_arrays(cache_sub, labels, bv_pre, K)
-            for k, arr in clustered.items():
-                data[k] = arr
-
-        data["beam_vals"] = bv_out
-        data["vec_orig"] = vec_out
-        data["n_sel"] = K
-        print(f"  [{bf}] Beam clustered: {S} → {K} pixels")
 
 
 # ── TOD generation ────────────────────────────────────────────────────────────
@@ -347,59 +225,6 @@ def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0):
         return day_index, False, str(e)
 
 
-# ── Calibration cache ─────────────────────────────────────────────────────────
-
-
-def _save_calibration(n_processes, n_threads, batch_size):
-    """Write calibration results back to the active config file."""
-    import yaml
-
-    with open(config.CONFIG_FILE) as f:
-        raw = yaml.safe_load(f)
-    raw["calibration_n_processes"] = int(n_processes)
-    raw["calibration_numba_threads"] = int(n_threads)
-    raw["calibration_batch_size"] = int(batch_size)
-    raw["calibration_enabled"] = False
-    with open(config.CONFIG_FILE, "w") as f:
-        yaml.dump(
-            raw,
-            f,
-            default_flow_style=False,
-            allow_unicode=True,
-            explicit_start=True,
-            sort_keys=False,
-        )
-    print(
-        f"Calibration saved to {config.CONFIG_FILE} "
-        f"(n_processes={n_processes}, numba_threads={n_threads}, "
-        f"batch_size={batch_size})"
-    )
-
-
-def _save_clustering_calibration(tail_fraction, n_clusters):
-    """Write clustering calibration results to the active config YAML file."""
-    import yaml
-
-    with open(config.CONFIG_FILE) as f:
-        raw = yaml.safe_load(f)
-    raw["n_beam_clusters"] = int(n_clusters)
-    raw["beam_cluster_tail_fraction"] = float(tail_fraction)
-    raw["clustering_calibration_enabled"] = False  # disable after save
-    with open(config.CONFIG_FILE, "w") as f:
-        yaml.dump(
-            raw,
-            f,
-            default_flow_style=False,
-            allow_unicode=True,
-            explicit_start=True,
-            sort_keys=False,
-        )
-    print(
-        f"Clustering calibration saved: tail_fraction={tail_fraction:.4f}, "
-        f"n_clusters={n_clusters}"
-    )
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -439,7 +264,7 @@ def main(n_cpu_ceiling):
             error_threshold=config.clustering_error_threshold,
             interp_mode=interp_mode,
         )
-        _save_clustering_calibration(best_tf, best_K)
+        save_clustering_calibration(best_tf, best_K)
         # Update in-memory config so clustering is applied this run too
         config.n_beam_clusters = best_K
         config.beam_cluster_tail_fraction = best_tf
@@ -463,65 +288,9 @@ def main(n_cpu_ceiling):
             np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
         )
 
-    # ── Spin-2 skip threshold ─────────────────────────────────────────────────
-    # When spin2_skip_tolerance is set, derive the cos(θ_pts) cutoff such that
-    # boresights in the equatorial band (|bz| ≤ cutoff) bypass the spin-2 Q/U
-    # rotation, with a worst-case |2δ| bounded by the configured tolerance over
-    # all beam-pixel positions within the beam radius.  -1.0 disables it.
-    z_skip_threshold = -1.0
-    if config.spin2_skip_tolerance and config.spin2_skip_tolerance > 0:
-        # Beam radius: beam-power-weighted enclosed radius.  The unweighted
-        # max overstates the relevant scale because tail pixels contribute
-        # to TOD error proportionally to their beam value.  Instead use the
-        # smallest R such that Σ_{r_i ≤ R} |b_i| ≥ q · Σ |b_i| — the lowest-
-        # contribution (1−q) fraction of the beam is dropped from the bound.
-        # The centre direction is the beam-weighted mean of vec_orig
-        # (convention-independent under any future change of beam frame).
-        # Max across beam entries is kept as a conservative aggregation.
-        beam_radius_quantile = 0.999
-        beam_radius = 0.0
-        for _data in beam_data.values():
-            vo = _data["vec_orig"].astype(np.float64)
-            bv = _data["beam_vals"].astype(np.float64)
-            v_centre = (vo * bv[:, None]).sum(axis=0)
-            n = float(np.linalg.norm(v_centre))
-            if n < 1e-12:
-                continue
-            v_centre /= n
-            cos_off = np.clip(vo @ v_centre, -1.0, 1.0)
-            r_pix = np.arccos(cos_off)
-            w = np.abs(bv)
-            w_total = float(w.sum())
-            if w_total <= 0.0:
-                continue
-            order = np.argsort(r_pix)
-            w_cum = np.cumsum(w[order]) / w_total
-            idx = int(np.searchsorted(w_cum, beam_radius_quantile))
-            if idx >= r_pix.size:
-                idx = r_pix.size - 1
-            r_enc = float(r_pix[order[idx]])
-            if r_enc > beam_radius:
-                beam_radius = r_enc
-        z_skip_threshold = compute_spin2_skip_z_threshold(
-            beam_radius, float(config.spin2_skip_tolerance)
-        )
-        if z_skip_threshold < 0.0:
-            print(
-                f"Spin-2 skip: tolerance={config.spin2_skip_tolerance} too tight "
-                f"for beam_radius_eff={np.degrees(beam_radius):.3f}° "
-                f"(q={beam_radius_quantile}) — optimisation effectively "
-                f"disabled (no equatorial band)."
-            )
-        else:
-            theta_band_deg = np.degrees(np.arccos(z_skip_threshold))
-            print(
-                f"Spin-2 skip enabled: tol={config.spin2_skip_tolerance}, "
-                f"beam_radius_eff={np.degrees(beam_radius):.3f}° "
-                f"(q={beam_radius_quantile}), "
-                f"z_threshold={z_skip_threshold:.6f} "
-                f"(boresight band θ ∈ [{theta_band_deg:.2f}°, "
-                f"{180 - theta_band_deg:.2f}°] bypasses correction)"
-            )
+    z_skip_threshold = resolve_spin2_skip_threshold(
+        beam_data, config.spin2_skip_tolerance
+    )
 
     use_cached = not config.calibration_enabled
     if use_cached:
@@ -546,7 +315,7 @@ def main(n_cpu_ceiling):
             center_idx=(_cx, _cy) if (_cx is not None and _cy is not None) else None,
             z_skip_threshold=z_skip_threshold,
         )
-        _save_calibration(ncpus, n_threads, batch_size)
+        save_runtime_calibration(ncpus, n_threads, batch_size)
     print(
         f"Processing days {start}–{end - 1}  ({len(days)} days,  "
         f"{ncpus} workers × {n_threads} threads)"

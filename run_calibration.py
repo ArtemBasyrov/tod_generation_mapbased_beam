@@ -18,136 +18,20 @@ import os
 
 import numpy as np
 import healpy as hp
-import yaml
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import tod_config as config
-from tod_io import load_beam, load_scan_information
+from tod_io import load_scan_information
 from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
-from tod_utils import _get_ncpus, _compute_dB_threshold_from_power
-from beam_cluster import cluster_beam_pixels, cluster_cached_arrays
-
-
-# ── Beam helpers (mirrors main script) ───────────────────────────────────────
-
-
-def _prepare_beam_data():
-    beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
-    beam_threshold_map = {
-        config.beam_file_I: config.power_threshold_I,
-        config.beam_file_Q: config.power_threshold_Q,
-        config.beam_file_U: config.power_threshold_U,
-    }
-    beam_groups = {}
-    for i, bf in enumerate(beam_files):
-        beam_groups.setdefault(bf, []).append(i)
-
-    beam_data = {}
-    for bf, comp_indices in beam_groups.items():
-        ra, dec, pixel_map = load_beam(
-            config.FOLDER_BEAM,
-            bf,
-            center_x=config.beam_center_x,
-            center_y=config.beam_center_y,
-        )
-        db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
-        sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
-        beam_vals = pixel_map[sel].astype(np.float32)
-        norm = beam_vals.sum()
-        if norm != 0:
-            beam_vals /= norm
-        theta_orig = np.pi / 2 - dec
-        vec_orig = np.stack(
-            [
-                np.sin(theta_orig) * np.cos(ra),
-                np.sin(theta_orig) * np.sin(ra),
-                np.cos(theta_orig),
-            ],
-            axis=-1,
-        )[sel].astype(np.float32)
-        beam_data[bf] = {
-            "ra": ra,
-            "dec": dec,
-            "beam_vals": beam_vals,
-            "sel": sel,
-            "comp_indices": comp_indices,
-            "n_sel": int(sel.sum()),
-            "vec_orig": vec_orig,
-        }
-        print(f"  Beam {bf}: {sel.sum()} selected pixels")
-    return beam_data
-
-
-def _apply_clustering(beam_data, n_clusters, tail_fraction):
-    _CACHE_KEYS = ("vec_rolled", "dtheta", "dphi")
-    for bf, data in beam_data.items():
-        bv_pre = data["beam_vals"]
-        vo_pre = data["vec_orig"]
-        S = data["n_sel"]
-        vec_out, bv_out, labels = cluster_beam_pixels(
-            vo_pre, bv_pre, n_clusters=n_clusters, tail_fraction=tail_fraction
-        )
-        K = len(bv_out)
-        cache_sub = {k: data[k] for k in _CACHE_KEYS if k in data}
-        if cache_sub:
-            clustered = cluster_cached_arrays(cache_sub, labels, bv_pre, K)
-            for k, arr in clustered.items():
-                data[k] = arr
-        data["beam_vals"] = bv_out
-        data["vec_orig"] = vec_out
-        data["n_sel"] = K
-        print(f"  [{bf}] Beam clustered: {S} → {K} pixels")
-
-
-# ── Config writers ────────────────────────────────────────────────────────────
-
-
-def _save_runtime_calibration(n_processes, n_threads, batch_size):
-    with open(config.CONFIG_FILE) as f:
-        raw = yaml.safe_load(f)
-    raw["calibration_n_processes"] = int(n_processes)
-    raw["calibration_numba_threads"] = int(n_threads)
-    raw["calibration_batch_size"] = int(batch_size)
-    raw["calibration_enabled"] = False
-    with open(config.CONFIG_FILE, "w") as f:
-        yaml.dump(
-            raw,
-            f,
-            default_flow_style=False,
-            allow_unicode=True,
-            explicit_start=True,
-            sort_keys=False,
-        )
-    print(
-        f"Saved to {config.CONFIG_FILE}: "
-        f"n_processes={n_processes}, numba_threads={n_threads}, batch_size={batch_size}"
-    )
-
-
-def _save_clustering_calibration(tail_fraction, n_clusters):
-    with open(config.CONFIG_FILE) as f:
-        raw = yaml.safe_load(f)
-    raw["n_beam_clusters"] = int(n_clusters)
-    raw["beam_cluster_tail_fraction"] = float(tail_fraction)
-    raw["clustering_calibration_enabled"] = False
-    with open(config.CONFIG_FILE, "w") as f:
-        yaml.dump(
-            raw,
-            f,
-            default_flow_style=False,
-            allow_unicode=True,
-            explicit_start=True,
-            sort_keys=False,
-        )
-    print(
-        f"Saved to {config.CONFIG_FILE}: "
-        f"tail_fraction={tail_fraction:.4f}, n_clusters={n_clusters}"
-    )
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+from tod_utils import _get_ncpus
+from tod_pipeline_helpers import (
+    prepare_beam_data,
+    apply_beam_clustering,
+    save_runtime_calibration,
+    save_clustering_calibration,
+)
 
 
 def main():
@@ -178,7 +62,8 @@ def main():
     ]
 
     print("Loading beam data...")
-    beam_data = _prepare_beam_data()
+    beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
+    beam_data = prepare_beam_data(beam_files)
 
     if run_clustering:
         print("Running beam clustering calibration...")
@@ -190,7 +75,7 @@ def main():
             error_threshold=config.clustering_error_threshold,
             interp_mode=config.beam_interp_method,
         )
-        _save_clustering_calibration(best_tf, best_K)
+        save_clustering_calibration(best_tf, best_K)
         n_clusters, tail_fraction = best_K, best_tf
     else:
         n_clusters = config.n_beam_clusters
@@ -201,7 +86,9 @@ def main():
             f"Applying beam clustering "
             f"(tail_fraction={tail_fraction}, n_clusters={n_clusters}) ..."
         )
-        _apply_clustering(beam_data, n_clusters=n_clusters, tail_fraction=tail_fraction)
+        apply_beam_clustering(
+            beam_data, n_clusters=n_clusters, tail_fraction=tail_fraction
+        )
 
     for data in beam_data.values():
         data["mp_stacked"] = np.ascontiguousarray(
@@ -223,7 +110,7 @@ def main():
             interp_mode=config.beam_interp_method,
             center_idx=(_cx, _cy) if (_cx is not None and _cy is not None) else None,
         )
-        _save_runtime_calibration(n_processes, n_threads, batch_size)
+        save_runtime_calibration(n_processes, n_threads, batch_size)
 
 
 if __name__ == "__main__":
