@@ -470,12 +470,15 @@ def main(n_cpu_ceiling):
     # all beam-pixel positions within the beam radius.  -1.0 disables it.
     z_skip_threshold = -1.0
     if config.spin2_skip_tolerance and config.spin2_skip_tolerance > 0:
-        # Beam radius: max angular distance from the beam-frame centre to any
-        # beam pixel.  The centre direction is the beam-weighted mean of
-        # vec_orig (convention-independent: prepare_beam_data places the
-        # centre at +x by construction, but using the weighted mean keeps
-        # this correct under any future change of convention).  Maximum is
-        # taken across all beam entries as a conservative upper bound.
+        # Beam radius: beam-power-weighted enclosed radius.  The unweighted
+        # max overstates the relevant scale because tail pixels contribute
+        # to TOD error proportionally to their beam value.  Instead use the
+        # smallest R such that Σ_{r_i ≤ R} |b_i| ≥ q · Σ |b_i| — the lowest-
+        # contribution (1−q) fraction of the beam is dropped from the bound.
+        # The centre direction is the beam-weighted mean of vec_orig
+        # (convention-independent under any future change of beam frame).
+        # Max across beam entries is kept as a conservative aggregation.
+        beam_radius_quantile = 0.999
         beam_radius = 0.0
         for _data in beam_data.values():
             vo = _data["vec_orig"].astype(np.float64)
@@ -486,23 +489,35 @@ def main(n_cpu_ceiling):
                 continue
             v_centre /= n
             cos_off = np.clip(vo @ v_centre, -1.0, 1.0)
-            r_max = float(np.max(np.arccos(cos_off)))
-            if r_max > beam_radius:
-                beam_radius = r_max
+            r_pix = np.arccos(cos_off)
+            w = np.abs(bv)
+            w_total = float(w.sum())
+            if w_total <= 0.0:
+                continue
+            order = np.argsort(r_pix)
+            w_cum = np.cumsum(w[order]) / w_total
+            idx = int(np.searchsorted(w_cum, beam_radius_quantile))
+            if idx >= r_pix.size:
+                idx = r_pix.size - 1
+            r_enc = float(r_pix[order[idx]])
+            if r_enc > beam_radius:
+                beam_radius = r_enc
         z_skip_threshold = compute_spin2_skip_z_threshold(
             beam_radius, float(config.spin2_skip_tolerance)
         )
         if z_skip_threshold < 0.0:
             print(
                 f"Spin-2 skip: tolerance={config.spin2_skip_tolerance} too tight "
-                f"for beam_radius={np.degrees(beam_radius):.3f}° — optimisation "
-                f"effectively disabled (no equatorial band)."
+                f"for beam_radius_eff={np.degrees(beam_radius):.3f}° "
+                f"(q={beam_radius_quantile}) — optimisation effectively "
+                f"disabled (no equatorial band)."
             )
         else:
             theta_band_deg = np.degrees(np.arccos(z_skip_threshold))
             print(
                 f"Spin-2 skip enabled: tol={config.spin2_skip_tolerance}, "
-                f"beam_radius={np.degrees(beam_radius):.3f}°, "
+                f"beam_radius_eff={np.degrees(beam_radius):.3f}° "
+                f"(q={beam_radius_quantile}), "
                 f"z_threshold={z_skip_threshold:.6f} "
                 f"(boresight band θ ∈ [{theta_band_deg:.2f}°, "
                 f"{180 - theta_band_deg:.2f}°] bypasses correction)"
