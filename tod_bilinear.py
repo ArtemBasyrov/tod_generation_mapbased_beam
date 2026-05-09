@@ -158,6 +158,12 @@ def _gather_accum_fused_jit(
             _other_ch[n_other] = _c
             n_other += 1
 
+    # Empty dummy buffers for the spin-2-skip branch — hoisted out of prange so
+    # we don't pay 3 zero-size allocs per b when the cache is unused.
+    _empty_pix = np.empty(0, dtype=np.int64)
+    _empty_c2d = np.empty(0, dtype=np.float64)
+    _empty_s2d = np.empty(0, dtype=np.float64)
+
     if has_qu:
         for b in numba.prange(B):
             # Per-b rotation scalars — hoisted out of the inner s-loop.
@@ -180,14 +186,17 @@ def _gather_accum_fused_jit(
             apply_spin2 = bz_abs > z_skip_threshold
 
             # Cache only allocated when actually used.  ~24 KiB per active b.
+            # np.empty + scalar reset is cheaper than np.full(-1).
             if apply_spin2:
-                cache_pix = np.full(_SPIN2_CACHE_SIZE, -1, dtype=np.int64)
+                cache_pix = np.empty(_SPIN2_CACHE_SIZE, dtype=np.int64)
+                for _i in range(_SPIN2_CACHE_SIZE):
+                    cache_pix[_i] = -1
                 cache_c2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
                 cache_s2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
             else:
-                cache_pix = np.empty(0, dtype=np.int64)
-                cache_c2d = np.empty(0, dtype=np.float64)
-                cache_s2d = np.empty(0, dtype=np.float64)
+                cache_pix = _empty_pix
+                cache_c2d = _empty_c2d
+                cache_s2d = _empty_s2d
 
             # Boresight (z, sin θ, φ) for spin-2 — computed once per b.
             z_pts = max(-1.0, min(1.0, bz))

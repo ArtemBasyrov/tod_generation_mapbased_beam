@@ -18,7 +18,7 @@
 
   start_day: 0
   end_day: 366
-  # multipricessing parameters
+  # multiprocessing parameters
   n_processes: 6
   # calibration cache — set by the calibration run, disabled on subsequent runs
   # set calibration_enabled: false to force using the cached values below

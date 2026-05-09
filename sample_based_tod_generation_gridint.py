@@ -33,9 +33,9 @@ end_day = config.end_day
 interp_mode = config.beam_interp_method
 
 # ── Worker-global state (populated by _worker_init in each spawned process) ───
-# MP is loaded in the parent, placed in shared memory, and attached here
-# read-only by each worker — no copies, no re-loading the FITS file.
-_g_mp = None  # list of 3 float32 arrays (views into shared memory)
+# Beam data lives in shared memory; the sky map itself is consumed via
+# mp_stacked (per-beam) so we only need its nside in the worker.
+_g_nside = None  # int — HEALPix nside of the input sky map
 _g_beam_data = None  # beam_data dict with mp_stacked from shared memory
 _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
 
@@ -43,7 +43,7 @@ _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
 # ── Pool initialiser ─────────────────────────────────────────────────────────
 
 
-def _worker_init(beam_data_static, mp_desc, beam_shm_descs, n_threads):
+def _worker_init(beam_data_static, nside, beam_shm_descs, n_threads):
     """
     Called once in each spawned worker process.
 
@@ -57,22 +57,18 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, n_threads):
     beam_data_static : dict  — beam_data without large arrays (small scalars /
                                tiny arrays safe to pickle: beam_vals, vec_orig,
                                psi_grid, sel, ra, dec, …)
-    mp_desc          : dict  — {'name', 'shape', 'dtype'} for the stacked MP block
+    nside            : int   — HEALPix nside of the input sky map
     beam_shm_descs   : dict  — {beam_filename: {'name', 'shape', 'dtype'}}
                                for mp_stacked
     """
-    global _g_mp, _g_beam_data, _g_shm_handles
+    global _g_nside, _g_beam_data, _g_shm_handles
 
     if n_threads is not None and n_threads > 0:
         import numba
 
         numba.set_num_threads(int(n_threads))
 
-    # Attach to the stacked (3, npix) sky-map block
-    shm_mp = SharedMemory(name=mp_desc["name"])
-    _g_shm_handles.append(shm_mp)  # keep alive
-    mp_full = np.ndarray(mp_desc["shape"], dtype=mp_desc["dtype"], buffer=shm_mp.buf)
-    _g_mp = [mp_full[i] for i in range(mp_desc["shape"][0])]  # list of 3 views
+    _g_nside = int(nside)
 
     # Attach to each beam entry's mp_stacked block
     _g_beam_data = {}
@@ -92,7 +88,7 @@ def _worker_init(beam_data_static, mp_desc, beam_shm_descs, n_threads):
 def tod_exact_gen_batched(
     beam_data,
     day_index,
-    mp,
+    nside,
     batch_size,
     process_name=None,
     z_skip_threshold=-1.0,
@@ -109,8 +105,7 @@ def tod_exact_gen_batched(
         beam_data (dict): Pre-loaded beam data from :func:`prepare_beam_data`.
             Must include ``'mp_stacked'`` for the Numba gather path.
         day_index (int): Zero-based index of the observation day.
-        mp (list[numpy.ndarray]): Sky map components ``[I, Q, U]``. Used on
-            the fallback (non-stacked) path only.
+        nside (int): HEALPix nside of the input sky map.
         batch_size (int): Number of detector samples per processing batch. Use
             the value returned by :func:`~tod_calibrate._calibrate_n_processes`.
         process_name (str | None): Label for log messages (e.g. the
@@ -121,7 +116,6 @@ def tod_exact_gen_batched(
             ``float64``. Axis 0 is the Stokes component index ``[I, Q, U]``.
     """
     prefix = f"[{process_name}] " if process_name else ""
-    nside = hp.get_nside(mp[0])
 
     # Open mmaps once for the whole day — avoids re-opening 3 files per batch,
     # which at batch_size=8 would otherwise dominate I/O overhead.
@@ -174,7 +168,7 @@ def tod_exact_gen_batched(
         for data in beam_data.values():
             contrib = beam_tod_batch(
                 nside,
-                mp,
+                None,
                 data,
                 rot_vecs,
                 phi_b,
@@ -211,12 +205,12 @@ def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0):
         tod_day = tod_exact_gen_batched(
             _g_beam_data,
             day_index,
-            _g_mp,
+            _g_nside,
             batch_size,
             process_name=process_name,
             z_skip_threshold=z_skip_threshold,
         )
-        output_file = f"{folder_tod_output}tod_day_{day_index}.npy"
+        output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
         np.save(output_file, tod_day)
         print(f"[{process_name}] Saved {output_file}")
         return day_index, True, None
@@ -321,15 +315,12 @@ def main(n_cpu_ceiling):
         f"{ncpus} workers × {n_threads} threads)"
     )
 
+    nside = hp.get_nside(MP[0])
+
     if ncpus > 1:
         # ── Allocate shared memory ─────────────────────────────────────────
-        # Pack all three MP components into one contiguous (3, npix) block so
-        # that a single SharedMemory allocation covers everything.
-        mp_arr = np.ascontiguousarray(np.stack(MP))  # (3, npix) float32
-        shm_mp = SharedMemory(create=True, size=mp_arr.nbytes)
-        np.ndarray(mp_arr.shape, dtype=mp_arr.dtype, buffer=shm_mp.buf)[:] = mp_arr
-        mp_desc = {"name": shm_mp.name, "shape": mp_arr.shape, "dtype": mp_arr.dtype}
-
+        # Workers consume the sky map exclusively via mp_stacked (per-beam,
+        # already in shared memory below); only nside is needed otherwise.
         # One block per unique beam file for mp_stacked (C, npix) float32.
         beam_shms = {}
         beam_shm_descs = {}
@@ -362,13 +353,11 @@ def main(n_cpu_ceiling):
             with multiprocessing.Pool(
                 processes=ncpus,
                 initializer=_worker_init,
-                initargs=(beam_data_static, mp_desc, beam_shm_descs, n_threads),
+                initargs=(beam_data_static, nside, beam_shm_descs, n_threads),
             ) as pool:
                 results = pool.map(worker, days)
         finally:
             # Release shared memory only after all workers have finished.
-            shm_mp.close()
-            shm_mp.unlink()
             for shm in beam_shms.values():
                 shm.close()
                 shm.unlink()
@@ -386,12 +375,12 @@ def main(n_cpu_ceiling):
             tod_day = tod_exact_gen_batched(
                 beam_data,
                 day_index,
-                MP,
+                nside,
                 batch_size,
                 process_name="main",
                 z_skip_threshold=z_skip_threshold,
             )
-            output_file = f"{folder_tod_output}/tod_day_{day_index}.npy"
+            output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
             np.save(output_file, tod_day)
 
     print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")

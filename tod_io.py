@@ -67,7 +67,9 @@ def load_scan_information(folder):
             f"Expected names like 'psi_<N>.npy', got: {files[:5]!r}"
         ) from exc
     nb_of_days = max_index + 1
-    first_file = os.path.join(folder, files[0])
+    # Sort by parsed index so fsamp is deterministic (filesystem order is not).
+    first_name = min(files, key=lambda f: int(f.split("_")[1].split(".")[0]))
+    first_file = os.path.join(folder, first_name)
     fsamp = np.load(first_file).shape[0] / 86400
     return nb_of_days, fsamp
 
