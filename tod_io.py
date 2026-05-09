@@ -102,13 +102,13 @@ def open_scan_day(folder_scan, day_index):
     return theta_mmap, phi_mmap, psi_mmap
 
 
-def load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
+def load_scan_data_batch(folder_scan, day_index, start_idx, end_idx, dtype=np.float32):
     """Load a contiguous batch of scan samples for one day into RAM.
 
     Opens the three scan files for ``day_index`` as memory-maps, slices the
-    requested sample range, and returns them as contiguous ``float32`` arrays.
-    Prefer :func:`open_scan_day` when processing many batches from the same
-    day to avoid redundant file opens.
+    requested sample range, and returns them as contiguous arrays of the
+    requested dtype. Prefer :func:`open_scan_day` when processing many batches
+    from the same day to avoid redundant file opens.
 
     Args:
         folder_scan (str): Path to the scan data directory. Must end with a
@@ -116,11 +116,14 @@ def load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
         day_index (int): Zero-based index of the observation day.
         start_idx (int): First sample index (inclusive).
         end_idx (int): Last sample index (exclusive).
+        dtype (numpy.dtype): Output dtype for theta/phi/psi. Defaults to
+            ``np.float32``; pass ``tod_config.precision_dtype`` to honour the
+            run-wide precision setting.
 
     Returns:
         tuple:
             - **theta** (*numpy.ndarray*) – Boresight colatitude [rad],
-              shape ``(end_idx - start_idx,)``, dtype ``float32``.
+              shape ``(end_idx - start_idx,)``.
             - **phi** (*numpy.ndarray*) – Boresight longitude [rad],
               same shape.
             - **psi** (*numpy.ndarray*) – Polarisation roll angle [rad],
@@ -129,7 +132,7 @@ def load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
     phi_mmap = np.load(folder_scan + f"phi_{day_index}.npy", mmap_mode="r")
     theta_mmap = np.load(folder_scan + f"theta_{day_index}.npy", mmap_mode="r")
     psi_mmap = np.load(folder_scan + f"psi_{day_index}.npy", mmap_mode="r")
-    theta = np.array(theta_mmap[start_idx:end_idx], dtype=np.float32)
-    phi = np.array(phi_mmap[start_idx:end_idx], dtype=np.float32)
-    psi = np.array(psi_mmap[start_idx:end_idx], dtype=np.float32)
+    theta = np.array(theta_mmap[start_idx:end_idx], dtype=dtype)
+    phi = np.array(phi_mmap[start_idx:end_idx], dtype=dtype)
+    psi = np.array(psi_mmap[start_idx:end_idx], dtype=dtype)
     return theta, phi, psi

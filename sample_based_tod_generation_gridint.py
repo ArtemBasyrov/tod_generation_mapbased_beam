@@ -112,8 +112,9 @@ def tod_exact_gen_batched(
             ``multiprocessing.Process`` name). Defaults to ``None``.
 
     Returns:
-        numpy.ndarray: TOD array of shape ``(3, n_samples)``, dtype
-            ``float64``. Axis 0 is the Stokes component index ``[I, Q, U]``.
+        numpy.ndarray: TOD array of shape ``(3, n_samples)``, dtype matching
+            ``tod_config.precision_dtype``. Axis 0 is the Stokes component
+            index ``[I, Q, U]``.
     """
     prefix = f"[{process_name}] " if process_name else ""
 
@@ -136,7 +137,7 @@ def tod_exact_gen_batched(
         + f"n_batches={n_batches}"
     )
 
-    tod_day = np.zeros((3, n_samples))
+    tod_day = np.zeros((3, n_samples), dtype=config.precision_dtype)
     start_time = time.time()
 
     for batch_idx in range(n_batches):
@@ -156,15 +157,15 @@ def tod_exact_gen_batched(
                 + f"Batch {batch_idx + 1}/{n_batches}  samples {bs}-{be - 1}  ETA {eta_str}"
             )
 
-        theta_b = np.array(theta_mmap[bs:be], dtype=np.float32)
-        phi_b = np.array(phi_mmap[bs:be], dtype=np.float32)
-        psi_b = np.array(psi_mmap[bs:be], dtype=np.float32)
+        theta_b = np.array(theta_mmap[bs:be], dtype=config.precision_dtype)
+        phi_b = np.array(phi_mmap[bs:be], dtype=config.precision_dtype)
+        psi_b = np.array(psi_mmap[bs:be], dtype=config.precision_dtype)
         rot_vecs, betas = precompute_rotation_vector_batch(
             ra0, dec0, phi_b, theta_b, center_idx=beam_center_idx
         )
         psis_b = -betas + psi_b
 
-        tod_batch = np.zeros((3, be - bs))
+        tod_batch = np.zeros((3, be - bs), dtype=config.precision_dtype)
         for data in beam_data.values():
             contrib = beam_tod_batch(
                 nside,
@@ -235,9 +236,10 @@ def main(n_cpu_ceiling):
     # Load the sky map here (inside main / under __name__ guard) so that
     # spawned worker processes — which re-import this module — never execute
     # this line themselves.
-    print("Loading sky map...")
+    print(f"Loading sky map (precision={config.precision})...")
     MP = [
-        m.astype(np.float32) for m in hp.read_map(config.path_to_map, field=(0, 1, 2))
+        m.astype(config.precision_dtype)
+        for m in hp.read_map(config.path_to_map, field=(0, 1, 2))
     ]
 
     # ── Load exact beam data (clustering applied separately below) ─────────────
@@ -275,8 +277,8 @@ def main(n_cpu_ceiling):
             tail_fraction=config.beam_cluster_tail_fraction,
         )
 
-    # Stack sky-map components per beam entry into a contiguous (C, N) float32
-    # array.  The Numba gather kernel requires this layout.
+    # Stack sky-map components per beam entry into a contiguous (C, N) array
+    # in the active precision.  The Numba gather kernel requires this layout.
     for data in beam_data.values():
         data["mp_stacked"] = np.ascontiguousarray(
             np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
@@ -321,7 +323,8 @@ def main(n_cpu_ceiling):
         # ── Allocate shared memory ─────────────────────────────────────────
         # Workers consume the sky map exclusively via mp_stacked (per-beam,
         # already in shared memory below); only nside is needed otherwise.
-        # One block per unique beam file for mp_stacked (C, npix) float32.
+        # One block per unique beam file for mp_stacked (C, npix) — dtype
+        # follows config.precision_dtype.
         beam_shms = {}
         beam_shm_descs = {}
         for bf, data in beam_data.items():

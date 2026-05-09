@@ -28,6 +28,7 @@ import healpy as hp
 
 import numba
 
+import tod_config as config
 from tod_io import load_scan_data_batch
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
 from tod_utils import _fmt_time, _get_memory_per_process
@@ -87,7 +88,9 @@ def _max_batch_for_memory(mem_per_proc_gb, beam_data, nside, interp_mode):
 
 
 def _make_probe_data(beam_data, folder_scan, probe_day, n_samples):
-    theta_p, phi_p, psi_p = load_scan_data_batch(folder_scan, probe_day, 0, n_samples)
+    theta_p, phi_p, psi_p = load_scan_data_batch(
+        folder_scan, probe_day, 0, n_samples, dtype=config.precision_dtype
+    )
     n = min(n_samples, len(phi_p))
     return phi_p[:n], theta_p[:n], psi_p[:n]
 

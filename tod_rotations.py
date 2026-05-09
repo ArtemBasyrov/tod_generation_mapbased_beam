@@ -23,6 +23,8 @@ import math
 import numpy as np
 import numba
 
+import tod_config as config
+
 
 # ── Numba JIT kernels ─────────────────────────────────────────────────────────
 
@@ -224,22 +226,22 @@ def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx
 def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
     """
     Pre-compute the per-sample scalars needed by _rodrigues_jit from the
-    Rodrigues vectors and pointing angles.  All outputs are float32.
+    Rodrigues vectors and pointing angles.  All outputs follow
+    ``tod_config.precision_dtype``.
 
     Returns axes (B,3), cos_a (B,), sin_a (B,), ax_pts (B,3), cos_p (B,), sin_p (B,)
     """
-    angles = np.linalg.norm(rot_vecs, axis=-1).astype(np.float32)  # (B,)
-    safe = angles > np.float32(1e-10)
-    axes = (
-        rot_vecs / np.where(safe[:, None], angles[:, None], np.float32(1.0))
-    ).astype(np.float32)
-    axes = np.where(safe[:, None], axes, np.float32(0.0))
+    dt = config.precision_dtype
+    angles = np.linalg.norm(rot_vecs, axis=-1).astype(dt)  # (B,)
+    safe = angles > dt(1e-10)
+    axes = (rot_vecs / np.where(safe[:, None], angles[:, None], dt(1.0))).astype(dt)
+    axes = np.where(safe[:, None], axes, dt(0.0))
     cos_a = np.cos(angles)
     sin_a = np.sin(angles)
 
-    phi_f = np.asarray(phi_b, dtype=np.float32)
-    theta_f = np.asarray(theta_b, dtype=np.float32)
-    psis_f = np.asarray(psis_b, dtype=np.float32)
+    phi_f = np.asarray(phi_b, dtype=dt)
+    theta_f = np.asarray(theta_b, dtype=dt)
+    psis_f = np.asarray(psis_b, dtype=dt)
     st = np.sin(theta_f)
     ct = np.cos(theta_f)
     sp = np.sin(phi_f)
@@ -281,9 +283,10 @@ def _recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
     axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
         rot_vecs, phi_pix, theta_pix, psis
     )
-    out = np.empty((B, S, 3), dtype=np.float32)
+    dt = config.precision_dtype
+    out = np.empty((B, S, 3), dtype=dt)
     _rodrigues_jit(
-        np.asarray(vec_orig, dtype=np.float32),
+        np.asarray(vec_orig, dtype=dt),
         axes,
         cos_a,
         sin_a,

@@ -34,6 +34,7 @@ _get_interp_weights_jit, get_interp_weights_numba
 import numpy as np
 import healpy as hp
 
+import tod_config as config
 from numba_healpy import get_interp_weights_numba
 from tod_rotations import (
     _rotation_params,
@@ -126,8 +127,9 @@ def beam_tod_batch(
     axes, cos_a, sin_a, ax_pts, cos_p, sin_p = _rotation_params(
         rot_vecs, phi_b, theta_b, psis_b
     )
-    vec_orig_f32 = np.ascontiguousarray(vec_orig, dtype=np.float32)
-    beam_vals_f32 = np.ascontiguousarray(beam_vals, dtype=np.float32)
+    _dt = config.precision_dtype
+    vec_orig_f32 = np.ascontiguousarray(vec_orig, dtype=_dt)
+    beam_vals_f32 = np.ascontiguousarray(beam_vals, dtype=_dt)
 
     if mp_stacked is not None:
         tod_arr = np.zeros((C, B), dtype=np.float64)
@@ -169,9 +171,7 @@ def beam_tod_batch(
                 c_u,
                 float(z_skip_threshold),
             )
-        return {
-            comp: tod_arr[i].astype(np.float32) for i, comp in enumerate(comp_indices)
-        }
+        return {comp: tod_arr[i].astype(_dt) for i, comp in enumerate(comp_indices)}
 
     # ── Fallback: healpy-based gather when mp_stacked is not provided.
     # Not on the production hot path — materialises the (B, S, 3) rotated
@@ -182,6 +182,4 @@ def beam_tod_batch(
     mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
     mp_flat = np.einsum("ckn,kn->cn", mp_gathered, weights)
     tod_chunk = mp_flat.reshape(C, B, S) @ beam_vals_f32
-    return {
-        comp: tod_chunk[i].astype(np.float32) for i, comp in enumerate(comp_indices)
-    }
+    return {comp: tod_chunk[i].astype(_dt) for i, comp in enumerate(comp_indices)}

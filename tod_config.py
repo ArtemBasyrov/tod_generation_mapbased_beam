@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import yaml
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +33,21 @@ calibration_enabled = _cfg.get("calibration_enabled", True)
 calibration_n_processes = _cfg.get("calibration_n_processes", None)
 calibration_numba_threads = _cfg.get("calibration_numba_threads", None)
 calibration_batch_size = _cfg.get("calibration_batch_size", None)
+
+# Working precision for the float32-side of the pipeline.
+# Governs sky map, pointings, beam values, Rodrigues rotation, and the saved
+# TOD output. Float64 surfaces that exist for accumulation precision (bilinear
+# weights, spin-2 cache, TOD accumulator, B_ell) are NOT affected.
+# Use 'float64' as a precision-validation knob; 'float32' is the default and
+# matches the legacy behaviour.
+_precision_raw = _cfg.get("precision", "float32")
+_VALID_PRECISION = {"float32": np.float32, "float64": np.float64}
+if _precision_raw not in _VALID_PRECISION:
+    raise ValueError(
+        f"precision must be one of {sorted(_VALID_PRECISION)!r}, got {_precision_raw!r}"
+    )
+precision = _precision_raw
+precision_dtype = _VALID_PRECISION[_precision_raw]
 
 # Beam grid interpolation method
 # beam_interp_method: 'nearest'  → single nearest-pixel lookup (fastest)

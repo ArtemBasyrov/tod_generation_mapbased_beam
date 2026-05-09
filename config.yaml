@@ -65,6 +65,13 @@
   # calibration picks the fastest (tail_fraction, n_clusters) pair whose
   # B_ell divergence does not exceed this value.
   clustering_error_threshold: 1.0e-5
+  # Working precision for the float32-side of the pipeline (sky map, pointings,
+  # beam values, Rodrigues rotation, saved TOD). Float64 surfaces (bilinear
+  # weights, spin-2 cache, accumulators, B_ell) are unchanged either way.
+  # 'float32' (default) matches legacy behaviour; 'float64' is a precision
+  # validation knob — slower and uses more memory but isolates whether
+  # high-ell residuals are precision-limited.
+  precision: 'float32'
   # Multiprocessing start method: 'spawn' (safe, default) or 'fork' (faster on Linux).
   # 'fork' avoids re-running Numba JIT compilation in each worker but may deadlock
   # on macOS. Only change this if you have verified it is safe on your platform.

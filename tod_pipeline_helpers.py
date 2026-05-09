@@ -72,7 +72,7 @@ def prepare_beam_data(beam_filenames):
 
         db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
         sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
-        beam_vals = pixel_map[sel].astype(np.float32)
+        beam_vals = pixel_map[sel].astype(config.precision_dtype)
         norm = beam_vals.sum()
         if norm != 0:
             beam_vals /= norm
@@ -85,7 +85,7 @@ def prepare_beam_data(beam_filenames):
                 np.cos(theta_orig),
             ],
             axis=-1,
-        )[sel].astype(np.float32)
+        )[sel].astype(config.precision_dtype)
 
         beam_data[bf] = {
             "ra": ra,

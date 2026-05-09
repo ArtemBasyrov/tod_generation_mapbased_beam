@@ -56,9 +56,10 @@ def main():
     Nb, _ = load_scan_information(config.FOLDER_SCAN)
     probe_day = max(config.start_day or 0, 0)
 
-    print("Loading sky map...")
+    print(f"Loading sky map (precision={config.precision})...")
     MP = [
-        m.astype(np.float32) for m in hp.read_map(config.path_to_map, field=(0, 1, 2))
+        m.astype(config.precision_dtype)
+        for m in hp.read_map(config.path_to_map, field=(0, 1, 2))
     ]
 
     print("Loading beam data...")
