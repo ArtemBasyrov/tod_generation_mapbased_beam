@@ -255,6 +255,40 @@ def save_runtime_calibration(n_processes, n_threads, batch_size):
     )
 
 
+def apply_hwp_modulation(tod_batch, day_index, sample_start, fsamp, f_hwp, phi0):
+    """Rotate the Q/U rows of a TOD batch in place to model an ideal HWP.
+
+    Models a continuously rotating half-wave plate by applying
+        Q' =  Q·cos(4φ) + U·sin(4φ)
+        U' = −Q·sin(4φ) + U·cos(4φ)
+    where φ(t) = 2π·f_hwp·t + phi0 and t is seconds since the start of day 0
+    (continuous across days). Only the polarization rows are touched; T is
+    unchanged.
+
+    Args:
+        tod_batch (np.ndarray): Shape ``(3, B)``; modified in place.
+        day_index (int): Zero-based observation-day index.
+        sample_start (int): Index of the first sample of this batch within the
+            day (i.e. ``bs`` in the caller).
+        fsamp (float): Sample rate [samples/s].
+        f_hwp (float): HWP physical rotation frequency [Hz].
+        phi0 (float): Initial HWP phase at t=0 [rad].
+    """
+    B = tod_batch.shape[1]
+    if B == 0:
+        return
+    dt = 1.0 / float(fsamp)
+    t0 = day_index * 86400.0 + sample_start * dt
+    t = t0 + np.arange(B, dtype=np.float64) * dt
+    phi = 2.0 * np.pi * float(f_hwp) * t + float(phi0)
+    c = np.cos(4.0 * phi).astype(tod_batch.dtype, copy=False)
+    s = np.sin(4.0 * phi).astype(tod_batch.dtype, copy=False)
+    Q = tod_batch[1].copy()
+    U = tod_batch[2].copy()
+    tod_batch[1] = Q * c + U * s
+    tod_batch[2] = -Q * s + U * c
+
+
 def save_clustering_calibration(tail_fraction, n_clusters):
     """Write clustering calibration results back to the active config YAML."""
     _write_config(

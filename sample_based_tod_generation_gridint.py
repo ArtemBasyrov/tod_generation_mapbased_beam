@@ -15,6 +15,7 @@ from tod_utils import _get_ncpus, _fmt_time, _should_print_batch
 from tod_pipeline_helpers import (
     prepare_beam_data,
     apply_beam_clustering,
+    apply_hwp_modulation,
     resolve_spin2_skip_threshold,
     save_runtime_calibration,
     save_clustering_calibration,
@@ -92,6 +93,7 @@ def tod_exact_gen_batched(
     batch_size,
     process_name=None,
     z_skip_threshold=-1.0,
+    fsamp=None,
 ):
     """Generate TOD for a single observation day using batched processing.
 
@@ -181,6 +183,16 @@ def tod_exact_gen_batched(
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
 
+        if config.hwp_enabled:
+            apply_hwp_modulation(
+                tod_batch,
+                day_index=day_index,
+                sample_start=bs,
+                fsamp=fsamp,
+                f_hwp=config.hwp_rotation_frequency_hz,
+                phi0=config.hwp_initial_phase_rad,
+            )
+
         tod_day[:, bs:be] = tod_batch
 
     total = time.time() - start_time
@@ -194,7 +206,7 @@ def tod_exact_gen_batched(
 # ── Per-day worker (used by multiprocessing pool) ─────────────────────────────
 
 
-def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0):
+def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0, fsamp=None):
     """
     Worker entry point.  beam_data and mp are *not* passed as arguments —
     they live in the module-level globals populated by _worker_init, so no
@@ -210,6 +222,7 @@ def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0):
             batch_size,
             process_name=process_name,
             z_skip_threshold=z_skip_threshold,
+            fsamp=fsamp,
         )
         output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
         np.save(output_file, tod_day)
@@ -225,7 +238,7 @@ def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0):
 
 def main(n_cpu_ceiling):
     t0 = time.time()
-    Nb, _ = load_scan_information(folder_scan)
+    Nb, fsamp = load_scan_information(folder_scan)
 
     start = max(start_day or 0, 0)
     end = min(end_day or Nb, Nb)
@@ -351,6 +364,7 @@ def main(n_cpu_ceiling):
             batch_size=batch_size,
             Nb=Nb,
             z_skip_threshold=z_skip_threshold,
+            fsamp=fsamp,
         )
         try:
             with multiprocessing.Pool(
@@ -382,6 +396,7 @@ def main(n_cpu_ceiling):
                 batch_size,
                 process_name="main",
                 z_skip_threshold=z_skip_threshold,
+                fsamp=fsamp,
             )
             output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
             np.save(output_file, tod_day)

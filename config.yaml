@@ -72,6 +72,20 @@
   # validation knob — slower and uses more memory but isolates whether
   # high-ell residuals are precision-limited.
   precision: 'float32'
+  # Half-wave plate (HWP) modulation.
+  # When enabled, the TOD generator rotates the per-sample (Q, U) output by
+  # 4·φ_HWP(t), where φ_HWP(t) = 2π · hwp_rotation_frequency_hz · t +
+  # hwp_initial_phase_rad and t is seconds since the start of day 0
+  # (continuous across days). The rotation applied is:
+  #     Q' =  Q·cos(4φ) + U·sin(4φ)
+  #     U' = −Q·sin(4φ) + U·cos(4φ)
+  # so that downstream mapmakers still combine the detector signal as
+  #     d = T + Q'·cos(2ψ) + U'·sin(2ψ).
+  # The HWP affects polarization angle only, not beam shape — it is applied
+  # after beam convolution and does NOT alter the Rodrigues rotation.
+  hwp_enabled: false
+  hwp_rotation_frequency_hz: 0.0     # physical HWP rotation rate f_HWP [Hz]
+  hwp_initial_phase_rad: 0.0         # φ₀ at t = 0 (start of day 0) [rad]
   # Multiprocessing start method: 'spawn' (safe, default) or 'fork' (faster on Linux).
   # 'fork' avoids re-running Numba JIT compilation in each worker but may deadlock
   # on macOS. Only change this if you have verified it is safe on your platform.

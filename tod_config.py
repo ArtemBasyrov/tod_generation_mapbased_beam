@@ -95,6 +95,22 @@ beam_cluster_tail_fraction = _cfg.get("beam_cluster_tail_fraction", None)
 clustering_calibration_enabled = _cfg.get("clustering_calibration_enabled", False)
 clustering_error_threshold = _cfg.get("clustering_error_threshold", 1e-3)
 
+# Half-wave plate (HWP) modulation.
+# When hwp_enabled is True, the TOD generator rotates the per-sample (Q, U)
+# output by 4·φ_HWP(t) with φ_HWP(t) = 2π·hwp_rotation_frequency_hz·t +
+# hwp_initial_phase_rad. Time t is seconds since the start of day 0
+# (continuous across days). The HWP is applied AFTER beam convolution and
+# affects polarization angle only — it does not modify the beam shape or
+# the Rodrigues rotation.
+hwp_enabled = bool(_cfg.get("hwp_enabled", False))
+hwp_rotation_frequency_hz = float(_cfg.get("hwp_rotation_frequency_hz", 0.0))
+hwp_initial_phase_rad = float(_cfg.get("hwp_initial_phase_rad", 0.0))
+if hwp_enabled and not (hwp_rotation_frequency_hz > 0.0):
+    raise ValueError(
+        "hwp_enabled is True but hwp_rotation_frequency_hz must be > 0; "
+        f"got {hwp_rotation_frequency_hz!r}"
+    )
+
 # Multiprocessing start method ('spawn' or 'fork').
 # 'spawn' (default): safe on all platforms; re-triggers Numba JIT in each worker.
 # 'fork': faster worker startup on Linux (Numba cache already compiled); may cause

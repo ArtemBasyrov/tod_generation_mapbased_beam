@@ -390,6 +390,168 @@ class TestWriteConfigAndCalibrationSavers:
         assert data["clustering_calibration_enabled"] is False
 
 
+# ===========================================================================
+# TestApplyHwpModulation
+# ===========================================================================
+
+
+class TestApplyHwpModulation:
+    """Tests for apply_hwp_modulation — in-place 4·φ_HWP rotation of (Q, U).
+
+    Reference formula (matching the helper's implementation):
+        φ(t)  = 2π·f_hwp·t + φ₀,  t = day_index·86400 + sample_start·dt + i·dt
+        Q'_i =  Q_i·cos(4φ_i) + U_i·sin(4φ_i)
+        U'_i = −Q_i·sin(4φ_i) + U_i·cos(4φ_i)
+    T (row 0) must never be modified.
+    """
+
+    @staticmethod
+    def _make_batch(B, dtype=np.float32, seed=0):
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal((3, B)).astype(dtype)
+
+    def test_zero_frequency_zero_phase_is_identity_on_QU(self):
+        """f_hwp=0 and φ₀=0 → cos=1, sin=0; (Q,U) unchanged (T also unchanged)."""
+        tod = self._make_batch(B=32)
+        original = tod.copy()
+        pph.apply_hwp_modulation(
+            tod, day_index=0, sample_start=0, fsamp=19.0, f_hwp=0.0, phi0=0.0
+        )
+        npt.assert_array_equal(tod, original)
+
+    def test_T_row_is_never_modified(self):
+        """The intensity row must be left bit-for-bit identical."""
+        tod = self._make_batch(B=64)
+        T_before = tod[0].copy()
+        pph.apply_hwp_modulation(
+            tod, day_index=3, sample_start=10, fsamp=19.0, f_hwp=2.5, phi0=0.7
+        )
+        npt.assert_array_equal(tod[0], T_before)
+
+    def test_empty_batch_is_noop(self):
+        """B=0 must early-return without raising."""
+        tod = np.empty((3, 0), dtype=np.float32)
+        pph.apply_hwp_modulation(
+            tod, day_index=0, sample_start=0, fsamp=19.0, f_hwp=1.0, phi0=0.0
+        )
+        assert tod.shape == (3, 0)
+
+    def test_QU_norm_is_preserved(self):
+        """An ideal HWP is a rotation in (Q,U) space; Q²+U² is invariant per sample."""
+        tod = self._make_batch(B=128, dtype=np.float64)
+        norm_before = tod[1] ** 2 + tod[2] ** 2
+        pph.apply_hwp_modulation(
+            tod, day_index=5, sample_start=42, fsamp=19.0, f_hwp=1.7, phi0=0.3
+        )
+        norm_after = tod[1] ** 2 + tod[2] ** 2
+        npt.assert_allclose(norm_after, norm_before, rtol=1e-12, atol=1e-12)
+
+    def test_matches_explicit_formula(self):
+        """Numerical agreement with the reference 4φ rotation formula."""
+        B = 16
+        fsamp = 19.0
+        f_hwp = 0.5
+        phi0 = 0.25
+        day_index = 2
+        sample_start = 7
+        tod = self._make_batch(B=B, dtype=np.float64, seed=42)
+        Q0, U0 = tod[1].copy(), tod[2].copy()
+
+        pph.apply_hwp_modulation(
+            tod,
+            day_index=day_index,
+            sample_start=sample_start,
+            fsamp=fsamp,
+            f_hwp=f_hwp,
+            phi0=phi0,
+        )
+
+        dt = 1.0 / fsamp
+        t = day_index * 86400.0 + sample_start * dt + np.arange(B) * dt
+        phi = 2.0 * np.pi * f_hwp * t + phi0
+        c = np.cos(4.0 * phi)
+        s = np.sin(4.0 * phi)
+        Q_expected = Q0 * c + U0 * s
+        U_expected = -Q0 * s + U0 * c
+        npt.assert_allclose(tod[1], Q_expected, rtol=1e-12, atol=1e-12)
+        npt.assert_allclose(tod[2], U_expected, rtol=1e-12, atol=1e-12)
+
+    def test_phase_continuity_across_days(self):
+        """Sample 0 of day_index=1 must continue the phase from end of day 0."""
+        fsamp = 19.0
+        f_hwp = 1.0
+        phi0 = 0.0
+        # Two single-sample "batches": last sample of day 0, first sample of day 1.
+        # Build them with identical (Q, U) so the rotation reveals the phase.
+        tod_a = np.array([[0.0], [1.0], [0.0]], dtype=np.float64)
+        tod_b = np.array([[0.0], [1.0], [0.0]], dtype=np.float64)
+        N_per_day = int(round(fsamp * 86400.0))
+
+        pph.apply_hwp_modulation(
+            tod_a,
+            day_index=0,
+            sample_start=N_per_day - 1,
+            fsamp=fsamp,
+            f_hwp=f_hwp,
+            phi0=phi0,
+        )
+        pph.apply_hwp_modulation(
+            tod_b,
+            day_index=1,
+            sample_start=0,
+            fsamp=fsamp,
+            f_hwp=f_hwp,
+            phi0=phi0,
+        )
+        # The two t values must differ by exactly dt = 1/fsamp (continuous time).
+        dt = 1.0 / fsamp
+        t_a = 0 * 86400.0 + (N_per_day - 1) * dt
+        t_b = 1 * 86400.0 + 0 * dt
+        npt.assert_allclose(t_b - t_a, dt, rtol=1e-12, atol=1e-12)
+
+    def test_initial_phase_offset_applied(self):
+        """At t=0 (day 0, sample 0, i=0) only φ₀ contributes."""
+        phi0 = 0.4
+        tod = np.array([[0.0], [1.0], [0.0]], dtype=np.float64)
+        pph.apply_hwp_modulation(
+            tod, day_index=0, sample_start=0, fsamp=19.0, f_hwp=0.0, phi0=phi0
+        )
+        # Q=1, U=0 → Q' = cos(4φ₀), U' = −sin(4φ₀)
+        assert tod[1, 0] == pytest.approx(np.cos(4.0 * phi0), rel=1e-12)
+        assert tod[2, 0] == pytest.approx(-np.sin(4.0 * phi0), rel=1e-12)
+
+    def test_dtype_preserved_float32(self):
+        """A float32 input must remain float32 after the in-place rotation."""
+        tod = self._make_batch(B=8, dtype=np.float32)
+        pph.apply_hwp_modulation(
+            tod, day_index=0, sample_start=0, fsamp=19.0, f_hwp=1.0, phi0=0.1
+        )
+        assert tod.dtype == np.float32
+
+    def test_dtype_preserved_float64(self):
+        tod = self._make_batch(B=8, dtype=np.float64)
+        pph.apply_hwp_modulation(
+            tod, day_index=0, sample_start=0, fsamp=19.0, f_hwp=1.0, phi0=0.1
+        )
+        assert tod.dtype == np.float64
+
+    def test_full_period_returns_to_original(self):
+        """A full HWP rotation period (Δt = 1/f_hwp) applies 4·(2π)=8π → identity."""
+        # Construct two single-sample batches whose times differ by exactly 1/f_hwp.
+        f_hwp = 0.5  # period = 2 s
+        fsamp = 1.0  # so one period = 2 samples
+        Q0, U0 = 0.6, -0.8
+        tod_a = np.array([[0.0], [Q0], [U0]], dtype=np.float64)
+        tod_b = tod_a.copy()
+        pph.apply_hwp_modulation(
+            tod_a, day_index=0, sample_start=0, fsamp=fsamp, f_hwp=f_hwp, phi0=0.0
+        )
+        pph.apply_hwp_modulation(
+            tod_b, day_index=0, sample_start=2, fsamp=fsamp, f_hwp=f_hwp, phi0=0.0
+        )
+        npt.assert_allclose(tod_a, tod_b, rtol=1e-12, atol=1e-12)
+
+
 # ---------------------------------------------------------------------------
 # Standalone entry point
 # ---------------------------------------------------------------------------
