@@ -17,12 +17,53 @@ FOLDER_BEAM = _cfg["FOLDER_BEAM"]
 FOLDER_SCAN = _cfg["FOLDER_SCAN"]
 FOLDER_TOD_OUTPUT = _cfg["FOLDER_TOD_OUTPUT"]
 path_to_map = _cfg["path_to_map"]
-beam_file_I = _cfg["beam_file_I"]
-beam_file_Q = _cfg["beam_file_Q"]
-beam_file_U = _cfg["beam_file_U"]
-power_threshold_I = _cfg["power_fraction_threshold_I"]
-power_threshold_Q = _cfg["power_fraction_threshold_Q"]
-power_threshold_U = _cfg["power_fraction_threshold_U"]
+
+# Which Stokes components to read from the input FITS map.
+# Subset of [0, 1, 2] (= [T, Q, U]). Defaults to all three for backward
+# compatibility. With map_fields = [0], a temperature-only FITS file is
+# supported: Q/U TOD rows are filled with zeros and the spin-2 frame rotation
+# is skipped entirely. The output TOD shape is always (3, n_samples)
+# regardless of which fields are loaded.
+_map_fields_raw = _cfg.get("map_fields", [0, 1, 2])
+if not isinstance(_map_fields_raw, (list, tuple)) or not _map_fields_raw:
+    raise ValueError(
+        f"map_fields must be a non-empty list/tuple, got {_map_fields_raw!r}"
+    )
+map_fields = tuple(sorted({int(x) for x in _map_fields_raw}))
+if any(c not in (0, 1, 2) for c in map_fields):
+    raise ValueError(
+        f"map_fields entries must be in {{0, 1, 2}} (T, Q, U); got {map_fields!r}"
+    )
+
+# Per-component beam files and power thresholds are required only for the
+# Stokes components listed in map_fields. Entries for inactive components
+# may be omitted from the YAML or left as null.
+beam_file_I = _cfg.get("beam_file_I")
+beam_file_Q = _cfg.get("beam_file_Q")
+beam_file_U = _cfg.get("beam_file_U")
+power_threshold_I = _cfg.get("power_fraction_threshold_I")
+power_threshold_Q = _cfg.get("power_fraction_threshold_Q")
+power_threshold_U = _cfg.get("power_fraction_threshold_U")
+
+# Validate that beam files and power thresholds exist for every active field.
+_COMP_LABELS = {0: "I", 1: "Q", 2: "U"}
+_beam_files_by_idx = {0: beam_file_I, 1: beam_file_Q, 2: beam_file_U}
+_thresholds_by_idx = {
+    0: power_threshold_I,
+    1: power_threshold_Q,
+    2: power_threshold_U,
+}
+_missing = []
+for _c in map_fields:
+    _lbl = _COMP_LABELS[_c]
+    if _beam_files_by_idx[_c] is None:
+        _missing.append(f"beam_file_{_lbl}")
+    if _thresholds_by_idx[_c] is None:
+        _missing.append(f"power_fraction_threshold_{_lbl}")
+if _missing:
+    raise ValueError(
+        f"map_fields={list(map_fields)} requires config entries: " + ", ".join(_missing)
+    )
 start_day = _cfg["start_day"]
 end_day = _cfg["end_day"]
 n_processes = _cfg["n_processes"]

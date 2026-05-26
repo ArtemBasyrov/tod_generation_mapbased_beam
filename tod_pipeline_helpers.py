@@ -25,7 +25,7 @@ from tod_spin2 import compute_spin2_skip_z_threshold
 from beam_cluster import cluster_beam_pixels, cluster_cached_arrays
 
 
-def prepare_beam_data(beam_filenames):
+def prepare_beam_data(beam_filenames, active_fields=None):
     """Load and preprocess all unique beam files into a beam-data dictionary.
 
     For each unique beam filename, loads the FITS map, selects pixels by power
@@ -37,6 +37,11 @@ def prepare_beam_data(beam_filenames):
             component, in the order ``[I, Q, U]``). Duplicate filenames are
             de-duplicated; the corresponding ``comp_indices`` lists which Stokes
             components share a given beam file.
+        active_fields (tuple[int, ...] | None): Which Stokes component indices
+            (0=T, 1=Q, 2=U) are present in the loaded sky map. Beam entries
+            whose comp_indices fall entirely outside this set are dropped, and
+            within each kept entry comp_indices is filtered to the active set.
+            ``None`` → use ``config.map_fields``.
 
     Returns:
         dict[str, dict]: Beam-data dictionary keyed by beam filename. Each
@@ -51,15 +56,29 @@ def prepare_beam_data(beam_filenames):
             - ``'n_sel'`` – Number of selected pixels ``S``
             - ``'vec_orig'`` – Beam-pixel unit vectors, shape ``(S, 3)``
     """
-    beam_threshold_map = {
-        config.beam_file_I: config.power_threshold_I,
-        config.beam_file_Q: config.power_threshold_Q,
-        config.beam_file_U: config.power_threshold_U,
-    }
+    if active_fields is None:
+        active_fields = config.map_fields
+    active_set = set(int(c) for c in active_fields)
 
+    # Only build the threshold lookup for active components. Inactive entries
+    # in beam_filenames may legitimately be None.
+    _per_idx_threshold = (
+        config.power_threshold_I,
+        config.power_threshold_Q,
+        config.power_threshold_U,
+    )
+    beam_threshold_map = {}
     beam_groups = {}
     for i, bf in enumerate(beam_filenames):
+        if i not in active_set:
+            continue
+        if bf is None:
+            raise ValueError(
+                f"beam_filenames[{i}] is None but component {i} is active "
+                f"(map_fields={sorted(active_set)})"
+            )
         beam_groups.setdefault(bf, []).append(i)
+        beam_threshold_map[bf] = _per_idx_threshold[i]
 
     beam_data = {}
     for bf, comp_indices in beam_groups.items():

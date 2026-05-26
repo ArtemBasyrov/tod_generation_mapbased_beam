@@ -56,11 +56,17 @@ def main():
     Nb, _ = load_scan_information(config.FOLDER_SCAN)
     probe_day = max(config.start_day or 0, 0)
 
-    print(f"Loading sky map (precision={config.precision})...")
-    MP = [
-        m.astype(config.precision_dtype)
-        for m in hp.read_map(config.path_to_map, field=(0, 1, 2))
-    ]
+    print(
+        f"Loading sky map (precision={config.precision}, "
+        f"fields={list(config.map_fields)})..."
+    )
+    _raw = hp.read_map(config.path_to_map, field=tuple(config.map_fields))
+    if len(config.map_fields) == 1:
+        _raw = (_raw,)
+    MP = {
+        c: np.asarray(m).astype(config.precision_dtype)
+        for c, m in zip(config.map_fields, _raw)
+    }
 
     print("Loading beam data...")
     beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]

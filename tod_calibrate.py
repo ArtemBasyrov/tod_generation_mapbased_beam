@@ -268,7 +268,7 @@ def calibrate_runtime(
     Returns:
         (n_processes, n_threads, batch_size)
     """
-    nside = hp.get_nside(mp[0])
+    nside = hp.get_nside(next(iter(mp.values())) if isinstance(mp, dict) else mp[0])
     first_bf = next(iter(beam_data))
     ra0, dec0 = beam_data[first_bf]["ra"], beam_data[first_bf]["dec"]
 
@@ -461,7 +461,8 @@ def calibrate_beam_clustering(
 
     if bell_lmax is None:
         if mp is not None:
-            bell_lmax = 2 * hp.get_nside(mp[0])
+            _ref = next(iter(mp.values())) if isinstance(mp, dict) else mp[0]
+            bell_lmax = 2 * hp.get_nside(_ref)
         else:
             bell_lmax = 500
 

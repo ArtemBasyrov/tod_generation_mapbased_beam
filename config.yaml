@@ -2,8 +2,15 @@
   FOLDER_SCAN: "/path/to/scan/folder/"
   FOLDER_TOD_OUTPUT: "/path/to/tod/output/folder/"
   path_to_map: "/path/to/map/skymap.fits" # has I,Q,U maps
+  # Which Stokes components to read from the FITS map.
+  # Subset of [0, 1, 2] (= [T, Q, U]). Use [0] for a temperature-only map —
+  # the pipeline then skips the spin-2 Q/U frame rotation and writes zeros for
+  # the Q/U rows of the output TOD. Output shape stays (3, n_samples).
+  map_fields: [0, 1, 2]
 
   # beam files setup
+  # Only the entries whose index appears in map_fields are required. Entries
+  # for inactive components may be omitted or set to null.
   FOLDER_BEAM: "/path/to/beam/folder/"
   beam_file_I: "beam_pixel_map_I.fits"
   beam_file_Q: "beam_pixel_map_Q.fits"

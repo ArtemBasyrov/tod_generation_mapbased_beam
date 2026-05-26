@@ -249,11 +249,17 @@ def main(n_cpu_ceiling):
     # Load the sky map here (inside main / under __name__ guard) so that
     # spawned worker processes — which re-import this module — never execute
     # this line themselves.
-    print(f"Loading sky map (precision={config.precision})...")
-    MP = [
-        m.astype(config.precision_dtype)
-        for m in hp.read_map(config.path_to_map, field=(0, 1, 2))
-    ]
+    print(
+        f"Loading sky map (precision={config.precision}, "
+        f"fields={list(config.map_fields)})..."
+    )
+    _raw = hp.read_map(config.path_to_map, field=tuple(config.map_fields))
+    if len(config.map_fields) == 1:
+        _raw = (_raw,)
+    MP = {
+        c: np.asarray(m).astype(config.precision_dtype)
+        for c, m in zip(config.map_fields, _raw)
+    }
 
     # ── Load exact beam data (clustering applied separately below) ─────────────
     print("Loading beam data...")
@@ -330,7 +336,7 @@ def main(n_cpu_ceiling):
         f"{ncpus} workers × {n_threads} threads)"
     )
 
-    nside = hp.get_nside(MP[0])
+    nside = hp.get_nside(next(iter(MP.values())))
 
     if ncpus > 1:
         # ── Allocate shared memory ─────────────────────────────────────────
