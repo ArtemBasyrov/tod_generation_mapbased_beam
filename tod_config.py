@@ -151,6 +151,12 @@ if hwp_enabled and not (hwp_rotation_frequency_hz > 0.0):
         "hwp_enabled is True but hwp_rotation_frequency_hz must be > 0; "
         f"got {hwp_rotation_frequency_hz!r}"
     )
+if hwp_enabled and not (1 in map_fields and 2 in map_fields):
+    raise ValueError(
+        "hwp_enabled is True but map_fields does not contain both Q (1) and "
+        f"U (2); got map_fields={list(map_fields)}. HWP modulation rotates "
+        "Q and U into each other and is meaningless without both."
+    )
 
 # Multiprocessing start method ('spawn' or 'fork').
 # 'spawn' (default): safe on all platforms; re-triggers Numba JIT in each worker.
