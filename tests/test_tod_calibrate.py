@@ -636,13 +636,15 @@ def _runtime_beam_data(S=10, nside=8):
     }
 
 
-def _fake_load_scan_data_batch(folder_scan, day_index, start_idx, end_idx):
+def _fake_load_scan_data_batch(
+    folder_scan, day_index, start_idx, end_idx, dtype=np.float32
+):
     """Stub of tod_io.load_scan_data_batch — returns deterministic float32 ramps."""
     n = end_idx - start_idx
     return (
-        (np.arange(n) + start_idx).astype(np.float32),
-        (np.arange(n) + start_idx + 1000).astype(np.float32),
-        (np.arange(n) + start_idx + 2000).astype(np.float32),
+        (np.arange(n) + start_idx).astype(dtype),
+        (np.arange(n) + start_idx + 1000).astype(dtype),
+        (np.arange(n) + start_idx + 2000).astype(dtype),
     )
 
 
@@ -672,12 +674,12 @@ class TestMakeProbeData:
         """If the loader returns fewer samples than requested, output is capped."""
         bd = _runtime_beam_data()
 
-        def short_loader(folder, day, s, e):
+        def short_loader(folder, day, s, e, dtype=np.float32):
             n = max(0, (e - s) // 2)
             return (
-                np.zeros(n, dtype=np.float32),
-                np.zeros(n, dtype=np.float32),
-                np.zeros(n, dtype=np.float32),
+                np.zeros(n, dtype=dtype),
+                np.zeros(n, dtype=dtype),
+                np.zeros(n, dtype=dtype),
             )
 
         with patch("tod_calibrate.load_scan_data_batch", side_effect=short_loader):
