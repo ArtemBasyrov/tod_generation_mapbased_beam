@@ -45,7 +45,6 @@ power_threshold_I = _cfg.get("power_fraction_threshold_I")
 power_threshold_Q = _cfg.get("power_fraction_threshold_Q")
 power_threshold_U = _cfg.get("power_fraction_threshold_U")
 
-# Validate that beam files and power thresholds exist for every active field.
 _COMP_LABELS = {0: "I", 1: "Q", 2: "U"}
 _beam_files_by_idx = {0: beam_file_I, 1: beam_file_Q, 2: beam_file_U}
 _thresholds_by_idx = {
@@ -90,10 +89,8 @@ if _precision_raw not in _VALID_PRECISION:
 precision = _precision_raw
 precision_dtype = _VALID_PRECISION[_precision_raw]
 
-# Beam grid interpolation method
-# beam_interp_method: 'nearest'  → single nearest-pixel lookup (fastest)
-#                     'bilinear' → 4-pixel bilinear HEALPix (default, fast Numba kernel)
-# ('bicubic' branch adds Keys/Catmull-Rom; 'gaussian' branch adds isotropic Gaussian kernel)
+# Additional methods live on feature branches: 'bicubic' (Keys/Catmull-Rom)
+# and 'gaussian' (isotropic Gaussian kernel).
 _interp_method_raw = _cfg.get("beam_interp_method", "bilinear")
 _VALID_INTERP = {"nearest", "bilinear"}
 if _interp_method_raw not in _VALID_INTERP:
@@ -126,13 +123,6 @@ spin2_skip_tolerance = _cfg.get("spin2_skip_tolerance", None)
 n_beam_clusters = _cfg.get("n_beam_clusters", None)
 beam_cluster_tail_fraction = _cfg.get("beam_cluster_tail_fraction", None)
 
-# Clustering calibration
-# enable_clustering_calibration : set True to trigger a calibration sweep on
-#   the next run; automatically reset to False after calibration completes.
-# clustering_error_threshold     : maximum tolerated relative RMS TOD error.
-# clustering_tail_fractions      : list of tail fractions to sweep.
-# clustering_n_clusters_list     : list of K values to sweep.
-# clustering_n_probe_samples     : number of scan samples used for the probe.
 clustering_calibration_enabled = _cfg.get("clustering_calibration_enabled", False)
 clustering_error_threshold = _cfg.get("clustering_error_threshold", 1e-3)
 

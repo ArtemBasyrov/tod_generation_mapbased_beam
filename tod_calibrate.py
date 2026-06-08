@@ -6,9 +6,9 @@ Calibrates three knobs jointly:
   * numba_threads (T)      — threads per worker (parallel over batch via prange)
   * batch_size (B)         — samples per fused-kernel invocation
 
-The fused kernel (a1d5d36) parallelises the entire Rodrigues+gather over
-prange(B). Spawning P workers each using T = NUMBA_NUM_THREADS_DEFAULT (=all
-cores) oversubscribes by P×; the new search enforces P*T ≤ N_cores.
+The fused kernel parallelises Rodrigues+gather over prange(B), so P workers
+each using T = NUMBA_NUM_THREADS_DEFAULT oversubscribes by P×; the search
+enforces P*T ≤ N_cores.
 
 Strategy (~30s wall time):
   Phase A — single-process throughput vs T at a fixed B.
@@ -17,8 +17,6 @@ Strategy (~30s wall time):
             Memory budget per process must accommodate mp_stacked (already in
             shared memory, but counted defensively) plus transient per-batch
             buffers.
-
-Beam clustering calibration is unchanged (driven by science accuracy, not speed).
 """
 
 import gc
@@ -35,9 +33,6 @@ from tod_utils import _fmt_time, _get_memory_per_process
 from tod_beam_math import compute_bell
 from beam_cluster import cluster_beam_pixels
 
-# Per-batch transient memory (bytes per sample). The fused kernel no longer
-# materialises a (B, S, 3) Rodrigues buffer (commit a1d5d36); only small
-# B-scaled arrays remain (pointings, weights, output).
 _BYTES_PER_SAMPLE_TRANSIENT = {
     "nearest": 80,
     "bilinear": 120,
@@ -56,9 +51,6 @@ _TARGET_SAMPLES_PER_THREAD = 1024
 _PROBE_TARGET_SECONDS = 1.5  # per measurement cell
 _PROBE_MIN_SAMPLES = 20_000
 _PROBE_MAX_SAMPLES = 400_000
-
-
-# ── Memory model ─────────────────────────────────────────────────────────────
 
 
 def _per_proc_static_bytes(beam_data, nside):
@@ -82,9 +74,6 @@ def _max_batch_for_memory(mem_per_proc_gb, beam_data, nside, interp_mode):
     if transient_budget_gb <= 0.05:
         return 0
     return max(1, int(transient_budget_gb * 1e9 // bps))
-
-
-# ── Probe runner ─────────────────────────────────────────────────────────────
 
 
 def _make_probe_data(beam_data, folder_scan, probe_day, n_samples):
@@ -237,9 +226,6 @@ def _process_thread_pairs(n_cores, max_processes):
     return pairs
 
 
-# ── Public entry point ──────────────────────────────────────────────────────
-
-
 def calibrate_runtime(
     beam_data,
     folder_scan,
@@ -295,7 +281,6 @@ def calibrate_runtime(
         )
     ref_bs = min(ref_bs, bs_cap_p1)
 
-    # Load probe scan data once — _measure_throughput slices as needed.
     phi_full, theta_full, psi_full = _make_probe_data(
         beam_data, folder_scan, probe_day, _PROBE_MAX_SAMPLES
     )
@@ -341,7 +326,6 @@ def calibrate_runtime(
         cands = [b for b in cands if 256 <= b <= bs_cap_p1]
         if not cands:
             cands = [min(ref_bs, bs_cap_p1)]
-        # Prepend the already-measured ref point if not already in the list
         best_b, best_tp = ref_bs, tp_by_threads[t]
         for b in cands:
             if b == ref_bs:
@@ -412,9 +396,6 @@ def calibrate_runtime(
         f"batch_size={B}  (est total tp={best[0]:,.0f} samp/s)"
     )
     return P, T, B
-
-
-# ── Beam clustering calibration (unchanged) ──────────────────────────────────
 
 
 def _run_clustering_probe(

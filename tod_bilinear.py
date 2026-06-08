@@ -2,8 +2,7 @@
 Bilinear interpolation kernels for TOD generation.
 
 _gather_accum_jit         — scalar bilinear accumulation from pre-computed
-                            pixels and weights.  Reference implementation;
-                            tests use it to verify the fused kernel below.
+                            pixels and weights.  Reference implementation.
 _gather_accum_fused_jit   — fully fused Rodrigues + bilinear gather + spin-2
                             cache + accumulation.  Production hot path.
 """
@@ -15,7 +14,7 @@ from numba_healpy import (
     _TWO_PI,
     _ring_interp_single_jit,
     _ring_interp_with_angles_jit,
-    get_interp_weights_numba,  # re-exported for tests
+    get_interp_weights_numba,
 )
 from tod_rotations import _rodrigues_apply_one_jit
 from tod_spin2 import (
@@ -37,9 +36,8 @@ def _gather_accum_jit(pixels, weights, beam_vals, mp_stacked, B, Sc, tod):
     """
     Fused HEALPix gather, bilinear interpolation, and beam accumulation.
 
-    Replaces:  np.stack gather → einsum → reshape → matmul
-    with a single scalar loop over (b, s) that reads map values once and
-    accumulates directly, avoiding the (C, 4, B*Sc) mp_gathered intermediate.
+    A single scalar loop over (b, s) reads map values once and accumulates
+    directly, avoiding any (C, 4, B*Sc) gathered intermediate.
 
     Parameters
     ----------
@@ -70,9 +68,6 @@ def _gather_accum_jit(pixels, weights, beam_vals, mp_stacked, B, Sc, tod):
                     + mp_stacked[c, p2] * w2
                     + mp_stacked[c, p3] * w3
                 ) * bv
-
-
-# ── Fully fused kernel (spin-2 amortised via direct-mapped cache) ─────────────
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
@@ -150,7 +145,6 @@ def _gather_accum_fused_jit(
     has_qu = c_q >= 0 and c_u >= 0
     npix_total = 12 * nside * nside
 
-    # Precompute which channels are neither Q nor U (used in the has_qu path).
     n_other = 0
     _other_ch = np.empty(C, dtype=np.int64)
     for _c in range(C):

@@ -1,8 +1,9 @@
 """
-Nearest pixel interpolation methods for TOD generation.
+Nearest-pixel interpolation kernel for TOD generation.
 
-This module contains the functions for nearest pixel interpolation
-used in the TOD generation pipeline.
+_gather_accum_nearest_jit — fully fused Rodrigues + HEALPix nearest-pixel
+                            lookup + spin-2 Q/U frame correction +
+                            accumulation.
 """
 
 import math

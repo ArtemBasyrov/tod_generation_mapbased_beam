@@ -35,6 +35,16 @@ from tod_pipeline_helpers import (
 
 
 def main():
+    """Run runtime and/or clustering calibration and write results to config.
+
+    With no flags, runtime calibration runs by default. Passing
+    ``--clustering`` runs clustering calibration; ``--runtime --clustering``
+    runs both. Results are persisted via
+    :func:`tod_pipeline_helpers.save_runtime_calibration` /
+    :func:`~tod_pipeline_helpers.save_clustering_calibration`, which write to
+    the active config file (``config_local.yaml`` if present, else
+    ``config.yaml``).
+    """
     parser = argparse.ArgumentParser(
         description="Run TOD generation calibration and update the config file."
     )
@@ -48,7 +58,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Default: runtime only
     run_runtime = args.runtime or (not args.runtime and not args.clustering)
     run_clustering = args.clustering
 

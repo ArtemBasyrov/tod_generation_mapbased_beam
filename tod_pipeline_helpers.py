@@ -1,6 +1,5 @@
 """
-Pipeline helpers shared between the two entry scripts
-(sample_based_tod_generation_gridint.py and run_calibration.py).
+Pipeline helpers shared by the entry scripts.
 
 prepare_beam_data            — load beams from disk, dB-threshold + normalise,
                                build (S, 3) beam-pixel unit vectors.
@@ -9,6 +8,8 @@ apply_beam_clustering        — in-place spherical k-means reduction of every
                                cache arrays attached to the entry.
 resolve_spin2_skip_threshold — derive the equatorial-band cos(θ) cutoff for
                                the spin-2 Q/U rotation skip optimisation.
+apply_hwp_modulation         — rotate Q/U rows of a TOD batch in place to
+                               model an ideal continuously rotating HWP.
 save_runtime_calibration     — persist (n_processes, numba_threads, batch_size)
                                back into the active config YAML.
 save_clustering_calibration  — persist (n_clusters, tail_fraction) back into
@@ -60,8 +61,7 @@ def prepare_beam_data(beam_filenames, active_fields=None):
         active_fields = config.map_fields
     active_set = set(int(c) for c in active_fields)
 
-    # Only build the threshold lookup for active components. Inactive entries
-    # in beam_filenames may legitimately be None.
+    # Inactive entries in beam_filenames may legitimately be None.
     _per_idx_threshold = (
         config.power_threshold_I,
         config.power_threshold_Q,

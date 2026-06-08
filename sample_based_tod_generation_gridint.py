@@ -24,7 +24,6 @@ from tod_pipeline_helpers import (
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-# ── Config ────────────────────────────────────────────────────────────────────
 folder_scan = config.FOLDER_SCAN
 folder_tod_output = config.FOLDER_TOD_OUTPUT
 beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
@@ -39,9 +38,6 @@ interp_mode = config.beam_interp_method
 _g_nside = None  # int — HEALPix nside of the input sky map
 _g_beam_data = None  # beam_data dict with mp_stacked from shared memory
 _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
-
-
-# ── Pool initialiser ─────────────────────────────────────────────────────────
 
 
 def _worker_init(beam_data_static, nside, beam_shm_descs, n_threads):
@@ -71,7 +67,6 @@ def _worker_init(beam_data_static, nside, beam_shm_descs, n_threads):
 
     _g_nside = int(nside)
 
-    # Attach to each beam entry's mp_stacked block
     _g_beam_data = {}
     for bf, static in beam_data_static.items():
         desc = beam_shm_descs[bf]
@@ -81,9 +76,6 @@ def _worker_init(beam_data_static, nside, beam_shm_descs, n_threads):
         entry = dict(static)
         entry["mp_stacked"] = ms
         _g_beam_data[bf] = entry
-
-
-# ── TOD generation ────────────────────────────────────────────────────────────
 
 
 def tod_exact_gen_batched(
@@ -146,7 +138,6 @@ def tod_exact_gen_batched(
         bs = batch_idx * batch_size
         be = min(bs + batch_size, n_samples)
 
-        # ETA
         if _should_print_batch(batch_idx, n_batches):
             elapsed = time.time() - start_time
             if batch_idx > 0:
@@ -203,9 +194,6 @@ def tod_exact_gen_batched(
     return tod_day
 
 
-# ── Per-day worker (used by multiprocessing pool) ─────────────────────────────
-
-
 def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0, fsamp=None):
     """
     Worker entry point.  beam_data and mp are *not* passed as arguments —
@@ -233,10 +221,19 @@ def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0, fsamp=None):
         return day_index, False, str(e)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-
 def main(n_cpu_ceiling):
+    """Generate TODs for the day range configured in ``tod_config``.
+
+    Loads the sky map and beams, optionally runs clustering and runtime
+    calibration, then processes each day either in-process (``ncpus == 1``)
+    or via a multiprocessing pool with the sky-map components stored in
+    POSIX shared memory. Per-day TOD arrays are written to
+    ``config.FOLDER_TOD_OUTPUT`` as ``tod_day_{i}.npy``.
+
+    Args:
+        n_cpu_ceiling (int): Hard upper bound on worker processes, typically
+            from :func:`tod_utils._get_ncpus`.
+    """
     t0 = time.time()
     Nb, fsamp = load_scan_information(folder_scan)
 
@@ -261,14 +258,9 @@ def main(n_cpu_ceiling):
         for c, m in zip(config.map_fields, _raw)
     }
 
-    # ── Load exact beam data (clustering applied separately below) ─────────────
     print("Loading beam data...")
     beam_data = prepare_beam_data(beam_files)
 
-    # ── Beam pixel clustering ──────────────────────────────────────────────────
-    # Calibration: sweep (tail_fraction, K) grid on a probe batch to find the
-    # best setting within the configured error tolerance.  Runs only when
-    # clustering_calibration_enabled=True; disabled automatically after first run.
     if config.clustering_calibration_enabled:
         print("Running beam clustering calibration …")
         best_tf, best_K = calibrate_beam_clustering(
@@ -339,11 +331,6 @@ def main(n_cpu_ceiling):
     nside = hp.get_nside(next(iter(MP.values())))
 
     if ncpus > 1:
-        # ── Allocate shared memory ─────────────────────────────────────────
-        # Workers consume the sky map exclusively via mp_stacked (per-beam,
-        # already in shared memory below); only nside is needed otherwise.
-        # One block per unique beam file for mp_stacked (C, npix) — dtype
-        # follows config.precision_dtype.
         beam_shms = {}
         beam_shm_descs = {}
         for bf, data in beam_data.items():

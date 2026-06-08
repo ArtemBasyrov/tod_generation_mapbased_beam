@@ -117,7 +117,7 @@ def _kmeans_sphere(
     verbose: bool = True,
 ) -> tuple:
     """
-    Weighted spherical k-means.  Internal function; called by cluster_beam_pixels.
+    Weighted spherical k-means.
 
     Parameters
     ----------

@@ -12,8 +12,10 @@ _get_interp_weights_jit — parallel (prange over N) replacement for
                           get_interpol algorithm exactly.
 get_interp_weights_numba— public wrapper; drop-in replacement for hp.get_interp_weights.
 
-_ring_interp_single_jit     — bilinear neighbour lookup for one unit-vector query;
-                               acos-free for the normal case (sin weight formula).
+_ring_interp_single_jit     — bilinear neighbour lookup for one unit-vector
+                               query; numerically identical to
+                               ``hp.get_interp_weights`` (uses acos for the
+                               θ-linear weight).
 _ring_interp_with_angles_jit — same as _ring_interp_single_jit but also returns
                                (z_n, phi_n) of each of the 4 neighbours for
                                callers that need the neighbour sky positions
@@ -26,9 +28,8 @@ _query_disc_jit         — nopython query_disc: returns int64 array of RING pix
                           indices within a disc, callable from inside JIT kernels.
 query_disc_numba        — public wrapper; drop-in for hp.query_disc(nest=False).
 
-_gather_ring_stencil_jit — fast Keys/Catmull-Rom stencil gather via ring walk.
-                           Replaces _query_disc_into_jit in the bicubic hot loop,
-                           eliminating the ~9 acos calls per (b,s) element.
+_gather_ring_stencil_jit — Keys/Catmull-Rom stencil gather via a ring walk,
+                           used by the bicubic kernel on the ``bicubic`` branch.
 
 """
 
@@ -42,10 +43,8 @@ _INV_TWO_PI = 1.0 / _TWO_PI
 _TWO_THIRDS = 2.0 / 3.0  # HEALPix polar-cap / equatorial boundary
 
 
-# ── HEALPix RING-scheme helpers (nopython, no parallel) ───────────────────────
-# These three functions mirror the HEALPix C++ internals for get_interpol.
-# They must NOT carry parallel=True because they are called from within a
-# prange body inside _get_interp_weights_jit.
+# These three helpers must NOT carry parallel=True: they are called from
+# within a prange body inside _get_interp_weights_jit.
 
 
 @numba.jit(nopython=True, cache=True)

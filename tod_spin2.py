@@ -62,7 +62,6 @@ def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
     if phi_pts == phi_pix and sth_pts == sth_pix and z_pts == z_pix:
         return 1.0, 0.0
 
-    # step 1
     dphi = phi_pts - phi_pix
     ch = math.cos(dphi * 0.5)
     sh = math.sin(dphi * 0.5)
@@ -70,28 +69,23 @@ def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
     cos_dphi = 1 - 2.0 * sh * sh
     sh2 = sh * sh  # sin^2 (Delta phi / 2)
 
-    # step 2
     dz = z_pts - z_pix
     ds = sth_pts - sth_pix
     st2 = 0.25 * (dz * dz + ds * ds)  # sin^2 (Delta theta / 2)
     S = sth_pix * sth_pts
     h = st2 + S * sh2  # haversine of the angular separation
 
-    # step 3
     sin2_dtheta = 4.0 * st2 * (1 - st2)  # sin^2 (Delta theta)
 
-    # step 4
     z_sum = z_pts + z_pix
     N = 2.0 * sin_dphi * z_sum * h  # numerator for tan(delta)
 
-    # step 5
     C = z_pts * z_pix
     term1 = sin2_dtheta * cos_dphi
     term2 = 4.0 * S * C * sh2 * sh2
     term3 = S * sin_dphi * sin_dphi
     D = term1 - term2 + term3  # denominator for tan(delta)
 
-    # step 6
     u = 1.0 / (N * N + D * D)
     cos_2d = (D * D - N * N) * u
     sin_2d = 2.0 * N * D * u

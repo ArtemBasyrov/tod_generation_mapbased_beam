@@ -5,9 +5,8 @@ All functions are stateless and take only arrays as arguments.
 
 Rotation kernels (in tod_rotations.py)
 ---------------------------------------
-_rodrigues_jit                — fused double Rodrigues rotation (recenter + pol. roll),
-                                materialises a (B, S, 3) buffer.  Used by the
-                                numpy-fallback path and by tests.
+_rodrigues_jit                — fused double Rodrigues rotation (recenter +
+                                pol. roll), materialises a (B, S, 3) buffer.
 _rodrigues_apply_one_jit      — scalar per-(b, s) fused Rodrigues; inlined into
                                 the production gather kernels so the (B, S, 3)
                                 intermediate is never materialised.
@@ -17,8 +16,8 @@ precompute_rotation_vector_batch — Rodrigues vectors and pol. angle offsets fo
 
 Gather/accumulate kernels
 -------------------------
-_gather_accum_jit          — scalar bilinear accumulation from pre-computed pixels/weights
-                             (in tod_bilinear.py; used by tests).
+_gather_accum_jit          — scalar bilinear accumulation from pre-computed
+                             pixels/weights (in tod_bilinear.py).
 _gather_accum_fused_jit    — fully fused Rodrigues + bilinear gather + per-b
                              direct-mapped spin-2 cache + accumulation
                              (in tod_bilinear.py).
@@ -112,8 +111,6 @@ def beam_tod_batch(
     C = len(comp_indices)
     mp_stacked = data.get("mp_stacked")  # (C, N) float32, or None
 
-    # Q and U channel positions within the C-dim of mp_stacked.
-    # Convention: input map fields are [T, Q, U] at indices [0, 1, 2].
     c_q = comp_indices.index(1) if 1 in comp_indices else -1
     c_u = comp_indices.index(2) if 2 in comp_indices else -1
 

@@ -26,9 +26,6 @@ import numba
 import tod_config as config
 
 
-# ── Numba JIT kernels ─────────────────────────────────────────────────────────
-
-
 @numba.jit(nopython=True, cache=True)
 def _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out):
     """
@@ -67,12 +64,10 @@ def _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out):
             vx = vec_orig[s, 0]
             vy = vec_orig[s, 1]
             vz = vec_orig[s, 2]
-            # Rodrigues 1 – recenter beam
             dkv = kx * vx + ky * vy + kz * vz
             rx = vx * ca + (ky * vz - kz * vy) * sa + kx * dkv * oma
             ry = vy * ca + (kz * vx - kx * vz) * sa + ky * dkv * oma
             rz = vz * ca + (kx * vy - ky * vx) * sa + kz * dkv * oma
-            # Rodrigues 2 – polarisation roll
             dpr = px * rx + py * ry + pz * rz
             out[b, s, 0] = rx * cp_ + (py * rz - pz * ry) * sp_ + px * dpr * omp
             out[b, s, 1] = ry * cp_ + (pz * rx - px * rz) * sp_ + py * dpr * omp
@@ -120,20 +115,15 @@ def _rodrigues_apply_one_jit(
     """
     oma = 1.0 - ca
     omp = 1.0 - cp_
-    # Rodrigues 1 — recenter beam
     dkv = kx * vx_in + ky * vy_in + kz * vz_in
     rx = vx_in * ca + (ky * vz_in - kz * vy_in) * sa + kx * dkv * oma
     ry = vy_in * ca + (kz * vx_in - kx * vz_in) * sa + ky * dkv * oma
     rz = vz_in * ca + (kx * vy_in - ky * vx_in) * sa + kz * dkv * oma
-    # Rodrigues 2 — polarisation roll about the boresight
     dpr = px * rx + py * ry + pz * rz
     vx = rx * cp_ + (py * rz - pz * ry) * sp_ + px * dpr * omp
     vy = ry * cp_ + (pz * rx - px * rz) * sp_ + py * dpr * omp
     vz = rz * cp_ + (px * ry - py * rx) * sp_ + pz * dpr * omp
     return vx, vy, vz
-
-
-# ── Public numpy functions ────────────────────────────────────────────────────
 
 
 def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx=None):
@@ -229,7 +219,16 @@ def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
     Rodrigues vectors and pointing angles.  All outputs follow
     ``tod_config.precision_dtype``.
 
-    Returns axes (B,3), cos_a (B,), sin_a (B,), ax_pts (B,3), cos_p (B,), sin_p (B,)
+    Returns
+    -------
+    axes   : (B, 3)  normalised Rodrigues-1 rotation axes (zero where the
+                     rotation angle ≈ 0, so the kernel becomes the identity).
+    cos_a  : (B,)    cos of the Rodrigues-1 angle ``|rot_vecs|``.
+    sin_a  : (B,)    sin of the Rodrigues-1 angle.
+    ax_pts : (B, 3)  boresight unit vectors derived from (phi_b, theta_b);
+                     act as the Rodrigues-2 rotation axis.
+    cos_p  : (B,)    cos of the Rodrigues-2 angle ``psis_b``.
+    sin_p  : (B,)    sin of the Rodrigues-2 angle.
     """
     dt = config.precision_dtype
     angles = np.linalg.norm(rot_vecs, axis=-1).astype(dt)  # (B,)
