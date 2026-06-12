@@ -2,7 +2,6 @@ import os
 import time
 import multiprocessing
 from multiprocessing.shared_memory import SharedMemory
-from functools import partial
 
 import numpy as np
 import healpy as hp
@@ -12,6 +11,7 @@ from tod_io import load_scan_information, open_scan_day
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
 from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
 from tod_utils import _get_ncpus, _fmt_time, _should_print_batch
+from tod_runcontext import build_run_context
 from tod_pipeline_helpers import (
     prepare_beam_data,
     apply_beam_clustering,
@@ -24,23 +24,19 @@ from tod_pipeline_helpers import (
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-folder_scan = config.FOLDER_SCAN
-folder_tod_output = config.FOLDER_TOD_OUTPUT
-beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
-start_day = config.start_day
-end_day = config.end_day
-
-interp_mode = config.beam_interp_method
+# Run-scoped parameters (folder paths, interp mode, precision, HWP, …) are
+# carried in a RunContext (see tod_runcontext.py), built once in main() and
+# passed to each worker at pool start-up.
 
 # ── Worker-global state (populated by _worker_init in each spawned process) ───
-# Beam data lives in shared memory; the sky map itself is consumed via
-# mp_stacked (per-beam) so we only need its nside in the worker.
-_g_nside = None  # int — HEALPix nside of the input sky map
+# Beam data lives in shared memory; the run context (small scalars) is pickled
+# to the worker once at init.
+_g_ctx = None  # RunContext — run-scoped parameters
 _g_beam_data = None  # beam_data dict with mp_stacked from shared memory
 _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
 
 
-def _worker_init(beam_data_static, nside, beam_shm_descs, n_threads):
+def _worker_init(beam_data_static, ctx, beam_shm_descs, n_threads):
     """
     Called once in each spawned worker process.
 
@@ -54,18 +50,19 @@ def _worker_init(beam_data_static, nside, beam_shm_descs, n_threads):
     beam_data_static : dict  — beam_data without large arrays (small scalars /
                                tiny arrays safe to pickle: beam_vals, vec_orig,
                                psi_grid, sel, ra, dec, …)
-    nside            : int   — HEALPix nside of the input sky map
+    ctx              : RunContext — run-scoped parameters (paths, interp mode,
+                               nside, batch size, precision, HWP, …)
     beam_shm_descs   : dict  — {beam_filename: {'name', 'shape', 'dtype'}}
                                for mp_stacked
     """
-    global _g_nside, _g_beam_data, _g_shm_handles
+    global _g_ctx, _g_beam_data, _g_shm_handles
 
     if n_threads is not None and n_threads > 0:
         import numba
 
         numba.set_num_threads(int(n_threads))
 
-    _g_nside = int(nside)
+    _g_ctx = ctx
 
     _g_beam_data = {}
     for bf, static in beam_data_static.items():
@@ -79,13 +76,10 @@ def _worker_init(beam_data_static, nside, beam_shm_descs, n_threads):
 
 
 def tod_exact_gen_batched(
+    ctx,
     beam_data,
     day_index,
-    nside,
-    batch_size,
     process_name=None,
-    z_skip_threshold=-1.0,
-    fsamp=None,
 ):
     """Generate TOD for a single observation day using batched processing.
 
@@ -96,34 +90,33 @@ def tod_exact_gen_batched(
     entry, and accumulates the results.
 
     Args:
+        ctx (RunContext): Run-scoped parameters (scan folder, interp mode,
+            nside, batch size, precision, spin-2 skip threshold, HWP, …).
         beam_data (dict): Pre-loaded beam data from :func:`prepare_beam_data`.
             Must include ``'mp_stacked'`` for the Numba gather path.
         day_index (int): Zero-based index of the observation day.
-        nside (int): HEALPix nside of the input sky map.
-        batch_size (int): Number of detector samples per processing batch. Use
-            the value returned by :func:`~tod_calibrate._calibrate_n_processes`.
         process_name (str | None): Label for log messages (e.g. the
             ``multiprocessing.Process`` name). Defaults to ``None``.
 
     Returns:
         numpy.ndarray: TOD array of shape ``(3, n_samples)``, dtype matching
-            ``tod_config.precision_dtype``. Axis 0 is the Stokes component
+            ``ctx.precision_dtype``. Axis 0 is the Stokes component
             index ``[I, Q, U]``.
     """
     prefix = f"[{process_name}] " if process_name else ""
+    _dt = ctx.precision_dtype
 
     # Open mmaps once for the whole day — avoids re-opening 3 files per batch,
     # which at batch_size=8 would otherwise dominate I/O overhead.
-    theta_mmap, phi_mmap, psi_mmap = open_scan_day(folder_scan, day_index)
+    theta_mmap, phi_mmap, psi_mmap = open_scan_day(ctx.folder_scan, day_index)
     n_samples = len(phi_mmap)
 
     first_bf = next(iter(beam_data))
     ra0, dec0 = beam_data[first_bf]["ra"], beam_data[first_bf]["dec"]
 
-    _cx, _cy = config.beam_center_x, config.beam_center_y
-    beam_center_idx = (_cx, _cy) if (_cx is not None and _cy is not None) else None
+    beam_center_idx = ctx.beam_center_idx
 
-    batch_size = max(1, min(batch_size, n_samples))
+    batch_size = max(1, min(ctx.batch_size, n_samples))
     n_batches = (n_samples + batch_size - 1) // batch_size
     print(
         prefix
@@ -131,7 +124,7 @@ def tod_exact_gen_batched(
         + f"n_batches={n_batches}"
     )
 
-    tod_day = np.zeros((3, n_samples), dtype=config.precision_dtype)
+    tod_day = np.zeros((3, n_samples), dtype=_dt)
     start_time = time.time()
 
     for batch_idx in range(n_batches):
@@ -150,38 +143,38 @@ def tod_exact_gen_batched(
                 + f"Batch {batch_idx + 1}/{n_batches}  samples {bs}-{be - 1}  ETA {eta_str}"
             )
 
-        theta_b = np.array(theta_mmap[bs:be], dtype=config.precision_dtype)
-        phi_b = np.array(phi_mmap[bs:be], dtype=config.precision_dtype)
-        psi_b = np.array(psi_mmap[bs:be], dtype=config.precision_dtype)
+        theta_b = np.array(theta_mmap[bs:be], dtype=_dt)
+        phi_b = np.array(phi_mmap[bs:be], dtype=_dt)
+        psi_b = np.array(psi_mmap[bs:be], dtype=_dt)
         rot_vecs, betas = precompute_rotation_vector_batch(
             ra0, dec0, phi_b, theta_b, center_idx=beam_center_idx
         )
         psis_b = -betas + psi_b
 
-        tod_batch = np.zeros((3, be - bs), dtype=config.precision_dtype)
+        tod_batch = np.zeros((3, be - bs), dtype=_dt)
         for data in beam_data.values():
             contrib = beam_tod_batch(
-                nside,
+                ctx.nside,
                 None,
                 data,
                 rot_vecs,
                 phi_b,
                 theta_b,
                 psis_b,
-                interp_mode=interp_mode,
-                z_skip_threshold=z_skip_threshold,
+                interp_mode=ctx.interp_mode,
+                z_skip_threshold=ctx.z_skip_threshold,
             )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals
 
-        if config.hwp_enabled:
+        if ctx.hwp_enabled:
             apply_hwp_modulation(
                 tod_batch,
                 day_index=day_index,
                 sample_start=bs,
-                fsamp=fsamp,
-                f_hwp=config.hwp_rotation_frequency_hz,
-                phi0=config.hwp_initial_phase_rad,
+                fsamp=ctx.fsamp,
+                f_hwp=ctx.hwp_freq_hz,
+                phi0=ctx.hwp_phi0_rad,
             )
 
         tod_day[:, bs:be] = tod_batch
@@ -194,25 +187,23 @@ def tod_exact_gen_batched(
     return tod_day
 
 
-def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0, fsamp=None):
+def _process_day(day_index):
     """
-    Worker entry point.  beam_data and mp are *not* passed as arguments —
-    they live in the module-level globals populated by _worker_init, so no
-    pickling / copying of the large sky-map arrays occurs per task.
+    Worker entry point.  ``ctx`` and ``beam_data`` are *not* passed as
+    arguments — they live in the module-level globals populated by
+    :func:`_worker_init`, so no pickling / copying of the large sky-map arrays
+    (or re-pickling of the context) occurs per task.
     """
     process_name = multiprocessing.current_process().name
-    print(f"[{process_name}] Processing day {day_index + 1}/{Nb}")
+    print(f"[{process_name}] Processing day {day_index}")
     try:
         tod_day = tod_exact_gen_batched(
+            _g_ctx,
             _g_beam_data,
             day_index,
-            _g_nside,
-            batch_size,
             process_name=process_name,
-            z_skip_threshold=z_skip_threshold,
-            fsamp=fsamp,
         )
-        output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
+        output_file = os.path.join(_g_ctx.folder_tod_output, f"tod_day_{day_index}.npy")
         np.save(output_file, tod_day)
         print(f"[{process_name}] Saved {output_file}")
         return day_index, True, None
@@ -235,13 +226,15 @@ def main(n_cpu_ceiling):
             from :func:`tod_utils._get_ncpus`.
     """
     t0 = time.time()
-    Nb, fsamp = load_scan_information(folder_scan)
+    Nb, fsamp = load_scan_information(config.FOLDER_SCAN)
 
-    start = max(start_day or 0, 0)
-    end = min(end_day or Nb, Nb)
+    start = max(config.start_day or 0, 0)
+    end = min(config.end_day or Nb, Nb)
     days = range(start, end)
 
-    os.makedirs(folder_tod_output, exist_ok=True)
+    beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
+
+    os.makedirs(config.FOLDER_TOD_OUTPUT, exist_ok=True)
 
     # Load the sky map here (inside main / under __name__ guard) so that
     # spawned worker processes — which re-import this module — never execute
@@ -265,11 +258,11 @@ def main(n_cpu_ceiling):
         print("Running beam clustering calibration …")
         best_tf, best_K = calibrate_beam_clustering(
             beam_data,
-            folder_scan=folder_scan,
+            folder_scan=config.FOLDER_SCAN,
             probe_day=start,
             mp=MP,
             error_threshold=config.clustering_error_threshold,
-            interp_mode=interp_mode,
+            interp_mode=config.beam_interp_method,
         )
         save_clustering_calibration(best_tf, best_K)
         # Update in-memory config so clustering is applied this run too
@@ -313,12 +306,12 @@ def main(n_cpu_ceiling):
         _cx, _cy = config.beam_center_x, config.beam_center_y
         ncpus, n_threads, batch_size = calibrate_runtime(
             beam_data,
-            folder_scan,
+            config.FOLDER_SCAN,
             probe_day=start,
             mp=MP,
             n_cpu_ceiling=n_cpu_ceiling,
             max_processes_user=config.n_processes,
-            interp_mode=interp_mode,
+            interp_mode=config.beam_interp_method,
             center_idx=(_cx, _cy) if (_cx is not None and _cy is not None) else None,
             z_skip_threshold=z_skip_threshold,
         )
@@ -329,6 +322,15 @@ def main(n_cpu_ceiling):
     )
 
     nside = hp.get_nside(next(iter(MP.values())))
+
+    # Build the run context once; threaded through the worker pool (pickled
+    # once at init) or used directly on the single-process path.
+    ctx = build_run_context(
+        nside=nside,
+        batch_size=batch_size,
+        z_skip_threshold=z_skip_threshold,
+        fsamp=fsamp,
+    )
 
     if ncpus > 1:
         beam_shms = {}
@@ -352,20 +354,13 @@ def main(n_cpu_ceiling):
             for bf, data in beam_data.items()
         }
 
-        worker = partial(
-            _process_day,
-            batch_size=batch_size,
-            Nb=Nb,
-            z_skip_threshold=z_skip_threshold,
-            fsamp=fsamp,
-        )
         try:
             with multiprocessing.Pool(
                 processes=ncpus,
                 initializer=_worker_init,
-                initargs=(beam_data_static, nside, beam_shm_descs, n_threads),
+                initargs=(beam_data_static, ctx, beam_shm_descs, n_threads),
             ) as pool:
-                results = pool.map(worker, days)
+                results = pool.map(_process_day, days)
         finally:
             # Release shared memory only after all workers have finished.
             for shm in beam_shms.values():
@@ -383,15 +378,14 @@ def main(n_cpu_ceiling):
             numba.set_num_threads(int(n_threads))
         for day_index in days:
             tod_day = tod_exact_gen_batched(
+                ctx,
                 beam_data,
                 day_index,
-                nside,
-                batch_size,
                 process_name="main",
-                z_skip_threshold=z_skip_threshold,
-                fsamp=fsamp,
             )
-            output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
+            output_file = os.path.join(
+                ctx.folder_tod_output, f"tod_day_{day_index}.npy"
+            )
             np.save(output_file, tod_day)
 
     print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")

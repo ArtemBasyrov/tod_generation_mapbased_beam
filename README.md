@@ -115,9 +115,9 @@ completes so subsequent runs reuse the cached values without re-measuring.
 
 | Value | Branch | Description | Speed |
 |---|---|---|---|
-| `'nearest'` | `main` | Single nearest-pixel lookup. No blending between pixels. Rotationally unstable — not recommended for polarisation analysis. | Fastest |
+| `'nearest'` | `main` | Single nearest-pixel lookup. No blending between pixels. Exhibits discrete boundary-jump artefacts — not recommended for polarisation analysis. | Fastest |
 | `'bilinear'` | `main` | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy. **Recommended default.** | Fast |
-| `'bicubic'` | `bicubic` | Keys/Catmull-Rom kernel via gnomonic projection (~30–50 pixels). ~10× more rotationally stable than bilinear. | Slower |
+| `'bicubic'` | `bicubic` | Keys/Catmull-Rom kernel via gnomonic projection (~30–50 pixels). Regular-grid method on an irregular pixelization — not science-ready. | Slower |
 | `'gaussian'` | `gaussian` | Isotropic Gaussian kernel over all pixels within `radius_deg`. Avoids grid artefacts; requires `beam_interp_sigma_deg`. | Slow |
 
 ### Beam pixel clustering
