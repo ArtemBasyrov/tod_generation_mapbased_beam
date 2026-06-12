@@ -552,6 +552,77 @@ class TestApplyHwpModulation:
         npt.assert_allclose(tod_a, tod_b, rtol=1e-12, atol=1e-12)
 
 
+class TestMergeBeamEntries:
+    """Tests for merge_beam_entries — collapsing per-source entries into one
+    unified multi-component (C, S) entry."""
+
+    @staticmethod
+    def _entry(vec, bv, comps):
+        return {
+            "ra": np.zeros((3, 3)),
+            "dec": np.zeros((3, 3)),
+            "vec_orig": np.asarray(vec, dtype=np.float32),
+            "beam_vals": np.asarray(bv, dtype=np.float32),
+            "comp_indices": list(comps),
+            "n_sel": len(bv),
+        }
+
+    def test_single_source_broadcasts_to_rows(self):
+        """One source with all three components → (3, S) weights, every row equal
+        to the source weights, geometry and component order unchanged."""
+        vec = np.arange(15, dtype=np.float32).reshape(5, 3)
+        bv = np.array([0.1, 0.2, 0.3, 0.15, 0.25], dtype=np.float32)
+        beam_data = {"beamA": self._entry(vec, bv, [0, 1, 2])}
+
+        merged = pph.merge_beam_entries(beam_data)
+        assert len(merged) == 1
+        u = next(iter(merged.values()))
+
+        assert u["comp_indices"] == [0, 1, 2]
+        assert u["n_sel"] == 5
+        npt.assert_array_equal(u["vec_orig"], vec)
+        assert u["beam_vals"].shape == (3, 5)
+        for row in range(3):
+            npt.assert_array_equal(u["beam_vals"][row], bv)
+
+    def test_separate_sources_concatenate_and_zero_fill(self):
+        """I from one file, (Q, U) from another → concatenated pixels, with each
+        component's weights placed on its own pixels and zero elsewhere."""
+        vec_i = np.full((2, 3), 1.0, dtype=np.float32)
+        bv_i = np.array([0.4, 0.6], dtype=np.float32)
+        vec_qu = np.full((3, 3), 2.0, dtype=np.float32)
+        bv_qu = np.array([0.2, 0.3, 0.5], dtype=np.float32)
+
+        beam_data = {
+            "beamI": self._entry(vec_i, bv_i, [0]),
+            "beamQU": self._entry(vec_qu, bv_qu, [1, 2]),
+        }
+        merged = pph.merge_beam_entries(beam_data)
+        u = next(iter(merged.values()))
+
+        assert u["comp_indices"] == [0, 1, 2]
+        assert u["n_sel"] == 5
+        npt.assert_array_equal(u["vec_orig"], np.concatenate([vec_i, vec_qu]))
+
+        bv = u["beam_vals"]
+        assert bv.shape == (3, 5)
+        # I (row 0): weights on its 2 pixels, zero on the QU pixels.
+        npt.assert_array_equal(bv[0], np.array([0.4, 0.6, 0.0, 0.0, 0.0], np.float32))
+        # Q and U (rows 1, 2): zero on the I pixels, weights on the QU pixels.
+        npt.assert_array_equal(bv[1], np.array([0.0, 0.0, 0.2, 0.3, 0.5], np.float32))
+        npt.assert_array_equal(bv[2], np.array([0.0, 0.0, 0.2, 0.3, 0.5], np.float32))
+
+    def test_partial_fields_qonly(self):
+        """A single Q-only source yields a one-row (1, S) weight matrix."""
+        vec = np.full((4, 3), 0.5, dtype=np.float32)
+        bv = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+        merged = pph.merge_beam_entries({"beamQ": self._entry(vec, bv, [1])})
+        u = next(iter(merged.values()))
+        assert u["comp_indices"] == [1]
+        assert u["beam_vals"].shape == (1, 4)
+        npt.assert_array_equal(u["beam_vals"][0], bv)
+
+
 # ---------------------------------------------------------------------------
 # Standalone entry point
 # ---------------------------------------------------------------------------

@@ -73,9 +73,11 @@ def beam_tod_batch(
             element is a 1-D ``float32`` array of length ``12 * nside**2``.
             Used only on the numpy-fallback path (when ``mp_stacked`` is not
             provided).
-        data (dict): Beam data entry as returned by :func:`prepare_beam_data`.
-            Required keys: ``'vec_orig'``, ``'beam_vals'``, ``'comp_indices'``.
-            Production path additionally requires ``'mp_stacked'``.
+        data (dict): Beam data entry. Required keys: ``'vec_orig'`` (S, 3),
+            ``'beam_vals'``, ``'comp_indices'``. ``'beam_vals'`` is either a
+            per-component ``(C, S)`` array (one weight row per entry in
+            ``comp_indices``) or a 1-D ``(S,)`` array shared by all components.
+            Production path additionally requires ``'mp_stacked'`` (C, N).
         rot_vecs (numpy.ndarray): Rodrigues rotation vectors from
             :func:`precompute_rotation_vector_batch`, shape ``(B, 3)``.
         phi_b (numpy.ndarray): Boresight longitude [rad], shape ``(B,)``.
@@ -105,11 +107,18 @@ def beam_tod_batch(
     """
     B = phi_b.shape[0]
     vec_orig = data["vec_orig"]  # (S, 3)
-    beam_vals = data["beam_vals"]  # (S,)
     S = vec_orig.shape[0]
     comp_indices = data["comp_indices"]
     C = len(comp_indices)
     mp_stacked = data.get("mp_stacked")  # (C, N) float32, or None
+
+    # Beam weights are per-component, shape (C, S): row i is the weight of
+    # component ``comp_indices[i]``.  A 1-D (S,) array is accepted for backward
+    # compatibility and broadcast across components (every component shares the
+    # same beam) before the kernel call.
+    beam_vals = np.asarray(data["beam_vals"])
+    if beam_vals.ndim == 1:
+        beam_vals = np.broadcast_to(beam_vals, (C, beam_vals.shape[0]))
 
     c_q = comp_indices.index(1) if 1 in comp_indices else -1
     c_u = comp_indices.index(2) if 2 in comp_indices else -1
@@ -178,5 +187,5 @@ def beam_tod_batch(
     pixels, weights = get_interp_weights_numba(nside, theta_flat, phi_flat)
     mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
     mp_flat = np.einsum("ckn,kn->cn", mp_gathered, weights)
-    tod_chunk = mp_flat.reshape(C, B, S) @ beam_vals_f32
+    tod_chunk = np.einsum("cbs,cs->cb", mp_flat.reshape(C, B, S), beam_vals_f32)
     return {comp: tod_chunk[i].astype(_dt) for i, comp in enumerate(comp_indices)}

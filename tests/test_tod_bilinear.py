@@ -248,6 +248,9 @@ class TestGatherAccumFusedJit:
         c_q=-1,
         c_u=-1,
     ):
+        C = mp_stacked.shape[0]
+        S_ = beam_vals.shape[0]
+        beam_vals_cs = np.ascontiguousarray(np.broadcast_to(beam_vals, (C, S_)))
         _gather_accum_fused_jit(
             vec_orig,
             axes,
@@ -258,7 +261,7 @@ class TestGatherAccumFusedJit:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            beam_vals_cs,
             B,
             S,
             tod,
@@ -854,6 +857,9 @@ class TestSpin2SkipOptimisation:
         z_skip_threshold,
     ):
         tod = np.zeros((mp_stacked.shape[0], B), dtype=np.float64)
+        C = mp_stacked.shape[0]
+        S_ = beam_vals.shape[0]
+        beam_vals_cs = np.ascontiguousarray(np.broadcast_to(beam_vals, (C, S_)))
         _gather_accum_fused_jit(
             vec_orig,
             axes,
@@ -864,7 +870,7 @@ class TestSpin2SkipOptimisation:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            beam_vals_cs,
             B,
             S,
             tod,
@@ -888,6 +894,9 @@ class TestSpin2SkipOptimisation:
         beam_vals /= beam_vals.sum()
 
         tod_default = np.zeros((3, B), dtype=np.float64)
+        beam_vals_cs = np.ascontiguousarray(
+            np.broadcast_to(beam_vals, (mp_stacked.shape[0], S))
+        )
         _gather_accum_fused_jit(
             vec_orig,
             axes,
@@ -898,7 +907,7 @@ class TestSpin2SkipOptimisation:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            beam_vals_cs,
             B,
             S,
             tod_default,

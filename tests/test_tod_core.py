@@ -283,6 +283,57 @@ class TestBeamTodBatch:
                 err_msg=f"Fused path disagrees with numpy fallback on random map, comp={comp}",
             )
 
+    def test_per_component_weights_independent(self):
+        """A 2-D (C, S) beam_vals weights each component by its own row; scaling
+        one component's row scales only that component's TOD, on both the fused
+        (mp_stacked) and numpy-fallback paths."""
+        nside = 32
+        B = 6
+        mp = self._constant_maps(nside)
+        data_base = self._build_data(S=30)
+        phi_b, theta_b, psis_b, rot_vecs = self._build_scan(B)
+        comp_indices = data_base["comp_indices"]  # ["I", "Q", "U"] → scalar path
+        C = len(comp_indices)
+
+        base = data_base["beam_vals"].astype(np.float32)  # (S,)
+        bv_2d = np.stack([base * (i + 1) for i in range(C)]).astype(np.float32)
+        mp_stacked = np.stack([mp[c] for c in comp_indices]).astype(np.float32)
+
+        def run(bv, stacked):
+            d = dict(data_base)
+            d["beam_vals"] = bv
+            d["mp_stacked"] = stacked
+            return beam_tod_batch(nside, mp, d, rot_vecs, phi_b, theta_b, psis_b)
+
+        # Each component row scaled by (i+1) ⇒ that component's TOD scaled by (i+1).
+        tod = run(bv_2d, mp_stacked)
+        tod_single = run(base, mp_stacked)
+        for i, comp in enumerate(comp_indices):
+            npt.assert_allclose(
+                tod[comp],
+                tod_single[comp] * (i + 1),
+                rtol=1e-5,
+                err_msg=f"comp {comp} not independently weighted by its row",
+            )
+
+        # Scaling only the Q row scales only tod[Q]; I and U are untouched.
+        bv_scaled_q = bv_2d.copy()
+        bv_scaled_q[1] *= 2.0
+        tod_q = run(bv_scaled_q, mp_stacked)
+        npt.assert_allclose(tod_q["I"], tod["I"], rtol=1e-6)
+        npt.assert_allclose(tod_q["U"], tod["U"], rtol=1e-6)
+        npt.assert_allclose(tod_q["Q"], tod["Q"] * 2.0, rtol=1e-5)
+
+        # The (C, S) path agrees between the fused kernel and the numpy fallback.
+        tod_fallback = run(bv_2d, None)
+        for comp in comp_indices:
+            npt.assert_allclose(
+                tod[comp],
+                tod_fallback[comp],
+                atol=1e-4,
+                err_msg=f"(C,S) fused vs fallback disagree for comp={comp}",
+            )
+
 
 # ---------------------------------------------------------------------------
 # Standalone entry point

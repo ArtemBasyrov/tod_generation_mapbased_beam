@@ -103,6 +103,9 @@ def _call_nearest(
     c_q=-1,
     c_u=-1,
 ):
+    C = mp_stacked.shape[0]
+    S_ = beam_vals.shape[0]
+    beam_vals_cs = np.ascontiguousarray(np.broadcast_to(beam_vals, (C, S_)))
     _gather_accum_nearest_jit(
         vec_orig,
         axes,
@@ -113,7 +116,7 @@ def _call_nearest(
         sin_p,
         nside,
         mp_stacked,
-        beam_vals,
+        beam_vals_cs,
         B,
         S,
         tod,
@@ -873,6 +876,9 @@ class TestNearestSpin2Skip:
         z_skip_threshold,
     ):
         tod = np.zeros((mp_stacked.shape[0], B), dtype=np.float64)
+        C = mp_stacked.shape[0]
+        S_ = beam_vals.shape[0]
+        beam_vals_cs = np.ascontiguousarray(np.broadcast_to(beam_vals, (C, S_)))
         _gather_accum_nearest_jit(
             vec_orig,
             axes,
@@ -883,7 +889,7 @@ class TestNearestSpin2Skip:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            beam_vals_cs,
             B,
             S,
             tod,
@@ -906,6 +912,9 @@ class TestNearestSpin2Skip:
         beam_vals /= beam_vals.sum()
 
         tod_default = np.zeros((3, B), dtype=np.float64)
+        beam_vals_cs = np.ascontiguousarray(
+            np.broadcast_to(beam_vals, (mp_stacked.shape[0], S))
+        )
         _gather_accum_nearest_jit(
             vec_orig,
             axes,
@@ -916,7 +925,7 @@ class TestNearestSpin2Skip:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            beam_vals_cs,
             B,
             S,
             tod_default,

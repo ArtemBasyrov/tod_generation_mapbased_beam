@@ -6,6 +6,10 @@ prepare_beam_data            — load beams from disk, dB-threshold + normalise,
 apply_beam_clustering        — in-place spherical k-means reduction of every
                                beam entry, plus reduction of any precomputed
                                cache arrays attached to the entry.
+merge_beam_entries           — collapse the per-source beam entries into one
+                               unified entry with a per-component (C, S) weight
+                               matrix, so all Stokes components are gathered in a
+                               single kernel call.
 resolve_spin2_skip_threshold — derive the equatorial-band cos(θ) cutoff for
                                the spin-2 Q/U rotation skip optimisation.
 apply_hwp_modulation         — rotate Q/U rows of a TOD batch in place to
@@ -164,6 +168,69 @@ def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
         data["vec_orig"] = vec_out
         data["n_sel"] = K
         print(f"  [{bf}] Beam clustered: {S} → {K} pixels")
+
+
+def merge_beam_entries(beam_data):
+    """Collapse per-source beam entries into one unified multi-component entry.
+
+    Each input entry covers a single beam map and the list of Stokes components
+    (``comp_indices``) that read from it, with a 1-D ``beam_vals`` of shape
+    ``(S,)``. The unified entry concatenates every source's beam pixels and
+    carries a per-component weight matrix ``beam_vals`` of shape
+    ``(C, S_total)``: row ``i`` holds the weight of component
+    ``comp_indices[i]`` and is zero on pixels that belong to other sources.
+
+    Because all active components — in particular Q and U — then share one
+    entry, the gather kernel applies the spin-2 frame rotation to Q and U
+    together instead of dropping it whenever they come from separate beam files.
+
+    For the common case of a single beam map shared by all components, the
+    unified entry holds that map's pixels unchanged and replicates its weights
+    across the component rows, so the gathered TOD is identical to gathering the
+    single entry directly.
+
+    Args:
+        beam_data (dict): Per-source entries from :func:`prepare_beam_data`
+            (optionally clustered). Each value must provide ``'vec_orig'``
+            (S, 3), ``'beam_vals'`` (S,), ``'comp_indices'`` and the shared
+            ``'ra'`` / ``'dec'`` beam grid.
+
+    Returns:
+        dict: A single-entry dict ``{key: unified}`` whose value has
+            ``'vec_orig'`` (S_total, 3), ``'beam_vals'`` (C, S_total),
+            ``'comp_indices'`` (sorted active components), ``'n_sel'`` and the
+            shared ``'ra'`` / ``'dec'`` grid.
+    """
+    dt = config.precision_dtype
+    entries = list(beam_data.values())
+    comp_indices = sorted({c for e in entries for c in e["comp_indices"]})
+    C = len(comp_indices)
+    row_of = {c: i for i, c in enumerate(comp_indices)}
+    S_total = sum(e["vec_orig"].shape[0] for e in entries)
+
+    vec_orig = np.empty((S_total, 3), dtype=dt)
+    beam_vals = np.zeros((C, S_total), dtype=dt)
+
+    off = 0
+    for e in entries:
+        Ks = e["vec_orig"].shape[0]
+        vec_orig[off : off + Ks] = e["vec_orig"]
+        bv = np.asarray(e["beam_vals"])
+        for c in e["comp_indices"]:
+            beam_vals[row_of[c], off : off + Ks] = bv
+        off += Ks
+
+    first = entries[0]
+    unified = {
+        "ra": first["ra"],
+        "dec": first["dec"],
+        "vec_orig": np.ascontiguousarray(vec_orig),
+        "beam_vals": np.ascontiguousarray(beam_vals),
+        "comp_indices": comp_indices,
+        "n_sel": S_total,
+    }
+    key = "+".join(str(k) for k in beam_data)
+    return {key: unified}
 
 
 def resolve_spin2_skip_threshold(beam_data, tolerance, beam_radius_quantile=0.999):

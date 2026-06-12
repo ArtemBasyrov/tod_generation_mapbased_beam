@@ -15,6 +15,7 @@ from tod_runcontext import build_run_context
 from tod_pipeline_helpers import (
     prepare_beam_data,
     apply_beam_clustering,
+    merge_beam_entries,
     apply_hwp_modulation,
     resolve_spin2_skip_threshold,
     save_runtime_calibration,
@@ -281,16 +282,23 @@ def main(n_cpu_ceiling):
             tail_fraction=config.beam_cluster_tail_fraction,
         )
 
-    # Stack sky-map components per beam entry into a contiguous (C, N) array
-    # in the active precision.  The Numba gather kernel requires this layout.
+    # Spin-2 skip threshold is derived from beam geometry per source, before the
+    # entries are merged (the threshold depends only on vec_orig / beam_vals).
+    z_skip_threshold = resolve_spin2_skip_threshold(
+        beam_data, config.spin2_skip_tolerance
+    )
+
+    # Collapse the per-source beam entries into one unified multi-component entry
+    # so every Stokes component is gathered in a single kernel call and the Q/U
+    # spin-2 frame rotation is always applied together.
+    beam_data = merge_beam_entries(beam_data)
+
+    # Stack sky-map components into a contiguous (C, N) array in the active
+    # precision.  The Numba gather kernel requires this layout.
     for data in beam_data.values():
         data["mp_stacked"] = np.ascontiguousarray(
             np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
         )
-
-    z_skip_threshold = resolve_spin2_skip_threshold(
-        beam_data, config.spin2_skip_tolerance
-    )
 
     use_cached = not config.calibration_enabled
     if use_cached:
