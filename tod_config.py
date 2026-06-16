@@ -217,3 +217,16 @@ if detector_subset is not None:
         raise ValueError(
             "detector_subset is set but no detectors: section is configured"
         )
+
+# Integrated furax export.
+# Enabled by default. When true, the generator writes one TOAST HDF5
+# observation per day (obs_day_{N}.h5) into FOLDER_TOD_OUTPUT and removes the
+# intermediate per-detector tod_day_*.npy files — the output directory then
+# holds only .h5 files. When false, only the raw tod_day_*.npy are written.
+# The stored detector signal uses the pipeline `precision`; one observation is
+# emitted per day (control granularity via start_day/end_day). Requires toast
+# in the active environment (imported lazily, only when enabled). The standalone
+# tod_to_furax.py keeps its own --output / --precision / --split-per-day knobs.
+furax_export = bool(_cfg.get("furax_export", True))
+# ISO-8601 UTC timestamp of sample 0 of day 0 (the timestream time origin).
+furax_export_t0 = _cfg.get("furax_export_t0", "2030-01-01T00:00:00+00:00")

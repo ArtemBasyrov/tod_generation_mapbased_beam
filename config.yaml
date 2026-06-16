@@ -111,3 +111,15 @@
   # Optionally run only part of the focal plane (names or 0-based indices).
   # Used to shard a large focal plane across HPC nodes. null → all detectors.
   detector_subset: null
+
+  # Integrated furax export (enabled by default).
+  # true  → write one TOAST HDF5 observation per day (obs_day_{N}.h5, a
+  #         (n_det, n_samples) detdata block) into FOLDER_TOD_OUTPUT, assembled
+  #         in memory from the workers' TODs — no tod_day_*.npy is written.
+  # false → write only the raw per-detector tod_day_*.npy files.
+  # The stored signal uses the pipeline `precision`; one observation per day
+  # (split granularity is controlled by start_day/end_day). Requires toast in
+  # the active env (imported lazily). The standalone tod_to_furax.py keeps its
+  # own --output / --precision / --split-per-day knobs for ad-hoc re-export.
+  furax_export: true
+  furax_export_t0: '2030-01-01T00:00:00+00:00'  # UTC time of sample 0 of day 0

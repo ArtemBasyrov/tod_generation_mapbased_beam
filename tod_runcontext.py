@@ -55,6 +55,10 @@ class RunContext:
     detectors : tuple[Detector, ...]
         Focal-plane detectors processed this run. A single implicit boresight
         detector (``quat=None``) when no ``detectors:`` section is configured.
+    furax_export : bool
+        When True, workers return the in-memory TOD and the main process writes
+        a per-day TOAST HDF5 observation directly (no ``.npy`` intermediary).
+        When False, workers write per-detector ``tod_day_*.npy`` instead.
     """
 
     folder_scan: str
@@ -70,6 +74,7 @@ class RunContext:
     hwp_freq_hz: float
     hwp_phi0_rad: float
     detectors: Tuple[Detector, ...]
+    furax_export: bool
 
 
 def build_run_context(nside, batch_size, z_skip_threshold, fsamp):
@@ -102,4 +107,5 @@ def build_run_context(nside, batch_size, z_skip_threshold, fsamp):
         hwp_freq_hz=float(config.hwp_rotation_frequency_hz),
         hwp_phi0_rad=float(config.hwp_initial_phase_rad),
         detectors=tuple(load_detectors()),
+        furax_export=bool(config.furax_export),
     )

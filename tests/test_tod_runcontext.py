@@ -27,6 +27,7 @@ def test_runcontext_is_frozen():
         hwp_freq_hz=0.0,
         hwp_phi0_rad=0.0,
         detectors=(),
+        furax_export=False,
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         ctx.nside = 2048

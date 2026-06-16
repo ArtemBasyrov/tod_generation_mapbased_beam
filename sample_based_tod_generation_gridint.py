@@ -219,6 +219,11 @@ def _process_task(task):
     module-level globals populated by :func:`_worker_init`, so no pickling /
     copying of the large sky-map arrays (or re-pickling of the context) occurs
     per task.  The detector is looked up from ``ctx.detectors`` by index.
+
+    Returns a 4-tuple ``(task, ok, err, payload)``. In furax-export mode the
+    ``(3, n_samples)`` TOD is returned as ``payload`` so the main process can
+    assemble the per-day observation in memory; otherwise the TOD is written to
+    a ``tod_day_*.npy`` file and ``payload`` is ``None``.
     """
     day_index, det_index = task
     detector = _g_ctx.detectors[det_index]
@@ -232,15 +237,90 @@ def _process_task(task):
             process_name=process_name,
             q_det=detector.quat,
         )
+        if _g_ctx.furax_export:
+            # Return the TOD; the main process assembles and writes the HDF5.
+            return task, True, None, tod_day
         output_file = tod_output_path(_g_ctx.folder_tod_output, day_index, detector)
         np.save(output_file, tod_day)
         print(f"[{process_name}] Saved {output_file}")
-        return task, True, None
+        return task, True, None, None
     except Exception as e:
         print(
             f"[{process_name}] Error on day {day_index}, detector {detector.name}: {e}"
         )
-        return task, False, str(e)
+        return task, False, str(e), None
+
+
+def _load_converter():
+    """Lazily import the furax export module (pulls in toast at import time).
+
+    Imported on first use rather than at module load so the heavy toast import
+    only happens when ``furax_export`` is enabled.
+    """
+    import tod_to_furax
+
+    return tod_to_furax
+
+
+def _expected_obs_paths(folder_out, day_index, n_splits):
+    """Output HDF5 paths the converter would write for one day."""
+    if n_splits == 1:
+        names = [f"obs_day_{day_index}"]
+    else:
+        names = [f"obs_day_{day_index}_p{p}" for p in range(n_splits)]
+    return [os.path.join(folder_out, f"{n}.h5") for n in names]
+
+
+def _assemble_and_write_day(day_index, det_tods, ctx, fsamp, export):
+    """Assemble a day's in-memory per-detector TODs and write one HDF5 obs.
+
+    Called from ``main()`` once all of a day's detector tasks have returned
+    their ``(3, n_samples)`` TODs (via IPC). The boresight pointing is read once
+    here, each detector's scalar timestream is combined at its own polarization
+    angle, and a single ``obs_day_{N}.h5`` is written into
+    ``ctx.folder_tod_output`` using the pipeline precision. No ``.npy`` files
+    are involved on this path.
+
+    Args:
+        day_index (int): Observation-day index whose detectors are all done.
+        det_tods (dict[int, numpy.ndarray]): ``{det_index: (3, n) TOD}``.
+        ctx (RunContext): Run context (scan/output folders, detectors, HWP,
+            precision).
+        fsamp (float): Sample rate [Hz].
+        export (dict): Resolved export parameters (``t0_unix``).
+    """
+    tod_to_furax = _load_converter()
+
+    theta_m, phi_m, psi_m = open_scan_day(ctx.folder_scan, day_index)
+    theta = np.asarray(theta_m, dtype=np.float64)
+    phi = np.asarray(phi_m, dtype=np.float64)
+    psi = np.asarray(psi_m, dtype=np.float64)
+
+    detectors = ctx.detectors
+    n_samples = theta.shape[0]
+    signal = np.empty((len(detectors), n_samples), dtype=np.float64)
+    for di, det in enumerate(detectors):
+        signal[di] = tod_to_furax.combine_detector_signal(
+            det_tods[di], theta, phi, psi, det
+        )
+
+    tod_to_furax.write_day_observation(
+        day_index=day_index,
+        signal=signal,
+        theta=theta,
+        phi=phi,
+        psi=psi,
+        detectors=list(detectors),
+        folder_out=ctx.folder_tod_output,
+        fsamp=fsamp,
+        t0_unix=export["t0_unix"],
+        hwp_enabled=ctx.hwp_enabled,
+        f_hwp=ctx.hwp_freq_hz,
+        phi0_hwp=ctx.hwp_phi0_rad,
+        n_splits=1,
+        signal_dtype=ctx.precision_dtype,
+    )
+    print(f"[export] Wrote obs_day_{day_index}.h5")
 
 
 def main(n_cpu_ceiling):
@@ -370,24 +450,70 @@ def main(n_cpu_ceiling):
         fsamp=fsamp,
     )
 
-    # Task grid: one task per (day, detector). Tasks whose output file already
-    # exists are skipped so an interrupted multi-day run resumes cheaply.
     detectors = ctx.detectors
-    print(f"Focal plane: {len(detectors)} detector(s) — {[d.name for d in detectors]}")
-    all_tasks = [(day, di) for day in days for di in range(len(detectors))]
+    n_det = len(detectors)
+    print(f"Focal plane: {n_det} detector(s) — {[d.name for d in detectors]}")
+
+    # Resolve the integrated-export time origin once (when enabled). One
+    # observation is written into FOLDER_TOD_OUTPUT per day, assembled in memory
+    # from the workers' TODs — no .npy is written on this path.
+    export = None
+    if config.furax_export:
+        from datetime import datetime
+
+        export = {
+            "t0_unix": datetime.fromisoformat(config.furax_export_t0).timestamp(),
+        }
+        print(f"Integrated furax export → {ctx.folder_tod_output} (.h5 only)")
+
+    # Task grid: one task per (day, detector). Resume skips a whole day once its
+    # obs_day_{N}.h5 exists (export mode) or each detector whose tod_day_*.npy
+    # exists (non-export mode).
+    def _obs_complete(day):
+        return export is not None and os.path.exists(
+            _expected_obs_paths(ctx.folder_tod_output, day, 1)[0]
+        )
+
+    all_tasks = [(day, di) for day in days for di in range(n_det)]
     tasks = []
     n_skipped = 0
-    for day, di in all_tasks:
-        if os.path.exists(tod_output_path(ctx.folder_tod_output, day, detectors[di])):
-            n_skipped += 1
-        else:
-            tasks.append((day, di))
+    for day in days:
+        if _obs_complete(day):
+            n_skipped += n_det
+            continue
+        for di in range(n_det):
+            if export is None and os.path.exists(
+                tod_output_path(ctx.folder_tod_output, day, detectors[di])
+            ):
+                n_skipped += 1
+            else:
+                tasks.append((day, di))
     if n_skipped:
         print(
             f"Resume: skipping {n_skipped}/{len(all_tasks)} task(s) with existing output"
         )
+
+    # Per-day completion tracking for the in-memory export finalizer. Each
+    # worker hands back its (3, n) TOD; the main process buffers them per day
+    # and writes the observation once all of a day's detectors have arrived.
+    day_remaining = {}
+    day_failed = set()
+    day_tods = {}  # day -> {det_index: (3, n) TOD}, held until the day is whole
+    pending_set = set(tasks)
+    for day in days:
+        rem = sum(1 for di in range(n_det) if (day, di) in pending_set)
+        if rem:
+            day_remaining[day] = rem
+
+    def _maybe_export(day):
+        if export is None or day in day_failed:
+            return
+        if day_remaining.get(day) == 0 and day in day_tods:
+            _assemble_and_write_day(day, day_tods.pop(day), ctx, fsamp, export)
+            day_remaining.pop(day, None)
+
     if not tasks:
-        print("Nothing to do — all outputs already present.")
+        print("Nothing to generate — all outputs already present.")
         print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")
         return
 
@@ -420,11 +546,18 @@ def main(n_cpu_ceiling):
                 initializer=_worker_init,
                 initargs=(beam_data_static, ctx, beam_shm_descs, n_threads),
             ) as pool:
-                # imap_unordered with chunksize=1: results land as they finish,
-                # giving better tail load-balancing than map's ordered chunking
-                # across the many short-relative-to-runtime (day, det) tasks.
+                # Results land as they finish (better tail load-balancing).
                 for res in pool.imap_unordered(_process_task, tasks, chunksize=1):
-                    results.append(res)
+                    (rday, rdi), rok, rerr, payload = res
+                    results.append(((rday, rdi), rok, rerr))
+                    if rok:
+                        if payload is not None:
+                            day_tods.setdefault(rday, {})[rdi] = payload
+                        if rday in day_remaining:
+                            day_remaining[rday] -= 1
+                            _maybe_export(rday)
+                    else:
+                        day_failed.add(rday)
         finally:
             # Release shared memory only after all workers have finished.
             for shm in beam_shms.values():
@@ -449,8 +582,16 @@ def main(n_cpu_ceiling):
                 process_name="main",
                 q_det=detector.quat,
             )
-            output_file = tod_output_path(ctx.folder_tod_output, day_index, detector)
-            np.save(output_file, tod_day)
+            if export is not None:
+                day_tods.setdefault(day_index, {})[det_index] = tod_day
+            else:
+                output_file = tod_output_path(
+                    ctx.folder_tod_output, day_index, detector
+                )
+                np.save(output_file, tod_day)
+            if day_index in day_remaining:
+                day_remaining[day_index] -= 1
+                _maybe_export(day_index)
 
     print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")
 

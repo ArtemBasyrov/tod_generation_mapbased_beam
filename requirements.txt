@@ -4,3 +4,7 @@ pixell
 numba
 pyyaml
 psutil
+# furax-compatible TOAST HDF5 export (enabled by default via furax_export)
+toast
+astropy
+h5py
