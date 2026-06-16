@@ -26,6 +26,7 @@ def test_runcontext_is_frozen():
         hwp_enabled=False,
         hwp_freq_hz=0.0,
         hwp_phi0_rad=0.0,
+        detectors=(),
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         ctx.nside = 2048
@@ -59,6 +60,14 @@ def test_build_run_context_maps_config(monkeypatch):
     assert ctx.hwp_enabled is True
     assert ctx.hwp_freq_hz == 1.5
     assert ctx.hwp_phi0_rad == 0.25
+    # With no detectors: section, the single implicit boresight detector is used.
+    monkeypatch.setattr(config, "detectors", None)
+    monkeypatch.setattr(config, "detector_subset", None)
+    ctx = build_run_context(
+        nside=512, batch_size=4096, z_skip_threshold=0.7, fsamp=19.0
+    )
+    assert len(ctx.detectors) == 1
+    assert ctx.detectors[0].is_boresight
 
 
 def test_build_run_context_beam_center_idx(monkeypatch):

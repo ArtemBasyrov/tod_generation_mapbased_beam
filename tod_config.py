@@ -158,3 +158,62 @@ mp_start_method = _cfg.get("mp_start_method", "spawn")
 # None → use H // 2 and W // 2 (centre of the array).
 beam_center_x = _cfg.get("beam_center_x", None)
 beam_center_y = _cfg.get("beam_center_y", None)
+
+# Focal-plane detectors.
+# When absent (or null/empty), the pipeline runs a single implicit boresight
+# detector and writes legacy-named tod_day_{N}.npy files. When present, each
+# entry describes a detector offset from the boresight in the TOAST
+# xi-eta-gamma convention (degrees); per-detector pointing is composed on the
+# fly (see tod_focalplane.py). Schema per entry:
+#   name: str (unique), xi_deg: float, eta_deg: float, gamma_deg: float
+# detector_subset (list of names or 0-based indices, or null) optionally runs
+# only part of the focal plane — used to shard a focal plane across HPC nodes.
+_detectors_raw = _cfg.get("detectors", None)
+if _detectors_raw is not None and not isinstance(_detectors_raw, (list, tuple)):
+    raise ValueError(
+        f"detectors must be a list of detector entries or null, "
+        f"got {type(_detectors_raw).__name__}"
+    )
+_REQUIRED_DET_KEYS = ("name", "xi_deg", "eta_deg", "gamma_deg")
+detectors = None
+if _detectors_raw:
+    detectors = []
+    _seen_names = set()
+    for _i, _entry in enumerate(_detectors_raw):
+        if not isinstance(_entry, dict):
+            raise ValueError(
+                f"detectors[{_i}] must be a mapping with keys "
+                f"{list(_REQUIRED_DET_KEYS)}, got {type(_entry).__name__}"
+            )
+        _missing_keys = [k for k in _REQUIRED_DET_KEYS if k not in _entry]
+        if _missing_keys:
+            raise ValueError(
+                f"detectors[{_i}] is missing required keys: {_missing_keys}"
+            )
+        _name = _entry["name"]
+        if not isinstance(_name, str) or not _name:
+            raise ValueError(
+                f"detectors[{_i}].name must be a non-empty string, got {_name!r}"
+            )
+        if _name in _seen_names:
+            raise ValueError(f"duplicate detector name {_name!r} in detectors")
+        _seen_names.add(_name)
+        _clean = {"name": _name}
+        for _k in ("xi_deg", "eta_deg", "gamma_deg"):
+            _v = float(_entry[_k])
+            if not np.isfinite(_v):
+                raise ValueError(f"detectors[{_i}].{_k} must be finite, got {_v!r}")
+            _clean[_k] = _v
+        detectors.append(_clean)
+
+detector_subset = _cfg.get("detector_subset", None)
+if detector_subset is not None:
+    if not isinstance(detector_subset, (list, tuple)) or not detector_subset:
+        raise ValueError(
+            f"detector_subset must be a non-empty list of detector names or "
+            f"indices, or null; got {detector_subset!r}"
+        )
+    if detectors is None:
+        raise ValueError(
+            "detector_subset is set but no detectors: section is configured"
+        )

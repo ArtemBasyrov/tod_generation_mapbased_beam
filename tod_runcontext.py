@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 import tod_config as config
+from tod_focalplane import Detector, load_detectors
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,9 @@ class RunContext:
         HWP physical rotation frequency [Hz].
     hwp_phi0_rad : float
         Initial HWP phase at t=0 [rad].
+    detectors : tuple[Detector, ...]
+        Focal-plane detectors processed this run. A single implicit boresight
+        detector (``quat=None``) when no ``detectors:`` section is configured.
     """
 
     folder_scan: str
@@ -65,6 +69,7 @@ class RunContext:
     hwp_enabled: bool
     hwp_freq_hz: float
     hwp_phi0_rad: float
+    detectors: Tuple[Detector, ...]
 
 
 def build_run_context(nside, batch_size, z_skip_threshold, fsamp):
@@ -96,4 +101,5 @@ def build_run_context(nside, batch_size, z_skip_threshold, fsamp):
         hwp_enabled=bool(config.hwp_enabled),
         hwp_freq_hz=float(config.hwp_rotation_frequency_hz),
         hwp_phi0_rad=float(config.hwp_initial_phase_rad),
+        detectors=tuple(load_detectors()),
     )

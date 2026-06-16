@@ -97,3 +97,17 @@
   # 'fork' avoids re-running Numba JIT compilation in each worker but may deadlock
   # on macOS. Only change this if you have verified it is safe on your platform.
   mp_start_method: 'spawn'
+
+  # Focal-plane detectors (optional).
+  # When omitted or null, a single implicit boresight detector is used and
+  # output keeps the legacy tod_day_{N}.npy naming. When present, each detector
+  # is offset from the boresight in the TOAST xi-eta-gamma convention (degrees)
+  # and per-detector pointing is composed on the fly. Output is then named
+  # tod_day_{N}_{name}.npy. gamma_deg is the polarization-angle offset; an A/B
+  # pair shares xi/eta and differs by gamma_deg = 90.
+  detectors: null
+  #   - {name: det_000A, xi_deg: 0.0, eta_deg: 0.0, gamma_deg: 0.0}
+  #   - {name: det_000B, xi_deg: 0.0, eta_deg: 0.0, gamma_deg: 90.0}
+  # Optionally run only part of the focal plane (names or 0-based indices).
+  # Used to shard a large focal plane across HPC nodes. null → all detectors.
+  detector_subset: null

@@ -12,6 +12,7 @@ from tod_core import precompute_rotation_vector_batch, beam_tod_batch
 from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
 from tod_utils import _get_ncpus, _fmt_time, _should_print_batch
 from tod_runcontext import build_run_context
+from tod_focalplane import detector_pointing_batch, tod_output_path
 from tod_pipeline_helpers import (
     prepare_beam_data,
     apply_beam_clustering,
@@ -81,6 +82,7 @@ def tod_exact_gen_batched(
     beam_data,
     day_index,
     process_name=None,
+    q_det=None,
 ):
     """Generate TOD for a single observation day using batched processing.
 
@@ -90,6 +92,12 @@ def tod_exact_gen_batched(
     rotation vectors, calls :func:`~tod_core.beam_tod_batch` for every beam
     entry, and accumulates the results.
 
+    When ``q_det`` is given, the boresight pointing batch is first transformed
+    into the detector's frame via :func:`tod_focalplane.detector_pointing_batch`
+    (float64, then cast to ``ctx.precision_dtype``) before entering the kernel.
+    When ``q_det`` is ``None`` the boresight pointing is used verbatim, leaving
+    single-detector output bit-identical to the legacy path.
+
     Args:
         ctx (RunContext): Run-scoped parameters (scan folder, interp mode,
             nside, batch size, precision, spin-2 skip threshold, HWP, …).
@@ -98,6 +106,8 @@ def tod_exact_gen_batched(
         day_index (int): Zero-based index of the observation day.
         process_name (str | None): Label for log messages (e.g. the
             ``multiprocessing.Process`` name). Defaults to ``None``.
+        q_det (numpy.ndarray | None): Detector offset quaternion ``(4,)``, or
+            ``None`` for the boresight detector (no pointing transform).
 
     Returns:
         numpy.ndarray: TOD array of shape ``(3, n_samples)``, dtype matching
@@ -144,9 +154,22 @@ def tod_exact_gen_batched(
                 + f"Batch {batch_idx + 1}/{n_batches}  samples {bs}-{be - 1}  ETA {eta_str}"
             )
 
-        theta_b = np.array(theta_mmap[bs:be], dtype=_dt)
-        phi_b = np.array(phi_mmap[bs:be], dtype=_dt)
-        psi_b = np.array(psi_mmap[bs:be], dtype=_dt)
+        if q_det is None:
+            theta_b = np.array(theta_mmap[bs:be], dtype=_dt)
+            phi_b = np.array(phi_mmap[bs:be], dtype=_dt)
+            psi_b = np.array(psi_mmap[bs:be], dtype=_dt)
+        else:
+            # Compose per-detector pointing in float64, then cast to the run
+            # precision. Overhead is O(B) against the kernel's O(B·S).
+            theta_d, phi_d, psi_d = detector_pointing_batch(
+                np.asarray(theta_mmap[bs:be], dtype=np.float64),
+                np.asarray(phi_mmap[bs:be], dtype=np.float64),
+                np.asarray(psi_mmap[bs:be], dtype=np.float64),
+                q_det,
+            )
+            theta_b = theta_d.astype(_dt)
+            phi_b = phi_d.astype(_dt)
+            psi_b = psi_d.astype(_dt)
         rot_vecs, betas = precompute_rotation_vector_batch(
             ra0, dec0, phi_b, theta_b, center_idx=beam_center_idx
         )
@@ -188,29 +211,36 @@ def tod_exact_gen_batched(
     return tod_day
 
 
-def _process_day(day_index):
+def _process_task(task):
     """
-    Worker entry point.  ``ctx`` and ``beam_data`` are *not* passed as
-    arguments — they live in the module-level globals populated by
-    :func:`_worker_init`, so no pickling / copying of the large sky-map arrays
-    (or re-pickling of the context) occurs per task.
+    Worker entry point for one ``(day_index, det_index)`` task.
+
+    ``ctx`` and ``beam_data`` are *not* passed as arguments — they live in the
+    module-level globals populated by :func:`_worker_init`, so no pickling /
+    copying of the large sky-map arrays (or re-pickling of the context) occurs
+    per task.  The detector is looked up from ``ctx.detectors`` by index.
     """
+    day_index, det_index = task
+    detector = _g_ctx.detectors[det_index]
     process_name = multiprocessing.current_process().name
-    print(f"[{process_name}] Processing day {day_index}")
+    print(f"[{process_name}] Processing day {day_index}, detector {detector.name}")
     try:
         tod_day = tod_exact_gen_batched(
             _g_ctx,
             _g_beam_data,
             day_index,
             process_name=process_name,
+            q_det=detector.quat,
         )
-        output_file = os.path.join(_g_ctx.folder_tod_output, f"tod_day_{day_index}.npy")
+        output_file = tod_output_path(_g_ctx.folder_tod_output, day_index, detector)
         np.save(output_file, tod_day)
         print(f"[{process_name}] Saved {output_file}")
-        return day_index, True, None
+        return task, True, None
     except Exception as e:
-        print(f"[{process_name}] Error on day {day_index}: {e}")
-        return day_index, False, str(e)
+        print(
+            f"[{process_name}] Error on day {day_index}, detector {detector.name}: {e}"
+        )
+        return task, False, str(e)
 
 
 def main(n_cpu_ceiling):
@@ -340,6 +370,27 @@ def main(n_cpu_ceiling):
         fsamp=fsamp,
     )
 
+    # Task grid: one task per (day, detector). Tasks whose output file already
+    # exists are skipped so an interrupted multi-day run resumes cheaply.
+    detectors = ctx.detectors
+    print(f"Focal plane: {len(detectors)} detector(s) — {[d.name for d in detectors]}")
+    all_tasks = [(day, di) for day in days for di in range(len(detectors))]
+    tasks = []
+    n_skipped = 0
+    for day, di in all_tasks:
+        if os.path.exists(tod_output_path(ctx.folder_tod_output, day, detectors[di])):
+            n_skipped += 1
+        else:
+            tasks.append((day, di))
+    if n_skipped:
+        print(
+            f"Resume: skipping {n_skipped}/{len(all_tasks)} task(s) with existing output"
+        )
+    if not tasks:
+        print("Nothing to do — all outputs already present.")
+        print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")
+        return
+
     if ncpus > 1:
         beam_shms = {}
         beam_shm_descs = {}
@@ -362,13 +413,18 @@ def main(n_cpu_ceiling):
             for bf, data in beam_data.items()
         }
 
+        results = []
         try:
             with multiprocessing.Pool(
                 processes=ncpus,
                 initializer=_worker_init,
                 initargs=(beam_data_static, ctx, beam_shm_descs, n_threads),
             ) as pool:
-                results = pool.map(_process_day, days)
+                # imap_unordered with chunksize=1: results land as they finish,
+                # giving better tail load-balancing than map's ordered chunking
+                # across the many short-relative-to-runtime (day, det) tasks.
+                for res in pool.imap_unordered(_process_task, tasks, chunksize=1):
+                    results.append(res)
         finally:
             # Release shared memory only after all workers have finished.
             for shm in beam_shms.values():
@@ -376,24 +432,24 @@ def main(n_cpu_ceiling):
                 shm.unlink()
 
         failed = [r for r in results if not r[1]]
-        print(f"\nDone — {len(results) - len(failed)}/{len(results)} days OK")
-        for day, _, err in failed:
-            print(f"  Day {day} failed: {err}")
+        print(f"\nDone — {len(results) - len(failed)}/{len(results)} task(s) OK")
+        for (day, di), _, err in failed:
+            print(f"  Day {day}, detector {detectors[di].name} failed: {err}")
     else:
         if n_threads is not None and n_threads > 0:
             import numba
 
             numba.set_num_threads(int(n_threads))
-        for day_index in days:
+        for day_index, det_index in tasks:
+            detector = detectors[det_index]
             tod_day = tod_exact_gen_batched(
                 ctx,
                 beam_data,
                 day_index,
                 process_name="main",
+                q_det=detector.quat,
             )
-            output_file = os.path.join(
-                ctx.folder_tod_output, f"tod_day_{day_index}.npy"
-            )
+            output_file = tod_output_path(ctx.folder_tod_output, day_index, detector)
             np.save(output_file, tod_day)
 
     print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")
