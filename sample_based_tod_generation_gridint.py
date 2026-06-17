@@ -12,7 +12,11 @@ from tod_core import precompute_rotation_vector_batch, beam_tod_batch
 from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
 from tod_utils import _get_ncpus, _fmt_time, _should_print_batch
 from tod_runcontext import build_run_context
-from tod_focalplane import detector_pointing_batch, tod_output_path
+from tod_focalplane import (
+    combine_detector_signal,
+    detector_pointing_batch,
+    tod_output_path,
+)
 from tod_pipeline_helpers import (
     prepare_beam_data,
     apply_beam_clustering,
@@ -221,9 +225,11 @@ def _process_task(task):
     per task.  The detector is looked up from ``ctx.detectors`` by index.
 
     Returns a 4-tuple ``(task, ok, err, payload)``. In furax-export mode the
-    ``(3, n_samples)`` TOD is returned as ``payload`` so the main process can
-    assemble the per-day observation in memory; otherwise the TOD is written to
-    a ``tod_day_*.npy`` file and ``payload`` is ``None``.
+    detector's scalar timestream ``(n_samples,)`` is returned as ``payload`` —
+    the I/Q/U → scalar combination is done here so only one row (not three) is
+    held over IPC and buffered by the main process until the day is whole.
+    Otherwise the full ``(3, n_samples)`` TOD is written to a ``tod_day_*.npy``
+    file and ``payload`` is ``None``.
     """
     day_index, det_index = task
     detector = _g_ctx.detectors[det_index]
@@ -238,8 +244,17 @@ def _process_task(task):
             q_det=detector.quat,
         )
         if _g_ctx.furax_export:
-            # Return the TOD; the main process assembles and writes the HDF5.
-            return task, True, None, tod_day
+            # Combine to the detector's scalar signal here so the main process
+            # buffers a single (n,) row per detector instead of a (3, n) TOD.
+            theta_m, phi_m, psi_m = open_scan_day(_g_ctx.folder_scan, day_index)
+            signal = combine_detector_signal(
+                tod_day,
+                np.asarray(theta_m, dtype=np.float64),
+                np.asarray(phi_m, dtype=np.float64),
+                np.asarray(psi_m, dtype=np.float64),
+                detector,
+            )
+            return task, True, None, signal
         output_file = tod_output_path(_g_ctx.folder_tod_output, day_index, detector)
         np.save(output_file, tod_day)
         print(f"[{process_name}] Saved {output_file}")
@@ -275,15 +290,15 @@ def _assemble_and_write_day(day_index, det_tods, ctx, fsamp, export):
     """Assemble a day's in-memory per-detector TODs and write one HDF5 obs.
 
     Called from ``main()`` once all of a day's detector tasks have returned
-    their ``(3, n_samples)`` TODs (via IPC). The boresight pointing is read once
-    here, each detector's scalar timestream is combined at its own polarization
-    angle, and a single ``obs_day_{N}.h5`` is written into
-    ``ctx.folder_tod_output`` using the pipeline precision. No ``.npy`` files
-    are involved on this path.
+    their scalar ``(n_samples,)`` timestreams (already combined at each
+    detector's polarization angle in the worker). The boresight pointing is read
+    once here for the observation, the per-detector rows are stacked, and a
+    single ``obs_day_{N}.h5`` is written into ``ctx.folder_tod_output`` using the
+    pipeline precision. No ``.npy`` files are involved on this path.
 
     Args:
         day_index (int): Observation-day index whose detectors are all done.
-        det_tods (dict[int, numpy.ndarray]): ``{det_index: (3, n) TOD}``.
+        det_tods (dict[int, numpy.ndarray]): ``{det_index: (n,) scalar signal}``.
         ctx (RunContext): Run context (scan/output folders, detectors, HWP,
             precision).
         fsamp (float): Sample rate [Hz].
@@ -299,10 +314,8 @@ def _assemble_and_write_day(day_index, det_tods, ctx, fsamp, export):
     detectors = ctx.detectors
     n_samples = theta.shape[0]
     signal = np.empty((len(detectors), n_samples), dtype=np.float64)
-    for di, det in enumerate(detectors):
-        signal[di] = tod_to_furax.combine_detector_signal(
-            det_tods[di], theta, phi, psi, det
-        )
+    for di in range(len(detectors)):
+        signal[di] = det_tods[di]
 
     tod_to_furax.write_day_observation(
         day_index=day_index,

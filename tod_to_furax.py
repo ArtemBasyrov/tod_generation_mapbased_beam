@@ -44,7 +44,12 @@ except ImportError as exc:
 
 import tod_config as config
 from tod_io import load_scan_information
-from tod_focalplane import detector_pointing_batch, load_detectors, tod_output_path
+from tod_focalplane import (
+    combine_detector_signal,
+    load_detectors,
+    tod_output_path,
+    _combine_iqu_to_signal,
+)
 
 
 def _angles_to_boresight_radec_quats(
@@ -201,37 +206,6 @@ def _build_observation(
         np.zeros(n_samples, dtype=np.uint8), offset=(0,), fromrank=0
     )
     return obs
-
-
-def _combine_iqu_to_signal(iqu: np.ndarray, psi_d: np.ndarray) -> np.ndarray:
-    """``I + Q cos(2 psi_d) + U sin(2 psi_d)`` for one detector, float64."""
-    I, Q, U = iqu.astype(np.float64)
-    c2 = np.cos(2.0 * psi_d.astype(np.float64))
-    s2 = np.sin(2.0 * psi_d.astype(np.float64))
-    return I + Q * c2 + U * s2
-
-
-def combine_detector_signal(iqu, theta, phi, psi, detector):
-    """Combine one detector's ``(3, n)`` [I, Q, U] TOD into its scalar timestream.
-
-    The combination uses the detector's polarization angle ``psi_d`` — the roll
-    of the per-detector pointing (``psi`` itself for the boresight detector). Q/U
-    are already in that detector frame (and, under HWP, pre-rotated), so the
-    stored signal is ``I + Q cos(2 psi_d) + U sin(2 psi_d)``.
-
-    Args:
-        iqu (numpy.ndarray): ``(3, n)`` [I, Q, U] TOD for this detector.
-        theta, phi, psi (numpy.ndarray): boresight pointing ``(n,)`` [rad].
-        detector (Detector): the detector (``quat is None`` → boresight).
-
-    Returns:
-        numpy.ndarray: scalar signal ``(n,)``, float64.
-    """
-    if detector.quat is None:
-        psi_d = psi
-    else:
-        psi_d = detector_pointing_batch(theta, phi, psi, detector.quat)[2]
-    return _combine_iqu_to_signal(iqu, psi_d)
 
 
 def write_day_observation(
