@@ -3,6 +3,9 @@ Pipeline helpers shared by the entry scripts.
 
 prepare_beam_data            — load beams from disk, dB-threshold + normalise,
                                build (S, 3) beam-pixel unit vectors.
+prepare_beam_sets            — same, but for a focal plane: one beam set per
+                               distinct detector beam_key, with disk loads
+                               shared across detectors that reuse a beam file.
 apply_beam_clustering        — in-place spherical k-means reduction of every
                                beam entry, plus reduction of any precomputed
                                cache arrays attached to the entry.
@@ -86,42 +89,129 @@ def prepare_beam_data(beam_filenames, active_fields=None):
 
     beam_data = {}
     for bf, comp_indices in beam_groups.items():
-        ra, dec, pixel_map = load_beam(
-            config.FOLDER_BEAM,
-            bf,
-            center_x=config.beam_center_x,
-            center_y=config.beam_center_y,
-        )
-
-        db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
-        sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
-        beam_vals = pixel_map[sel].astype(config.precision_dtype)
-        norm = beam_vals.sum()
-        if norm != 0:
-            beam_vals /= norm
-
-        theta_orig = np.pi / 2 - dec
-        vec_orig = np.stack(
-            [
-                np.sin(theta_orig) * np.cos(ra),
-                np.sin(theta_orig) * np.sin(ra),
-                np.cos(theta_orig),
-            ],
-            axis=-1,
-        )[sel].astype(config.precision_dtype)
-
-        beam_data[bf] = {
-            "ra": ra,
-            "dec": dec,
-            "beam_vals": beam_vals,
-            "sel": sel,
-            "comp_indices": comp_indices,
-            "n_sel": int(sel.sum()),
-            "vec_orig": vec_orig,
-        }
-        print(f"  Beam {bf}: {sel.sum()} selected pixels")
+        entry = _build_beam_source(bf, beam_threshold_map[bf])
+        entry["comp_indices"] = comp_indices
+        beam_data[bf] = entry
+        print(f"  Beam {bf}: {entry['n_sel']} selected pixels")
 
     return beam_data
+
+
+def _build_beam_source(bf, threshold):
+    """Load one beam file and build its power-thresholded pixel selection.
+
+    Shared by :func:`prepare_beam_data` and :func:`prepare_beam_sets`. Returns
+    the per-source entry without ``comp_indices`` (the caller assigns which
+    Stokes components read from this beam).
+
+    Args:
+        bf (str): Beam filename within ``config.FOLDER_BEAM``.
+        threshold (float): Power-fraction threshold for pixel inclusion.
+
+    Returns:
+        dict: Entry with ``ra``, ``dec``, ``beam_vals`` (S,), ``sel``,
+            ``n_sel`` and ``vec_orig`` (S, 3). ``comp_indices`` is not set.
+    """
+    ra, dec, pixel_map = load_beam(
+        config.FOLDER_BEAM,
+        bf,
+        center_x=config.beam_center_x,
+        center_y=config.beam_center_y,
+    )
+
+    db_cut = _compute_dB_threshold_from_power(pixel_map, threshold)
+    sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
+    beam_vals = pixel_map[sel].astype(config.precision_dtype)
+    norm = beam_vals.sum()
+    if norm != 0:
+        beam_vals /= norm
+
+    theta_orig = np.pi / 2 - dec
+    vec_orig = np.stack(
+        [
+            np.sin(theta_orig) * np.cos(ra),
+            np.sin(theta_orig) * np.sin(ra),
+            np.cos(theta_orig),
+        ],
+        axis=-1,
+    )[sel].astype(config.precision_dtype)
+
+    return {
+        "ra": ra,
+        "dec": dec,
+        "beam_vals": beam_vals,
+        "sel": sel,
+        "n_sel": int(sel.sum()),
+        "vec_orig": vec_orig,
+    }
+
+
+def prepare_beam_sets(beam_specs, active_fields=None):
+    """Load per-detector beam sets, sharing disk loads across detectors.
+
+    Each detector's beam set is described by a :class:`tod_focalplane.BeamSpec`
+    keyed by ``beam_key``. Beam files are read at most once per distinct
+    ``(filename, threshold)`` pair, so detectors that share a beam file (e.g. an
+    A/B polarization pair) pay the disk + threshold cost only once. The returned
+    per-source entries are independent copies, safe for in-place clustering.
+
+    Args:
+        beam_specs (dict[str, BeamSpec]): ``beam_key`` → resolved beam files and
+            thresholds, from :func:`tod_focalplane.build_beam_specs`.
+        active_fields (tuple[int, ...] | None): Active Stokes component indices
+            (``None`` → ``config.map_fields``). Components outside this set are
+            not loaded.
+
+    Returns:
+        dict[str, dict]: ``beam_key`` → per-source beam-data dict, each of the
+            same structure :func:`prepare_beam_data` returns (keyed by beam
+            filename, every entry carrying ``comp_indices``). Feed each value
+            through :func:`apply_beam_clustering` and :func:`merge_beam_entries`.
+
+    Raises:
+        ValueError: If an active component has no beam file, or one beam file is
+            requested with conflicting thresholds within a single beam set.
+    """
+    if active_fields is None:
+        active_fields = config.map_fields
+    active = [int(c) for c in active_fields]
+
+    source_cache = {}  # (filename, threshold) -> base entry (shared, read-only)
+    beam_sets = {}
+    for key, spec in beam_specs.items():
+        groups = {}  # filename -> [comp indices]
+        file_threshold = {}  # filename -> threshold (conflict detection)
+        for c in active:
+            bf = spec.beam_files[c]
+            thr = spec.thresholds[c]
+            if bf is None:
+                raise ValueError(
+                    f"beam set {key!r}: Stokes component {c} is active but its "
+                    f"beam file is None"
+                )
+            if bf in file_threshold and file_threshold[bf] != thr:
+                raise ValueError(
+                    f"beam set {key!r}: beam file {bf!r} is shared by components "
+                    f"with conflicting thresholds ({file_threshold[bf]!r} vs "
+                    f"{thr!r}); use one threshold per file"
+                )
+            file_threshold[bf] = thr
+            groups.setdefault(bf, []).append(c)
+
+        beam_data = {}
+        for bf, comp_indices in groups.items():
+            thr = file_threshold[bf]
+            base = source_cache.get((bf, thr))
+            if base is None:
+                base = _build_beam_source(bf, thr)
+                source_cache[(bf, thr)] = base
+            entry = dict(base)  # shallow copy; clustering reassigns arrays
+            entry["comp_indices"] = comp_indices
+            beam_data[bf] = entry
+            print(f"  [{key}] Beam {bf}: {entry['n_sel']} selected pixels")
+        beam_sets[key] = beam_data
+
+    return beam_sets
 
 
 _CLUSTER_CACHE_KEYS = ("vec_rolled", "dtheta", "dphi")

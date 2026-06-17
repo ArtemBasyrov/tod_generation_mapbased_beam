@@ -190,3 +190,195 @@ def test_output_path_naming():
     det = Detector(name="det_000B", quat=np.zeros(4), gamma=0.0)
     assert fp.tod_output_path("/out/", 7, boresight) == "/out/tod_day_7.npy"
     assert fp.tod_output_path("/out/", 7, det) == "/out/tod_day_7_det_000B.npy"
+
+
+# ── Per-detector beam sets (Phase 2) ──────────────────────────────────────────
+
+
+@pytest.fixture
+def _global_beams(monkeypatch):
+    """Pin the global beam files/thresholds so beam_key resolution is stable."""
+    monkeypatch.setattr(config, "beam_file_I", "I.fits")
+    monkeypatch.setattr(config, "beam_file_Q", "Q.fits")
+    monkeypatch.setattr(config, "beam_file_U", "U.fits")
+    monkeypatch.setattr(config, "power_threshold_I", 1.0)
+    monkeypatch.setattr(config, "power_threshold_Q", 1.0)
+    monkeypatch.setattr(config, "power_threshold_U", 1.0)
+
+
+def test_default_focal_plane_uses_default_beam_key(monkeypatch, _global_beams):
+    monkeypatch.setattr(config, "detectors", None)
+    monkeypatch.setattr(config, "detector_subset", None)
+    dets = fp.load_detectors()
+    assert dets[0].beam_key == "default"
+    specs = fp.build_beam_specs(dets)
+    assert list(specs) == ["default"]
+    assert specs["default"] == fp._global_beam_spec()
+
+
+def test_detectors_without_overrides_share_default_set(monkeypatch, _global_beams):
+    monkeypatch.setattr(
+        config,
+        "detectors",
+        [
+            {"name": "A", "xi_deg": 0.0, "eta_deg": 0.0, "gamma_deg": 0.0},
+            {"name": "B", "xi_deg": 0.0, "eta_deg": 0.0, "gamma_deg": 90.0},
+        ],
+    )
+    monkeypatch.setattr(config, "detector_subset", None)
+    dets = fp.load_detectors()
+    assert [d.beam_key for d in dets] == ["default", "default"]
+    # One shared beam set despite two detectors.
+    assert list(fp.build_beam_specs(dets)) == ["default"]
+
+
+def test_per_detector_beam_override_creates_distinct_set(monkeypatch, _global_beams):
+    monkeypatch.setattr(
+        config,
+        "detectors",
+        [
+            {"name": "A", "xi_deg": 0.0, "eta_deg": 0.0, "gamma_deg": 0.0},
+            {
+                "name": "B",
+                "xi_deg": 0.0,
+                "eta_deg": 0.0,
+                "gamma_deg": 90.0,
+                "beam_file_I": "I_asym.fits",
+                "beam_file_Q": "Q_asym.fits",
+                "beam_file_U": "U_asym.fits",
+            },
+        ],
+    )
+    monkeypatch.setattr(config, "detector_subset", None)
+    dets = fp.load_detectors()
+    assert dets[0].beam_key == "default"
+    assert dets[1].beam_key != "default"
+    specs = fp.build_beam_specs(dets)
+    assert set(specs) == {"default", dets[1].beam_key}
+    assert specs[dets[1].beam_key].beam_files == (
+        "I_asym.fits",
+        "Q_asym.fits",
+        "U_asym.fits",
+    )
+    # The non-overridden detector keeps the global files.
+    assert specs["default"].beam_files == ("I.fits", "Q.fits", "U.fits")
+
+
+def test_ab_pair_sharing_override_files_share_one_set(monkeypatch, _global_beams):
+    """An A/B pair pointing at the same (overridden) beam files shares a set."""
+    shared = {
+        "beam_file_I": "I_asym.fits",
+        "beam_file_Q": "Q_asym.fits",
+        "beam_file_U": "U_asym.fits",
+    }
+    monkeypatch.setattr(
+        config,
+        "detectors",
+        [
+            {"name": "A", "xi_deg": 0.0, "eta_deg": 0.0, "gamma_deg": 0.0, **shared},
+            {"name": "B", "xi_deg": 0.0, "eta_deg": 0.0, "gamma_deg": 90.0, **shared},
+        ],
+    )
+    monkeypatch.setattr(config, "detector_subset", None)
+    dets = fp.load_detectors()
+    assert dets[0].beam_key == dets[1].beam_key != "default"
+    assert len(fp.build_beam_specs(dets)) == 1
+
+
+def test_partial_override_falls_back_to_global(monkeypatch, _global_beams):
+    """Overriding only beam_file_Q keeps I/U at the global files."""
+    monkeypatch.setattr(
+        config,
+        "detectors",
+        [
+            {
+                "name": "A",
+                "xi_deg": 0.0,
+                "eta_deg": 0.0,
+                "gamma_deg": 0.0,
+                "beam_file_Q": "Q_special.fits",
+            }
+        ],
+    )
+    monkeypatch.setattr(config, "detector_subset", None)
+    dets = fp.load_detectors()
+    spec = fp.build_beam_specs(dets)[dets[0].beam_key]
+    assert spec.beam_files == ("I.fits", "Q_special.fits", "U.fits")
+
+
+def test_clustering_override_creates_distinct_set(monkeypatch, _global_beams):
+    """Same beam files but a per-detector clustering override → its own set."""
+    monkeypatch.setattr(
+        config,
+        "detectors",
+        [
+            {"name": "A", "xi_deg": 0.0, "eta_deg": 0.0, "gamma_deg": 0.0},
+            {
+                "name": "B",
+                "xi_deg": 0.0,
+                "eta_deg": 0.0,
+                "gamma_deg": 90.0,
+                "n_beam_clusters": 100,
+                "beam_cluster_tail_fraction": 0.03,
+            },
+        ],
+    )
+    monkeypatch.setattr(config, "detector_subset", None)
+    dets = fp.load_detectors()
+    assert dets[0].beam_key == "default"
+    assert dets[1].beam_key != "default"
+    specs = fp.build_beam_specs(dets)
+    # A inherits global clustering (None); B carries the explicit override.
+    assert specs["default"].n_clusters is None
+    assert specs["default"].tail_fraction is None
+    assert specs[dets[1].beam_key].n_clusters == 100
+    assert specs[dets[1].beam_key].tail_fraction == 0.03
+    # Files are still the global ones — only the clustering differs.
+    assert specs[dets[1].beam_key].beam_files == ("I.fits", "Q.fits", "U.fits")
+
+
+def test_clustering_only_partial_override(monkeypatch, _global_beams):
+    """Overriding only n_beam_clusters leaves tail_fraction inheriting global."""
+    monkeypatch.setattr(
+        config,
+        "detectors",
+        [
+            {
+                "name": "A",
+                "xi_deg": 0.0,
+                "eta_deg": 0.0,
+                "gamma_deg": 0.0,
+                "n_beam_clusters": 50,
+            }
+        ],
+    )
+    monkeypatch.setattr(config, "detector_subset", None)
+    dets = fp.load_detectors()
+    spec = fp.build_beam_specs(dets)[dets[0].beam_key]
+    assert spec.n_clusters == 50
+    assert spec.tail_fraction is None
+
+
+def test_build_beam_specs_respects_subset(monkeypatch, _global_beams):
+    """Only beam sets of selected detectors are loaded."""
+    monkeypatch.setattr(
+        config,
+        "detectors",
+        [
+            {"name": "A", "xi_deg": 0.0, "eta_deg": 0.0, "gamma_deg": 0.0},
+            {
+                "name": "B",
+                "xi_deg": 0.0,
+                "eta_deg": 0.0,
+                "gamma_deg": 90.0,
+                "beam_file_I": "I_asym.fits",
+                "beam_file_Q": "Q_asym.fits",
+                "beam_file_U": "U_asym.fits",
+            },
+        ],
+    )
+    monkeypatch.setattr(config, "detector_subset", ["A"])
+    dets = fp.load_detectors()
+    assert [d.name for d in dets] == ["A"]
+    # B's distinct beam set is not loaded for this shard.
+    assert list(fp.build_beam_specs(dets)) == ["default"]

@@ -623,6 +623,100 @@ class TestMergeBeamEntries:
         npt.assert_array_equal(u["beam_vals"][0], bv)
 
 
+class TestPrepareBeamSets:
+    """Tests for prepare_beam_sets — per-detector beam sets with shared loads."""
+
+    def _install_counting_load_beam(self, monkeypatch):
+        """Fake load_beam returning a fixed Gaussian; records (filename) calls."""
+        ra, dec, pm = _make_gaussian_beam(n=21)
+        calls = []
+
+        def fake_load_beam(folder, fname, center_x=None, center_y=None):
+            calls.append(fname)
+            return ra.copy(), dec.copy(), pm.copy()
+
+        monkeypatch.setattr(pph, "load_beam", fake_load_beam)
+        return calls
+
+    def _spec(self, files, thresholds=(1.0, 1.0, 1.0)):
+        from tod_focalplane import BeamSpec
+
+        return BeamSpec(beam_files=tuple(files), thresholds=tuple(thresholds))
+
+    def test_default_set_matches_prepare_beam_data(self, monkeypatch):
+        """A single 'default' set with one shared file → one entry, [0,1,2]."""
+        self._install_counting_load_beam(monkeypatch)
+        _patch_tod_config(monkeypatch)
+        specs = {"default": self._spec(("b.fits", "b.fits", "b.fits"))}
+
+        sets = pph.prepare_beam_sets(specs, active_fields=(0, 1, 2))
+
+        assert list(sets) == ["default"]
+        bd = sets["default"]
+        assert list(bd) == ["b.fits"]
+        assert bd["b.fits"]["comp_indices"] == [0, 1, 2]
+
+    def test_shared_file_loaded_once_across_sets(self, monkeypatch):
+        """Two beam keys whose I files coincide load that file from disk once."""
+        calls = self._install_counting_load_beam(monkeypatch)
+        _patch_tod_config(monkeypatch)
+        specs = {
+            "default": self._spec(("I.fits", "Q.fits", "U.fits")),
+            "beam:alt": self._spec(("I.fits", "Q2.fits", "U2.fits")),
+        }
+
+        sets = pph.prepare_beam_sets(specs, active_fields=(0, 1, 2))
+
+        assert set(sets) == {"default", "beam:alt"}
+        # I.fits is shared → loaded once; the other four are distinct.
+        assert calls.count("I.fits") == 1
+        assert sorted(calls) == ["I.fits", "Q.fits", "Q2.fits", "U.fits", "U2.fits"]
+
+    def test_independent_clustering_safe(self, monkeypatch):
+        """Entries from a shared disk load are independent copies (no aliasing)."""
+        self._install_counting_load_beam(monkeypatch)
+        _patch_tod_config(monkeypatch)
+        specs = {
+            "default": self._spec(("b.fits", "b.fits", "b.fits")),
+            "beam:alt": self._spec(("b.fits", "b.fits", "b.fits"), (0.5, 0.5, 0.5)),
+        }
+        sets = pph.prepare_beam_sets(specs, active_fields=(0, 1, 2))
+        e0 = sets["default"]["b.fits"]
+        e1 = sets["beam:alt"]["b.fits"]
+        assert e0 is not e1
+        e0["beam_vals"] = np.zeros_like(e0["beam_vals"])
+        assert not np.allclose(e1["beam_vals"], 0.0)
+
+    def test_active_fields_subset(self, monkeypatch):
+        """Only active components are grouped/loaded (T-only here)."""
+        calls = self._install_counting_load_beam(monkeypatch)
+        _patch_tod_config(monkeypatch)
+        specs = {"default": self._spec(("I.fits", "Q.fits", "U.fits"))}
+
+        sets = pph.prepare_beam_sets(specs, active_fields=(0,))
+
+        bd = sets["default"]
+        assert list(bd) == ["I.fits"]
+        assert bd["I.fits"]["comp_indices"] == [0]
+        assert calls == ["I.fits"]
+
+    def test_conflicting_threshold_same_file_raises(self, monkeypatch):
+        """One file shared by components with different thresholds is rejected."""
+        self._install_counting_load_beam(monkeypatch)
+        _patch_tod_config(monkeypatch)
+        specs = {"default": self._spec(("b.fits", "b.fits", "b.fits"), (1.0, 0.5, 1.0))}
+        with pytest.raises(ValueError, match="conflicting thresholds"):
+            pph.prepare_beam_sets(specs, active_fields=(0, 1, 2))
+
+    def test_active_component_missing_file_raises(self, monkeypatch):
+        """An active component whose beam file is None is an error."""
+        self._install_counting_load_beam(monkeypatch)
+        _patch_tod_config(monkeypatch)
+        specs = {"default": self._spec(("I.fits", None, "U.fits"))}
+        with pytest.raises(ValueError, match="beam file is None"):
+            pph.prepare_beam_sets(specs, active_fields=(0, 1, 2))
+
+
 # ---------------------------------------------------------------------------
 # Standalone entry point
 # ---------------------------------------------------------------------------

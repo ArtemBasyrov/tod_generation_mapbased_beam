@@ -13,12 +13,14 @@ from tod_calibrate import calibrate_runtime, calibrate_beam_clustering
 from tod_utils import _get_ncpus, _fmt_time, _should_print_batch
 from tod_runcontext import build_run_context
 from tod_focalplane import (
+    build_beam_specs,
     combine_detector_signal,
     detector_pointing_batch,
+    load_detectors,
     tod_output_path,
 )
 from tod_pipeline_helpers import (
-    prepare_beam_data,
+    prepare_beam_sets,
     apply_beam_clustering,
     merge_beam_entries,
     apply_hwp_modulation,
@@ -38,11 +40,11 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 # Beam data lives in shared memory; the run context (small scalars) is pickled
 # to the worker once at init.
 _g_ctx = None  # RunContext — run-scoped parameters
-_g_beam_data = None  # beam_data dict with mp_stacked from shared memory
+_g_beam_sets = None  # {beam_key: merged beam-data dict} with shared mp_stacked
 _g_shm_handles = []  # SharedMemory handles kept alive for worker lifetime
 
 
-def _worker_init(beam_data_static, ctx, beam_shm_descs, n_threads):
+def _worker_init(beam_sets_static, ctx, mp_shm_descs, n_threads):
     """
     Called once in each spawned worker process.
 
@@ -51,17 +53,22 @@ def _worker_init(beam_data_static, ctx, beam_shm_descs, n_threads):
     The SharedMemory handles are stored in _g_shm_handles so they are not
     garbage-collected (which would invalidate the buffer).
 
+    The sky-map block ``mp_stacked`` is shared per Stokes-component signature
+    ``tuple(comp_indices)`` — detectors whose beams cover the same components
+    attach the *same* block, so the sky map is stored once regardless of how
+    many beam sets (detectors) reference it.
+
     Parameters
     ----------
-    beam_data_static : dict  — beam_data without large arrays (small scalars /
-                               tiny arrays safe to pickle: beam_vals, vec_orig,
-                               psi_grid, sel, ra, dec, …)
+    beam_sets_static : dict  — {beam_key: {merged_key: static entry}}; static
+                               entries drop mp_stacked but keep the small arrays
+                               (beam_vals, vec_orig, sel, ra, dec, comp_indices)
     ctx              : RunContext — run-scoped parameters (paths, interp mode,
                                nside, batch size, precision, HWP, …)
-    beam_shm_descs   : dict  — {beam_filename: {'name', 'shape', 'dtype'}}
-                               for mp_stacked
+    mp_shm_descs     : dict  — {comp_signature: {'name', 'shape', 'dtype'}}
+                               for the deduped mp_stacked sky-map blocks
     """
-    global _g_ctx, _g_beam_data, _g_shm_handles
+    global _g_ctx, _g_beam_sets, _g_shm_handles
 
     if n_threads is not None and n_threads > 0:
         import numba
@@ -70,15 +77,20 @@ def _worker_init(beam_data_static, ctx, beam_shm_descs, n_threads):
 
     _g_ctx = ctx
 
-    _g_beam_data = {}
-    for bf, static in beam_data_static.items():
-        desc = beam_shm_descs[bf]
+    mp_views = {}
+    for sig, desc in mp_shm_descs.items():
         shm = SharedMemory(name=desc["name"])
         _g_shm_handles.append(shm)
-        ms = np.ndarray(desc["shape"], dtype=desc["dtype"], buffer=shm.buf)
-        entry = dict(static)
-        entry["mp_stacked"] = ms
-        _g_beam_data[bf] = entry
+        mp_views[sig] = np.ndarray(desc["shape"], dtype=desc["dtype"], buffer=shm.buf)
+
+    _g_beam_sets = {}
+    for beam_key, bd_static in beam_sets_static.items():
+        beam_data = {}
+        for mk, static in bd_static.items():
+            entry = dict(static)
+            entry["mp_stacked"] = mp_views[tuple(static["comp_indices"])]
+            beam_data[mk] = entry
+        _g_beam_sets[beam_key] = beam_data
 
 
 def tod_exact_gen_batched(
@@ -105,8 +117,9 @@ def tod_exact_gen_batched(
     Args:
         ctx (RunContext): Run-scoped parameters (scan folder, interp mode,
             nside, batch size, precision, spin-2 skip threshold, HWP, …).
-        beam_data (dict): Pre-loaded beam data from :func:`prepare_beam_data`.
-            Must include ``'mp_stacked'`` for the Numba gather path.
+        beam_data (dict): One detector's merged beam set (from
+            :func:`prepare_beam_sets` → :func:`merge_beam_entries`). Must
+            include ``'mp_stacked'`` for the Numba gather path.
         day_index (int): Zero-based index of the observation day.
         process_name (str | None): Label for log messages (e.g. the
             ``multiprocessing.Process`` name). Defaults to ``None``.
@@ -219,10 +232,11 @@ def _process_task(task):
     """
     Worker entry point for one ``(day_index, det_index)`` task.
 
-    ``ctx`` and ``beam_data`` are *not* passed as arguments — they live in the
+    ``ctx`` and the beam sets are *not* passed as arguments — they live in the
     module-level globals populated by :func:`_worker_init`, so no pickling /
     copying of the large sky-map arrays (or re-pickling of the context) occurs
-    per task.  The detector is looked up from ``ctx.detectors`` by index.
+    per task.  The detector is looked up from ``ctx.detectors`` by index, and
+    its beam set from ``_g_beam_sets`` by ``detector.beam_key``.
 
     Returns a 4-tuple ``(task, ok, err, payload)``. In furax-export mode the
     detector's scalar timestream ``(n_samples,)`` is returned as ``payload`` —
@@ -238,7 +252,7 @@ def _process_task(task):
     try:
         tod_day = tod_exact_gen_batched(
             _g_ctx,
-            _g_beam_data,
+            _g_beam_sets[detector.beam_key],
             day_index,
             process_name=process_name,
             q_det=detector.quat,
@@ -356,7 +370,11 @@ def main(n_cpu_ceiling):
     end = min(config.end_day or Nb, Nb)
     days = range(start, end)
 
-    beam_files = [config.beam_file_I, config.beam_file_Q, config.beam_file_U]
+    # Resolve the focal plane and the beam set each detector convolves with.
+    # Detectors that share a beam file (e.g. an A/B polarization pair) share one
+    # beam_key, so each unique beam set is loaded and clustered only once.
+    detectors = load_detectors()
+    beam_specs = build_beam_specs(detectors)
 
     os.makedirs(config.FOLDER_TOD_OUTPUT, exist_ok=True)
 
@@ -375,13 +393,18 @@ def main(n_cpu_ceiling):
         for c, m in zip(config.map_fields, _raw)
     }
 
-    print("Loading beam data...")
-    beam_data = prepare_beam_data(beam_files)
+    print(f"Loading beam data for {len(beam_specs)} beam set(s)...")
+    beam_sets = prepare_beam_sets(beam_specs)
+
+    # Calibration and (for non-default focal planes) a representative throughput
+    # probe use the first beam set; clustering parameters are global, so they
+    # apply uniformly to every set.
+    first_key = next(iter(beam_sets))
 
     if config.clustering_calibration_enabled:
         print("Running beam clustering calibration …")
         best_tf, best_K = calibrate_beam_clustering(
-            beam_data,
+            beam_sets[first_key],
             folder_scan=config.FOLDER_SCAN,
             probe_day=start,
             mp=MP,
@@ -393,35 +416,60 @@ def main(n_cpu_ceiling):
         config.n_beam_clusters = best_K
         config.beam_cluster_tail_fraction = best_tf
 
-    if config.n_beam_clusters is not None:
+    # Clustering parameters resolve per beam set: a detector's own
+    # n_beam_clusters / beam_cluster_tail_fraction override, or the global
+    # config value (possibly just set by calibration) when it does not override.
+    for key, beam_data in beam_sets.items():
+        spec = beam_specs[key]
+        n_clusters = (
+            spec.n_clusters if spec.n_clusters is not None else config.n_beam_clusters
+        )
+        tail_fraction = (
+            spec.tail_fraction
+            if spec.tail_fraction is not None
+            else config.beam_cluster_tail_fraction
+        )
+        if n_clusters is None:
+            continue
         print(
-            f"Applying beam clustering "
-            f"(tail_fraction={config.beam_cluster_tail_fraction}, "
-            f"n_clusters={config.n_beam_clusters}) …"
+            f"Applying beam clustering to set '{key}' "
+            f"(tail_fraction={tail_fraction}, n_clusters={n_clusters}) …"
         )
         apply_beam_clustering(
-            beam_data,
-            n_clusters=config.n_beam_clusters,
-            tail_fraction=config.beam_cluster_tail_fraction,
+            beam_data, n_clusters=n_clusters, tail_fraction=tail_fraction
         )
 
     # Spin-2 skip threshold is derived from beam geometry per source, before the
     # entries are merged (the threshold depends only on vec_orig / beam_vals).
+    # Take the most conservative (largest beam radius) over every detector's
+    # beam sources so the equatorial skip band is safe for all of them.
+    all_sources = {
+        f"{key}::{mk}": entry
+        for key, bd in beam_sets.items()
+        for mk, entry in bd.items()
+    }
     z_skip_threshold = resolve_spin2_skip_threshold(
-        beam_data, config.spin2_skip_tolerance
+        all_sources, config.spin2_skip_tolerance
     )
 
-    # Collapse the per-source beam entries into one unified multi-component entry
-    # so every Stokes component is gathered in a single kernel call and the Q/U
-    # spin-2 frame rotation is always applied together.
-    beam_data = merge_beam_entries(beam_data)
+    # Collapse each beam set's per-source entries into one unified
+    # multi-component entry so every Stokes component is gathered in a single
+    # kernel call and the Q/U spin-2 frame rotation is always applied together.
+    beam_sets = {key: merge_beam_entries(bd) for key, bd in beam_sets.items()}
 
     # Stack sky-map components into a contiguous (C, N) array in the active
-    # precision.  The Numba gather kernel requires this layout.
-    for data in beam_data.values():
-        data["mp_stacked"] = np.ascontiguousarray(
-            np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
-        )
+    # precision, deduped by Stokes-component signature: detectors whose beams
+    # cover the same components share one block (and one shared-memory copy),
+    # so the sky map is held once no matter how many beam sets reference it.
+    mp_blocks = {}
+    for beam_data in beam_sets.values():
+        for data in beam_data.values():
+            sig = tuple(data["comp_indices"])
+            if sig not in mp_blocks:
+                mp_blocks[sig] = np.ascontiguousarray(
+                    np.stack([MP[c] for c in sig])  # (C, N_hp)
+                )
+            data["mp_stacked"] = mp_blocks[sig]
 
     use_cached = not config.calibration_enabled
     if use_cached:
@@ -436,7 +484,7 @@ def main(n_cpu_ceiling):
         print("Calibrating runtime (n_processes × numba_threads × batch_size)...")
         _cx, _cy = config.beam_center_x, config.beam_center_y
         ncpus, n_threads, batch_size = calibrate_runtime(
-            beam_data,
+            beam_sets[first_key],
             config.FOLDER_SCAN,
             probe_day=start,
             mp=MP,
@@ -461,6 +509,7 @@ def main(n_cpu_ceiling):
         batch_size=batch_size,
         z_skip_threshold=z_skip_threshold,
         fsamp=fsamp,
+        detectors=detectors,
     )
 
     detectors = ctx.detectors
@@ -531,25 +580,29 @@ def main(n_cpu_ceiling):
         return
 
     if ncpus > 1:
+        # One shared-memory block per Stokes-component signature (deduped sky
+        # map), reused across every beam set that covers the same components.
         beam_shms = {}
-        beam_shm_descs = {}
-        for bf, data in beam_data.items():
-            ms = data["mp_stacked"]
+        mp_shm_descs = {}
+        for sig, ms in mp_blocks.items():
             shm = SharedMemory(create=True, size=ms.nbytes)
             np.ndarray(ms.shape, dtype=ms.dtype, buffer=shm.buf)[:] = ms
-            beam_shms[bf] = shm
-            beam_shm_descs[bf] = {
+            beam_shms[sig] = shm
+            mp_shm_descs[sig] = {
                 "name": shm.name,
                 "shape": ms.shape,
                 "dtype": ms.dtype,
             }
 
         # Only small arrays remain in the pickle payload: beam_vals, vec_orig,
-        # psi_grid, sel, ra, dec, comp_indices, n_sel.
+        # sel, ra, dec, comp_indices, n_sel — for every beam set.
         _SHARED_KEYS = {"mp_stacked"}
-        beam_data_static = {
-            bf: {k: v for k, v in data.items() if k not in _SHARED_KEYS}
-            for bf, data in beam_data.items()
+        beam_sets_static = {
+            beam_key: {
+                mk: {k: v for k, v in data.items() if k not in _SHARED_KEYS}
+                for mk, data in beam_data.items()
+            }
+            for beam_key, beam_data in beam_sets.items()
         }
 
         results = []
@@ -557,7 +610,7 @@ def main(n_cpu_ceiling):
             with multiprocessing.Pool(
                 processes=ncpus,
                 initializer=_worker_init,
-                initargs=(beam_data_static, ctx, beam_shm_descs, n_threads),
+                initargs=(beam_sets_static, ctx, mp_shm_descs, n_threads),
             ) as pool:
                 # Results land as they finish (better tail load-balancing).
                 for res in pool.imap_unordered(_process_task, tasks, chunksize=1):
@@ -590,7 +643,7 @@ def main(n_cpu_ceiling):
             detector = detectors[det_index]
             tod_day = tod_exact_gen_batched(
                 ctx,
-                beam_data,
+                beam_sets[detector.beam_key],
                 day_index,
                 process_name="main",
                 q_det=detector.quat,

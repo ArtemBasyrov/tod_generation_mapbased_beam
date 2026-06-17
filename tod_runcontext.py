@@ -77,7 +77,7 @@ class RunContext:
     furax_export: bool
 
 
-def build_run_context(nside, batch_size, z_skip_threshold, fsamp):
+def build_run_context(nside, batch_size, z_skip_threshold, fsamp, detectors=None):
     """Assemble a :class:`RunContext` from the loaded ``tod_config`` and the
     run-derived quantities computed in ``main()``.
 
@@ -87,10 +87,15 @@ def build_run_context(nside, batch_size, z_skip_threshold, fsamp):
         z_skip_threshold (float): Spin-2 skip cutoff from
             :func:`resolve_spin2_skip_threshold`.
         fsamp (float): Sample rate from :func:`load_scan_information`.
+        detectors (list[Detector] | None): Focal-plane detectors (each with its
+            ``beam_key``) resolved by ``main()``. ``None`` → load them here via
+            :func:`tod_focalplane.load_detectors`.
 
     Returns:
         RunContext: the immutable run context.
     """
+    if detectors is None:
+        detectors = load_detectors()
     _cx, _cy = config.beam_center_x, config.beam_center_y
     beam_center_idx = (_cx, _cy) if (_cx is not None and _cy is not None) else None
     return RunContext(
@@ -106,6 +111,6 @@ def build_run_context(nside, batch_size, z_skip_threshold, fsamp):
         hwp_enabled=bool(config.hwp_enabled),
         hwp_freq_hz=float(config.hwp_rotation_frequency_hz),
         hwp_phi0_rad=float(config.hwp_initial_phase_rad),
-        detectors=tuple(load_detectors()),
+        detectors=tuple(detectors),
         furax_export=bool(config.furax_export),
     )

@@ -105,9 +105,20 @@
   # and per-detector pointing is composed on the fly. Output is then named
   # tod_day_{N}_{name}.npy. gamma_deg is the polarization-angle offset; an A/B
   # pair shares xi/eta and differs by gamma_deg = 90.
+  # Each detector may optionally override the global beam with its own
+  # beam_file_{I,Q,U}, power_fraction_threshold_{I,Q,U}, n_beam_clusters and/or
+  # beam_cluster_tail_fraction (any omitted key falls back to the global value;
+  # an omitted clustering key inherits the global / calibrated clustering).
+  # Detectors whose resolved beam files AND clustering coincide share one beam
+  # set in memory, so an A/B pair on the same beams is loaded and clustered once.
+  # This is how genuinely asymmetric per-detector beams are run.
   detectors: null
   #   - {name: det_000A, xi_deg: 0.0, eta_deg: 0.0, gamma_deg: 0.0}
   #   - {name: det_000B, xi_deg: 0.0, eta_deg: 0.0, gamma_deg: 90.0}
+  #   - {name: det_001A, xi_deg: 0.3, eta_deg: 0.1, gamma_deg: 0.0,
+  #      beam_file_I: beam_001_I.fits, beam_file_Q: beam_001_Q.fits,
+  #      beam_file_U: beam_001_U.fits,
+  #      n_beam_clusters: 100, beam_cluster_tail_fraction: 0.03}
   # Optionally run only part of the focal plane (names or 0-based indices).
   # Used to shard a large focal plane across HPC nodes. null → all detectors.
   detector_subset: null

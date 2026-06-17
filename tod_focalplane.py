@@ -21,11 +21,14 @@ run precision afterwards.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 import tod_config as config
+
+# Stokes component index → config suffix used by the per-component beam knobs.
+_COMP_SUFFIX = ("I", "Q", "U")
 
 
 @dataclass(frozen=True)
@@ -42,16 +45,139 @@ class Detector:
         gamma (float): Polarization-angle offset [rad]. Folded into ``quat``
             for the pointing transform; retained here for the furax focal-plane
             table export.
+        beam_key (str): Identifier of the beam set this detector convolves with.
+            Detectors whose resolved beam files coincide share one key (and one
+            set of beam arrays in shared memory). ``"default"`` is the global
+            beam set used when no per-detector beam overrides are configured.
     """
 
     name: str
     quat: Optional[np.ndarray]
     gamma: float
+    beam_key: str = "default"
 
     @property
     def is_boresight(self) -> bool:
         """True for the implicit boresight detector (no offset transform)."""
         return self.quat is None
+
+
+@dataclass(frozen=True)
+class BeamSpec:
+    """Resolved per-detector beam files, thresholds and clustering overrides.
+
+    A detector's beam set is fully described by the three per-component beam
+    files and their power-fraction thresholds (with ``None`` for components not
+    in ``map_fields``), plus optional beam-clustering overrides. Two detectors
+    with equal :class:`BeamSpec` share a :attr:`Detector.beam_key`.
+
+    ``n_clusters`` / ``tail_fraction`` are ``None`` when the detector does not
+    override them; the generator then falls back to the global
+    ``config.n_beam_clusters`` / ``config.beam_cluster_tail_fraction`` (which may
+    themselves be set by clustering calibration) at clustering time. Storing the
+    *override* rather than the resolved value keeps the ``"default"`` key stable
+    across calibration.
+
+    Attributes:
+        beam_files (tuple): ``(beam_file_I, beam_file_Q, beam_file_U)``; entries
+            may be ``None`` for inactive components.
+        thresholds (tuple): ``(thr_I, thr_Q, thr_U)`` power-fraction thresholds;
+            entries may be ``None`` for inactive components.
+        n_clusters (int | None): Per-detector beam-cluster count override, or
+            ``None`` to inherit the global value.
+        tail_fraction (float | None): Per-detector clustering tail-fraction
+            override, or ``None`` to inherit the global value.
+    """
+
+    beam_files: Tuple[Optional[str], Optional[str], Optional[str]]
+    thresholds: Tuple[Optional[float], Optional[float], Optional[float]]
+    n_clusters: Optional[int] = None
+    tail_fraction: Optional[float] = None
+
+
+def _global_beam_spec() -> BeamSpec:
+    """The global (config-level) beam set used by detectors without overrides.
+
+    ``n_clusters`` / ``tail_fraction`` are left ``None`` (meaning "inherit the
+    global clustering config") so a detector that overrides nothing compares
+    equal to this spec and gets the ``"default"`` key.
+    """
+    return BeamSpec(
+        beam_files=(config.beam_file_I, config.beam_file_Q, config.beam_file_U),
+        thresholds=(
+            config.power_threshold_I,
+            config.power_threshold_Q,
+            config.power_threshold_U,
+        ),
+    )
+
+
+def _resolve_beam_spec(entry: dict) -> BeamSpec:
+    """Resolve a detector config entry's beam set, falling back to globals.
+
+    Args:
+        entry (dict): A cleaned ``config.detectors`` entry, optionally carrying
+            ``beam_file_{I,Q,U}`` / ``power_fraction_threshold_{I,Q,U}`` and
+            ``n_beam_clusters`` / ``beam_cluster_tail_fraction`` keys.
+
+    Returns:
+        BeamSpec: Per-component files/thresholds with global file/threshold
+            defaults applied; clustering overrides kept as-is (``None`` →
+            inherit the global clustering config at run time).
+    """
+    g = _global_beam_spec()
+    files = tuple(
+        entry.get(f"beam_file_{s}", None) or g.beam_files[i]
+        for i, s in enumerate(_COMP_SUFFIX)
+    )
+    thresholds = tuple(
+        entry.get(f"power_fraction_threshold_{s}", None)
+        if entry.get(f"power_fraction_threshold_{s}", None) is not None
+        else g.thresholds[i]
+        for i, s in enumerate(_COMP_SUFFIX)
+    )
+    return BeamSpec(
+        beam_files=files,
+        thresholds=thresholds,
+        n_clusters=entry.get("n_beam_clusters"),
+        tail_fraction=entry.get("beam_cluster_tail_fraction"),
+    )
+
+
+def _beam_key(spec: BeamSpec) -> str:
+    """Stable identifier for a beam set; ``"default"`` for the global spec."""
+    if spec == _global_beam_spec():
+        return "default"
+    parts = [("" if f is None else str(f)) for f in spec.beam_files]
+    parts += [("" if t is None else repr(t)) for t in spec.thresholds]
+    parts += [repr(spec.n_clusters), repr(spec.tail_fraction)]
+    return "beam:" + "|".join(parts)
+
+
+def build_beam_specs(detectors: "List[Detector]") -> "Dict[str, BeamSpec]":
+    """Map each detector's ``beam_key`` to its resolved :class:`BeamSpec`.
+
+    Only beam sets actually referenced by ``detectors`` (after any
+    ``detector_subset`` filtering) are included, so a sharded run loads only the
+    beams it needs.
+
+    Args:
+        detectors (list[Detector]): The detectors returned by
+            :func:`load_detectors` for this run.
+
+    Returns:
+        dict[str, BeamSpec]: ``beam_key`` → resolved beam files/thresholds.
+            ``{"default": <global spec>}`` for a run without per-detector beams.
+    """
+    raw = config.detectors
+    if not raw:
+        return {"default": _global_beam_spec()}
+    by_name = {e["name"]: e for e in raw}
+    specs: Dict[str, BeamSpec] = {}
+    for d in detectors:
+        if d.beam_key not in specs:
+            specs[d.beam_key] = _resolve_beam_spec(by_name[d.name])
+    return specs
 
 
 # ── Quaternion algebra (scalar-first (w, x, y, z), matches furax) ─────────────
@@ -177,7 +303,12 @@ def load_detectors():
         eta = np.deg2rad(entry["eta_deg"])
         gamma = np.deg2rad(entry["gamma_deg"])
         detectors.append(
-            Detector(name=entry["name"], quat=from_xieta(xi, eta, gamma), gamma=gamma)
+            Detector(
+                name=entry["name"],
+                quat=from_xieta(xi, eta, gamma),
+                gamma=gamma,
+                beam_key=_beam_key(_resolve_beam_spec(entry)),
+            )
         )
 
     subset = config.detector_subset

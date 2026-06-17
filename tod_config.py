@@ -204,6 +204,48 @@ if _detectors_raw:
             if not np.isfinite(_v):
                 raise ValueError(f"detectors[{_i}].{_k} must be finite, got {_v!r}")
             _clean[_k] = _v
+        # Optional per-detector beam overrides (Phase 2). When a key is absent
+        # or null, the detector falls back to the global beam_file_* /
+        # power_fraction_threshold_* for that Stokes component. Detectors whose
+        # resolved beam files coincide share a single beam set at run time.
+        for _bk in ("beam_file_I", "beam_file_Q", "beam_file_U"):
+            _bv = _entry.get(_bk)
+            if _bv is not None:
+                _clean[_bk] = str(_bv)
+        for _tk in (
+            "power_fraction_threshold_I",
+            "power_fraction_threshold_Q",
+            "power_fraction_threshold_U",
+        ):
+            _tv = _entry.get(_tk)
+            if _tv is not None:
+                _tv = float(_tv)
+                if not np.isfinite(_tv):
+                    raise ValueError(
+                        f"detectors[{_i}].{_tk} must be finite, got {_tv!r}"
+                    )
+                _clean[_tk] = _tv
+        # Optional per-detector beam-clustering overrides. When absent (or null)
+        # the detector inherits the global n_beam_clusters / beam_cluster_tail_
+        # fraction (themselves possibly set by clustering calibration).
+        _ncl = _entry.get("n_beam_clusters")
+        if _ncl is not None:
+            _ncl = int(_ncl)
+            if _ncl <= 0:
+                raise ValueError(
+                    f"detectors[{_i}].n_beam_clusters must be a positive int, "
+                    f"got {_ncl!r}"
+                )
+            _clean["n_beam_clusters"] = _ncl
+        _tf = _entry.get("beam_cluster_tail_fraction")
+        if _tf is not None:
+            _tf = float(_tf)
+            if not (0.0 < _tf <= 1.0):
+                raise ValueError(
+                    f"detectors[{_i}].beam_cluster_tail_fraction must be in "
+                    f"(0, 1], got {_tf!r}"
+                )
+            _clean["beam_cluster_tail_fraction"] = _tf
         detectors.append(_clean)
 
 detector_subset = _cfg.get("detector_subset", None)
