@@ -6,10 +6,13 @@ Installation
 
 Install the required Python packages::
 
-    pip install numpy healpy pixell numba pyyaml psutil
+    pip install numpy healpy pixell numba pyyaml psutil   # core TOD generation
+    pip install toast astropy h5py                         # furax HDF5 export (default-on)
 
 ``psutil`` is optional but recommended — it enables automatic CPU and memory
-detection on both local machines and HPC clusters.
+detection on both local machines and HPC clusters. The ``toast`` / ``astropy``
+/ ``h5py`` stack is needed only for the default furax HDF5 export; set
+``furax_export: false`` to write raw ``.npy`` files without it.
 
 Quick Start
 -----------
@@ -23,27 +26,20 @@ Quick Start
 
    * ``FOLDER_SCAN`` — directory with ``theta_N.npy`` / ``phi_N.npy`` /
      ``psi_N.npy`` scan files.
-   * ``FOLDER_TOD_OUTPUT`` — where output ``tod_day_N.npy`` files are written.
+   * ``FOLDER_TOD_OUTPUT`` — where output files (``obs_day_N.h5`` or
+     ``tod_day_N.npy``) are written.
    * ``path_to_map`` — HEALPix FITS file containing I, Q, U.
    * ``FOLDER_BEAM`` and ``beam_file_I/Q/U`` — beam FITS files.
 
-2. **(Optional) Pre-compute the beam rotation cache**::
-
-       python precompute_beam_cache.py --n_psi 720
-
-   This eliminates one or both Rodrigues rotations per sample at runtime,
-   yielding roughly a 25 % speed-up. However, the psi-roll is evaluated on a
-   discrete grid rather than continuously, which introduces a small interpolation
-   error. **Not recommended for experiments requiring high precision.** If you
-   do use caching, set ``beam_cache_dir`` in your config to the output directory.
-
-3. **Run the pipeline**::
+2. **Run the pipeline**::
 
        python sample_based_tod_generation_gridint.py
 
    On first run the pipeline measures throughput at several batch sizes and
    process counts, writes the optimal values to the config, and processes all
-   days. Subsequent runs skip calibration automatically.
+   days. Subsequent runs skip calibration automatically. By default it writes
+   one furax-compatible TOAST HDF5 observation per day (``obs_day_N.h5``); set
+   ``furax_export: false`` to write raw ``tod_day_N.npy`` files instead.
 
 Running on HPC / SLURM
 -----------------------
@@ -65,12 +61,16 @@ total allocated CPUs — the calibration captures this correctly.
 Output Files
 ------------
 
-One ``.npy`` file is written per processing batch (the filename uses a *day*
-index by convention, but the index can represent any batching unit you choose)::
+By default one TOAST HDF5 observation is written per processing day (the
+filename uses a *day* index by convention, but it can represent any batching
+unit)::
 
-    FOLDER_TOD_OUTPUT/tod_day_0.npy
-    FOLDER_TOD_OUTPUT/tod_day_1.npy
+    FOLDER_TOD_OUTPUT/obs_day_0.h5
+    FOLDER_TOD_OUTPUT/obs_day_1.h5
     ...
 
-Each file has shape ``(3, n_samples)`` and dtype ``float32``.
-Axis 0 is the Stokes component: ``[I, Q, U]``.
+Each observation holds a ``(n_det, n_samples)`` detdata block for the configured
+focal plane. With ``furax_export: false`` the pipeline instead writes raw NumPy
+files (``tod_day_N.npy`` for the boresight, ``tod_day_N_{name}.npy`` per
+detector), each of shape ``(3, n_samples)`` with axis 0 the Stokes component
+``[I, Q, U]``. See :doc:`data_formats` for full details.

@@ -21,8 +21,9 @@ Paths
        ``psi_N.npy``). Must end with a path separator.
    * - ``FOLDER_TOD_OUTPUT``
      - ``str``
-     - Output directory for TOD files (``tod_day_N.npy``). Created
-       automatically if absent.
+     - Output directory for TOD files (``obs_day_N.h5`` by default, or
+       ``tod_day_N.npy`` when ``furax_export: false``). Created automatically
+       if absent.
    * - ``path_to_map``
      - ``str``
      - Path to the HEALPix sky-map FITS file containing Stokes I, Q, U
@@ -40,6 +41,53 @@ Paths
    * - ``beam_file_U``
      - ``str``
      - Filename of the U-polarisation beam map inside ``FOLDER_BEAM``.
+
+Only the ``beam_file_*`` / ``power_fraction_threshold_*`` entries whose Stokes
+index appears in ``map_fields`` are required; entries for inactive components
+may be omitted or set to ``null``.
+
+Stokes Component Selection
+--------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 10 50
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``map_fields``
+     - ``list[int]``
+     - ``[0, 1, 2]``
+     - Which Stokes components to read from the input FITS map — a non-empty
+       subset of ``[0, 1, 2]`` = ``[T, Q, U]``. Use ``[0]`` for a
+       temperature-only map.
+
+The spin-2 Q/U frame rotation runs only when **both** Q (``1``) and U (``2``)
+are active. Any other subset takes the scalar gather path. The output TOD shape
+is always ``(3, n_samples)``; rows for inactive components are written as zeros.
+
+Beam Centre
+-----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 10 50
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``beam_center_x``
+     - ``int | null``
+     - ``null``
+     - Row index of the beam-centre pixel in the beam array. ``null`` →
+       ``H // 2``.
+   * - ``beam_center_y``
+     - ``int | null``
+     - ``null``
+     - Column index of the beam-centre pixel. ``null`` → ``W // 2``.
 
 Beam Pixel Selection
 --------------------
@@ -113,6 +161,11 @@ Multiprocessing
      - ``float``
      - Per-process memory budget in GB. Used as a fallback when ``psutil``
        is unavailable.
+   * - ``mp_start_method``
+     - ``str``
+     - Multiprocessing start method. ``'spawn'`` (default) is safe everywhere;
+       ``'fork'`` is faster on Linux (avoids re-running Numba JIT per worker)
+       but may deadlock on macOS.
 
 Calibration Cache
 -----------------
@@ -139,40 +192,15 @@ skipped automatically.
      - ``int | null``
      - ``null``
      - Cached optimal process count. Written automatically after calibration.
+   * - ``calibration_numba_threads``
+     - ``int | null``
+     - ``null``
+     - Cached optimal Numba ``prange`` thread count per worker. Written
+       automatically after calibration.
    * - ``calibration_batch_size``
      - ``int | null``
      - ``null``
      - Cached optimal batch size. Written automatically after calibration.
-
-Beam Rotation Cache
--------------------
-
-Pre-computing the psi-roll rotation (via :mod:`precompute_beam_cache`)
-eliminates one of the two Rodrigues rotations per sample, yielding roughly a
-25 % speed-up. An additional flat-sky approximation can eliminate the second
-rotation for narrow beams. Because the psi-roll is evaluated on a discrete
-grid rather than continuously, using the cache introduces a small
-interpolation error. **Not recommended for experiments requiring high
-precision.**
-
-.. list-table::
-   :header-rows: 1
-   :widths: 25 10 10 55
-
-   * - Key
-     - Type
-     - Default
-     - Description
-   * - ``beam_cache_dir``
-     - ``str | null``
-     - ``null``
-     - Path to the directory containing ``.npz`` cache files. ``null``
-       disables caching (full double-Rodrigues path used).
-   * - ``beam_cache_n_psi``
-     - ``int``
-     - ``720``
-     - Number of psi bins in the cache. **Must match** the ``--n_psi``
-       value used when generating the cache.
 
 Beam Interpolation
 ------------------
@@ -223,8 +251,14 @@ Beam Interpolation
      - Isotropic Gaussian kernel over all HEALPix pixels within
        ``radius_deg``. Avoids grid-aligned interpolation artefacts; best
        for wide or asymmetric beams. ``sigma_deg`` and ``radius_deg``
-       are active only for this method.
+       are active only for this method. Available on the ``gaussian`` branch.
      - Slow
+   * - ``'totalconvolve'``
+     - ducc0 NUFFT synthesis (``synthesis_general``, spin-0 for T, spin-2 for
+       Q/U). Accuracy set by ``totalconvolve_epsilon``; eliminates the flat
+       high-ℓ noise floor. Requires ``pip install ducc0``. Available on the
+       ``totalconvolve`` branch.
+     - 5–15× slower
 
 .. _configuration:Beam Pixel Clustering:
 
@@ -293,6 +327,150 @@ fill in ``n_beam_clusters`` and ``beam_cluster_tail_fraction`` by hand.
        :doc:`beam_cluster_calibration` for metric definition and
        tier-based recommendations.
 
+Spin-2 Skip Optimisation
+------------------------
+
+The spin-2 Q/U frame correction is negligible near the equator and grows toward
+the poles. Skipping it inside an equatorial band saves work at a bounded cost.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 15 12 45
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``spin2_skip_tolerance``
+     - ``float | null``
+     - ``null``
+     - Maximum per-sample fractional Q/U error tolerated by skipping the
+       correction in the equatorial band. ``null`` or ``0`` always applies the
+       correction. Recommended when used: ``0.01`` (1 %).
+
+Working Precision
+-----------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 12 12 56
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``precision``
+     - ``str``
+     - ``'float32'``
+     - Working precision for the float32-side of the pipeline (sky map,
+       pointings, beam values, Rodrigues rotation, saved TOD). ``'float64'`` is
+       a validation knob — slower and more memory, isolating whether high-ℓ
+       residuals are precision-limited. Float64 surfaces (bilinear weights,
+       spin-2 cache, accumulators, B_ℓ) are unchanged either way.
+
+Half-Wave Plate (HWP)
+---------------------
+
+When enabled, the generator rotates the per-sample ``(Q, U)`` output by
+``4·φ_HWP(t)``, with ``φ_HWP(t) = 2π·f_HWP·t + φ₀`` and ``t`` continuous across
+days. The rotation is applied **after** beam convolution and does not alter the
+beam shape or the Rodrigues rotation.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 12 12 44
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``hwp_enabled``
+     - ``bool``
+     - ``false``
+     - Enable HWP modulation of the output Q/U.
+   * - ``hwp_rotation_frequency_hz``
+     - ``float``
+     - ``0.0``
+     - Physical HWP rotation rate ``f_HWP`` [Hz].
+   * - ``hwp_initial_phase_rad``
+     - ``float``
+     - ``0.0``
+     - Phase ``φ₀`` at ``t = 0`` (start of day 0) [rad].
+
+Focal-Plane Detectors
+---------------------
+
+By default the boresight is a single implicit detector. A ``detectors`` list
+simulates a focal plane: each detector is offset from the boresight in the
+TOAST xi-eta-gamma convention (degrees) and its per-detector pointing is
+composed on the fly via quaternions that mirror ``furax.math.quaternion``
+exactly, so the generator and furax compose identical pointing.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 15 10 53
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``detectors``
+     - ``list | null``
+     - ``null``
+     - Focal-plane detector list. Each entry is
+       ``{name, xi_deg, eta_deg, gamma_deg}``. ``gamma_deg`` is the
+       polarisation-angle offset (an A/B pair shares xi/eta and differs by
+       ``gamma_deg = 90``). ``null`` → single boresight detector.
+   * - ``detector_subset``
+     - ``list | null``
+     - ``null``
+     - Run only part of the focal plane (detector names or 0-based indices).
+       Used to shard a focal plane across HPC nodes. ``null`` → all detectors.
+
+A detector entry may additionally carry ``beam_file_{I,Q,U}``,
+``power_fraction_threshold_{I,Q,U}``, ``n_beam_clusters`` and/or
+``beam_cluster_tail_fraction``. Any omitted key falls back to the global value.
+Detectors whose resolved beam files **and** clustering coincide share one beam
+set in memory, so an A/B pair on the same beams is loaded and clustered once —
+this is how genuinely asymmetric per-detector beams are run.
+
+.. code-block:: yaml
+
+   detectors:
+     - {name: det_000A, xi_deg: 0.0, eta_deg: 0.0, gamma_deg: 0.0}
+     - {name: det_000B, xi_deg: 0.0, eta_deg: 0.0, gamma_deg: 90.0}
+     - {name: det_001A, xi_deg: 0.3, eta_deg: 0.1, gamma_deg: 0.0,
+        beam_file_I: beam_001_I.fits, beam_file_Q: beam_001_Q.fits,
+        beam_file_U: beam_001_U.fits,
+        n_beam_clusters: 100, beam_cluster_tail_fraction: 0.03}
+
+furax HDF5 Export
+-----------------
+
+By default the generator writes one furax-compatible TOAST HDF5 observation per
+day (``obs_day_N.h5``, a ``(n_det, n_samples)`` detdata block) instead of
+``.npy`` files. The standalone ``tod_to_furax.py`` re-exports existing ``.npy``
+files with its own ``--output`` / ``--precision`` / ``--split-per-day`` flags.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 12 24 40
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``furax_export``
+     - ``bool``
+     - ``true``
+     - ``true`` → write ``obs_day_N.h5`` per day (no ``.npy``). ``false`` →
+       write raw per-detector ``tod_day_N.npy``. Requires the ``toast`` stack
+       (imported lazily).
+   * - ``furax_export_t0``
+     - ``str``
+     - ``'2030-01-01T00:00:00+00:00'``
+     - UTC time of sample 0 of day 0 (timestream time origin).
+
 Full Example
 ------------
 
@@ -302,6 +480,7 @@ Full Example
      FOLDER_SCAN:       "/data/scan/"
      FOLDER_TOD_OUTPUT: "/data/tod/"
      path_to_map:       "/data/maps/cmb_IQU.fits"
+     map_fields: [0, 1, 2]
 
      FOLDER_BEAM:  "/data/beams/"
      beam_file_I:  "beam_I.fits"
@@ -310,25 +489,36 @@ Full Example
      power_fraction_threshold_I: 0.99
      power_fraction_threshold_Q: 0.99
      power_fraction_threshold_U: 0.99
+     beam_center_x: null
+     beam_center_y: null
 
      start_day: 0
      end_day: 366
 
      n_processes: 8
      max_memory_per_process: 2.0
+     mp_start_method: 'spawn'
 
      calibration_enabled: true
      calibration_n_processes: null
+     calibration_numba_threads: null
      calibration_batch_size: null
 
-     beam_cache_dir: "/data/beam_cache/"
-     beam_cache_n_psi: 720
-
      beam_interp_method: 'bilinear'
-     beam_interp_sigma_deg: null
-     beam_interp_radius_deg: null
+     spin2_skip_tolerance: null
+     precision: 'float32'
 
      n_beam_clusters: null
      beam_cluster_tail_fraction: null
      clustering_calibration_enabled: false
      clustering_error_threshold: 1.0e-5
+
+     hwp_enabled: false
+     hwp_rotation_frequency_hz: 0.0
+     hwp_initial_phase_rad: 0.0
+
+     detectors: null
+     detector_subset: null
+
+     furax_export: true
+     furax_export_t0: '2030-01-01T00:00:00+00:00'

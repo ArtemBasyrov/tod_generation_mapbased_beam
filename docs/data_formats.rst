@@ -9,16 +9,17 @@ Input Files
 Sky Map (``path_to_map``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A HEALPix FITS file readable by ``healpy.read_map``. Must contain exactly
-three fields:
+A HEALPix FITS file readable by ``healpy.read_map``. Fields are indexed:
 
 * **Field 0** — Stokes I (intensity)
 * **Field 1** — Stokes Q (linear polarisation)
 * **Field 2** — Stokes U (linear polarisation)
 
-All three fields must share the same ``nside``. Values are loaded and stored
-as ``float32``. Any ``healpy``-compatible HEALPix FITS file (RING ordering)
-is accepted.
+Only the fields listed in ``map_fields`` (default ``[0, 1, 2]``) are read and
+allocated; the others are never loaded. All read fields must share the same
+``nside`` and are loaded at the configured ``precision`` (``float32`` by
+default). Any ``healpy``-compatible HEALPix FITS file (RING ordering) is
+accepted.
 
 Beam Files (``FOLDER_BEAM / beam_file_{I,Q,U}``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -61,67 +62,30 @@ The total number of processing units is inferred from the highest index found
 among ``psi_*.npy`` files. The sampling rate is estimated as
 ``len(psi_0.npy) / 86400`` samples per second.
 
-Beam Rotation Cache (``beam_cache_dir``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Optional ``.npz`` files produced by ``precompute_beam_cache.py``. The cache
-filename pattern is::
-
-    {beam_stem}_cache_npsi{N_psi}.npz
-
-Contents:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 15 20 10 55
-
-   * - Key
-     - Shape
-     - dtype
-     - Description
-   * - ``psi_grid``
-     - ``(N_psi,)``
-     - float32
-     - psi bin centres [rad] covering ``[0, 2π)``.
-   * - ``vec_rolled``
-     - ``(N_psi, S, 3)``
-     - float32
-     - Beam-pixel unit vectors after psi-roll for each bin. ``S`` is the
-       number of pixels selected by the power threshold.
-   * - ``beam_vals``
-     - ``(S,)``
-     - float32
-     - Normalised beam weights for the ``S`` selected pixels.
-   * - ``beam_ctr``
-     - ``(3,)``
-     - float32
-     - Beam-centre unit vector. Always ``[1, 0, 0]`` for correctly centred
-       beam maps.
-   * - ``dtheta``
-     - ``(N_psi, S)``
-     - float32
-     - Flat-sky colatitude offsets [rad] from the beam centre.
-       Present only when the cache was generated without ``--no_offsets``.
-       Valid for narrow beams (≲ 5°).
-   * - ``dphi``
-     - ``(N_psi, S)``
-     - float32
-     - Flat-sky phi offsets [rad] (raw; divide by ``sin(theta_b)`` at
-       runtime). Present together with ``dtheta``.
-
-When both ``dtheta`` and ``dphi`` are present the pipeline uses the
-*flat-sky* execution path, which skips both Rodrigues rotations and the
-``vec2ang`` call entirely.
-
 Output Files
 ------------
 
-TOD Files (``FOLDER_TOD_OUTPUT``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The output format depends on the ``furax_export`` setting.
 
-One ``.npy`` file per observation day::
+furax HDF5 Observations (``furax_export: true``, default)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    tod_day_{day_index}.npy
+One TOAST HDF5 observation per day::
+
+    obs_day_{day_index}.h5
+
+Each observation bundles every configured detector (the focal plane from
+``detectors``) into a ``(n_det, n_samples)`` detdata block, with timestamps
+anchored at ``furax_export_t0``. The stored signal dtype follows ``precision``.
+These files load directly into furax's ``MultiObservationMapMaker``.
+
+NumPy TOD Files (``furax_export: false``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+One ``.npy`` file per processing day and detector::
+
+    tod_day_{day_index}.npy            # implicit boresight detector
+    tod_day_{day_index}_{name}.npy     # per configured focal-plane detector
 
 .. list-table::
    :header-rows: 1
@@ -132,10 +96,11 @@ One ``.npy`` file per observation day::
      - Notes
    * - Shape
      - ``(3, n_samples)``
-     - Axis 0: Stokes component ``[I, Q, U]``. Axis 1: detector sample.
+     - Axis 0: Stokes component ``[I, Q, U]`` (rows for components absent from
+       ``map_fields`` are zero). Axis 1: detector sample.
    * - dtype
-     - ``float32``
-     -
+     - follows ``precision``
+     - ``float32`` by default.
    * - Format
      - NumPy ``.npy``
      - Load with ``numpy.load('tod_day_N.npy')``.
