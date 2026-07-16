@@ -12,7 +12,7 @@ import numpy as np
 
 
 def compute_bell(
-    ra, dec, pixel_map, lmax=1000, power_cut=0.99, normalise=True, verbose=True
+    ra, dec, pixel_map, lmax=1024, power_cut=1.00, normalise=True, verbose=True
 ):
     """Compute the effective beam transfer function B_ell from a pixelised beam.
 

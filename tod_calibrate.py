@@ -428,17 +428,31 @@ def calibrate_beam_clustering(
     error_threshold=1e-3,
     bell_lmax=None,
     interp_mode="bilinear",
+    tail_fractions=None,
+    n_clusters_list=None,
 ):
     """Find (tail_fraction, n_clusters) maximising speedup s.t. B_ell error
     ≤ error_threshold.
 
     Computes reference B_ell (power_cut=1.0) from unclustered beam, then
-    sweeps a fixed (tail_fraction × n_clusters) grid. The pair maximising
+    sweeps a (tail_fraction × n_clusters) grid. The pair maximising
     speedup with relative-RMS B_ell divergence ≤ error_threshold wins; if
     no pair qualifies, the minimum-divergence pair is returned with a warning.
+
+    ``tail_fractions`` overrides the default tail-fraction grid — e.g. to
+    enforce a lower bound derived from the noise floor of a measured beam,
+    so that the exactly-kept main-lobe pixels stay signal-dominated.
+    ``n_clusters_list`` overrides the default cluster-count grid — e.g. to
+    probe beyond 2000 clusters when the error budget is tight.
     """
-    tail_fractions = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
-    n_clusters_list = (10, 20, 50, 100, 200, 500, 1000, 2000)
+    if tail_fractions is None:
+        tail_fractions = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
+    else:
+        tail_fractions = tuple(sorted(float(tf) for tf in tail_fractions))
+    if n_clusters_list is None:
+        n_clusters_list = (10, 20, 50, 100, 200, 500, 1000, 2000)
+    else:
+        n_clusters_list = tuple(sorted(int(k) for k in n_clusters_list))
 
     if bell_lmax is None:
         if mp is not None:
