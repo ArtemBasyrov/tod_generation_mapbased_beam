@@ -20,7 +20,9 @@ def compute_bell(
 
         B_ell = sum_i [ w_i * P_ell(cos θ_i) ]
 
-    where ``w_i`` are the normalised beam weights, ``θ_i`` is the angular
+    where ``w_i`` are the normalised beam weights ``B_i cos(dec_i)`` — the
+    ``cos(dec)`` factor is the solid-angle Jacobian of the grid cell, without
+    which the sum evaluates ``int B / cos(dec) dOmega`` — ``θ_i`` is the angular
     distance of pixel *i* from the beam centre, and ``P_ell`` are Legendre
     polynomials computed via the three-term recurrence (O(N) memory).
 
@@ -53,7 +55,10 @@ def compute_bell(
     pixel_map = np.asarray(pixel_map, dtype=np.float64)
     ra = np.asarray(ra, dtype=np.float64).ravel()
     dec = np.asarray(dec, dtype=np.float64).ravel()
-    flat = pixel_map.ravel()
+    # Weights are a quadrature rule for int B dOmega, so they carry the
+    # cos(dec) cell Jacobian; omitting it tilts B_ell by the beam's own
+    # second moment along Dec.
+    flat = pixel_map.ravel() * np.cos(dec)
 
     # ── 1. Pixel selection ────────────────────────────────────────────────────
     if power_cut >= 1.0:

@@ -29,9 +29,10 @@ from beam_cluster import cluster_beam_pixels, cluster_cached_arrays
 def prepare_beam_data(beam_filenames, active_fields=None):
     """Load and preprocess all unique beam files into a beam-data dictionary.
 
-    For each unique beam filename, loads the FITS map, selects pixels by power
-    threshold (read from ``config.power_threshold_{I,Q,U}``), normalises beam
-    weights, and precomputes unit vectors.
+    For each unique beam filename, loads the FITS map, applies the ``cos(dec)``
+    solid-angle Jacobian, selects pixels by power threshold (read from
+    ``config.power_threshold_{I,Q,U}``), normalises beam weights, and
+    precomputes unit vectors.
 
     Args:
         beam_filenames (list[str]): List of beam filenames (one per Stokes
@@ -50,7 +51,8 @@ def prepare_beam_data(beam_filenames, active_fields=None):
 
             - ``'ra'`` – RA offset grid [rad]
             - ``'dec'`` – Dec offset grid [rad]
-            - ``'beam_vals'`` – Normalised beam weights, shape ``(S,)``
+            - ``'beam_vals'`` – Normalised beam weights ``B cos(dec)`` summing
+              to 1, shape ``(S,)``
             - ``'sel'`` – Boolean selection mask over the full beam map
             - ``'comp_indices'`` – List of Stokes component indices using this
               beam (e.g. ``[0]`` for I-only, ``[1, 2]`` if Q and U share a map)
@@ -89,14 +91,25 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             center_y=config.beam_center_y,
         )
 
+        # The beam file stores a point-sampled gain pattern, while the
+        # convolution integrates it against dOmega = cos(dec) dRA dDec. Folding
+        # in cos(dec) is what makes the weights a quadrature rule for that
+        # integral; without it the effective beam is B / cos(dec), which
+        # manufactures an m = +-2 ellipticity of relative amplitude r^2 / 8 out
+        # of a perfectly symmetric beam. The constant part of the cell area
+        # cancels in the normalisation below, so only cos(dec) is needed.
+        weighted_map = pixel_map * np.cos(dec)
+
         threshold = beam_threshold_map[bf]
         if threshold >= 1.0:
             # Every pixel contributes; skip the O(N log N) ranking entirely.
             sel = np.ones(pixel_map.shape, dtype=bool)
         else:
-            db_cut = _compute_dB_threshold_from_power(pixel_map, threshold)
-            sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) >= db_cut
-        beam_vals = pixel_map[sel].astype(config.precision_dtype)
+            # Rank on the solid-angle-weighted values: the retained fraction is
+            # a fraction of integrated power, not of summed amplitude.
+            db_cut = _compute_dB_threshold_from_power(weighted_map, threshold)
+            sel = 10 * np.log10(np.abs(weighted_map) + 1e-30) >= db_cut
+        beam_vals = weighted_map[sel].astype(config.precision_dtype)
         norm = beam_vals.sum()
         if norm != 0:
             beam_vals /= norm

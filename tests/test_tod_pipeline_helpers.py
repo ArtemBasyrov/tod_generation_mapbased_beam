@@ -147,6 +147,72 @@ class TestPrepareBeamData:
         bv = beam_data["b.fits"]["beam_vals"]
         npt.assert_allclose(float(bv.sum()), 1.0, atol=1e-5)
 
+    def test_beam_vals_carry_the_solid_angle_jacobian(self, monkeypatch):
+        """Weights must be B cos(dec), normalised — not B alone.
+
+        The grid cell subtends cos(dec) dRA dDec. Dropping that factor makes the
+        effective beam B / cos(dec), which turns a perfectly symmetric beam into
+        an elliptical one with a spurious m = +-2 harmonic — precisely the
+        asymmetry this pipeline exists to measure.
+        """
+        ra, dec, pm = _make_gaussian_beam(n=21)
+        self._install_fake_load_beam(monkeypatch, ra, dec, pm)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+        )
+
+        beam_data = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])
+        bv = beam_data["b.fits"]["beam_vals"].astype(np.float64)
+
+        expected = (pm * np.cos(dec)).ravel()
+        expected = expected / expected.sum()
+        npt.assert_allclose(bv, expected, rtol=1e-5)
+
+        # Decisive, not cosmetic: the two normalisations separate by
+        # <dec^2>_B / 2, well above the tolerance above.
+        plain = pm.ravel() / pm.sum()
+        with pytest.raises(AssertionError):
+            npt.assert_allclose(bv, plain, rtol=1e-6)
+
+    def test_symmetric_beam_stays_symmetric(self, monkeypatch):
+        """A beam symmetric in RA<->Dec must produce weights symmetric under transpose.
+
+        Regression guard for both group-A defects at once: the missing Jacobian
+        breaks this symmetry by stretching one axis, and a transposed load
+        breaks it whenever the beam is not itself symmetric.
+        """
+        ra, dec, pm = _make_gaussian_beam(n=21)
+        npt.assert_allclose(pm, pm.T, atol=0)  # the input really is symmetric
+        self._install_fake_load_beam(monkeypatch, ra, dec, pm)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+        )
+
+        beam_data = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])
+        d = beam_data["b.fits"]
+        w = d["beam_vals"].astype(np.float64).reshape(pm.shape)
+        v = d["vec_orig"].astype(np.float64).reshape(pm.shape + (3,))
+
+        # Weights: cos(dec) breaks the RA<->Dec symmetry of the *weights* by
+        # design, so check instead that the symmetry breaking is exactly the
+        # Jacobian and nothing else.
+        npt.assert_allclose(w / np.cos(dec), (w / np.cos(dec)).T, rtol=1e-5)
+
+        # Node placement: recover each node's offsets from its beam-frame
+        # vector.  Cell (i, j) must sit at the RA<->Dec mirror of cell (j, i).
+        # (The mirror is exact in offset coordinates, not in ambient
+        # components, since the frame is centred on x-hat.)
+        dec_node = np.arcsin(np.clip(v[..., 2], -1.0, 1.0))
+        ra_node = np.arctan2(v[..., 1], v[..., 0])
+        npt.assert_allclose(ra_node, dec_node.T, atol=1e-6)
+        npt.assert_allclose(dec_node, ra_node.T, atol=1e-6)
+
     def test_vec_orig_dtype_and_unit_norm(self, monkeypatch):
         """vec_orig is float32 and rows have unit norm."""
         ra, dec, pm = _make_gaussian_beam(n=21)
