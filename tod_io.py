@@ -9,6 +9,11 @@ def load_beam(folder_beam, filename, center_x=None, center_y=None):
     Reads a pixell/enmap FITS beam map, extracts the WCS-based sky coordinates,
     and returns them as offsets relative to the beam centre pixel.
 
+    ``posmap()`` returns ``[dec, ra]`` — declination first, following enmap's
+    ``{y, x}`` axis order — so the row index runs with Dec and the column index
+    with RA. Unpacking it the other way round transposes the beam pattern, which
+    for an asymmetric beam is a reflection that no roll can undo.
+
     Args:
         folder_beam (str): Path to the directory containing beam FITS files.
             Must end with a path separator.
@@ -29,7 +34,7 @@ def load_beam(folder_beam, filename, center_x=None, center_y=None):
               not dB), same shape as the beam map.
     """
     beam_map = enmap.read_map(folder_beam + filename)
-    ra, dec = beam_map.posmap()
+    dec, ra = beam_map.posmap()
     ra = np.array(ra)
     dec = np.array(dec)
     cx = center_x if center_x is not None else ra.shape[0] // 2

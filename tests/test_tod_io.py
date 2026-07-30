@@ -51,15 +51,18 @@ class _FakeBeamMap:
     load_beam calls beam_map.posmap() and beam_map[0] (the first slice along
     the leading axis). Everything else is irrelevant to the function under
     test.
+
+    ``posmap()`` returns ``[dec, ra]``, matching enmap's ``{y, x}`` axis order:
+    Dec varies with the row index, RA with the column index.
     """
 
-    def __init__(self, ra, dec, amp):
+    def __init__(self, dec, ra, amp):
         self._ra = ra
         self._dec = dec
         self._amp = amp
 
     def posmap(self):
-        return self._ra, self._dec
+        return self._dec, self._ra
 
     def __getitem__(self, idx):
         if idx == 0:
@@ -69,18 +72,40 @@ class _FakeBeamMap:
 
 class TestLoadBeam:
     def _make_grid(self, n=5):
-        """Build a small (n, n) RA/Dec grid in radians plus a deterministic amp map."""
+        """Build a small (n, n) RA/Dec grid in radians plus a deterministic amp map.
+
+        RA varies along the columns and Dec along the rows, as in a real CAR
+        beam map, so the two are distinguishable by which axis they vary on.
+        """
         x = np.linspace(-0.01, 0.01, n)  # 1°-ish strip
         ra, dec = np.meshgrid(x, x, indexing="xy")
         amp = (np.arange(n * n).reshape(n, n) + 1.0).astype(np.float64)
         return ra, dec, amp
+
+    def test_ra_runs_with_columns_and_dec_with_rows(self, monkeypatch):
+        """posmap() returns [dec, ra]; unpacking it the other way transposes the beam.
+
+        For an asymmetric beam that transposition is a reflection about the
+        diagonal, which no roll of the instrument can undo, so the axis
+        assignment is pinned here.
+        """
+        ra, dec, amp = self._make_grid(n=5)
+        fake_map = _FakeBeamMap(dec.copy(), ra.copy(), amp)
+        monkeypatch.setattr(tod_io.enmap, "read_map", lambda path: fake_map)
+
+        ra_out, dec_out, _ = tod_io.load_beam("/tmp/", "fake.fits")
+
+        assert np.ptp(ra_out, axis=0).max() == 0.0, "RA must not vary down a column"
+        assert np.ptp(ra_out, axis=1).max() > 0.0, "RA must vary along a row"
+        assert np.ptp(dec_out, axis=1).max() == 0.0, "Dec must not vary along a row"
+        assert np.ptp(dec_out, axis=0).max() > 0.0, "Dec must vary down a column"
 
     def test_returns_offsets_and_pixel_map(self, monkeypatch):
         """Default centering: ra/dec at the centre pixel must be zero."""
         ra, dec, amp = self._make_grid(n=5)
         # Wrap into a 1-channel "ndmap": load_beam reads beam_map[0].
         amp_3d = amp[None, :, :]
-        fake_map = _FakeBeamMap(ra.copy(), dec.copy(), amp_3d[0])
+        fake_map = _FakeBeamMap(dec.copy(), ra.copy(), amp_3d[0])
 
         monkeypatch.setattr(tod_io.enmap, "read_map", lambda path: fake_map)
 
@@ -110,7 +135,7 @@ class TestLoadBeam:
     def test_path_concatenation(self, monkeypatch):
         """folder + filename is passed straight to enmap.read_map."""
         ra, dec, amp = self._make_grid(n=3)
-        fake_map = _FakeBeamMap(ra, dec, amp)
+        fake_map = _FakeBeamMap(dec, ra, amp)
         seen_paths = []
 
         def fake_read(path):
