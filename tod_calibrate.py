@@ -470,6 +470,9 @@ def calibrate_beam_clustering(
             bvals.astype(np.float64),
             lmax=bell_lmax,
             power_cut=1.0,
+            # bvals are finished quadrature weights (clustered or not) and
+            # already carry the cos(dec) Jacobian.
+            apply_jacobian=False,
             verbose=False,
         )
         return bell

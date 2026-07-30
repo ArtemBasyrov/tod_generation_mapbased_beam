@@ -91,22 +91,22 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             center_y=config.beam_center_y,
         )
 
-        # The beam file stores a point-sampled gain pattern, while the
-        # convolution integrates it against dOmega = cos(dec) dRA dDec. Folding
-        # in cos(dec) is what makes the weights a quadrature rule for that
-        # integral; without it the effective beam is B / cos(dec), which
-        # manufactures an m = +-2 ellipticity of relative amplitude r^2 / 8 out
-        # of a perfectly symmetric beam. The constant part of the cell area
-        # cancels in the normalisation below, so only cos(dec) is needed.
+        # The beam file stores point samples, while the convolution integrates
+        # against dOmega = cos(dec) dRA dDec; cos(dec) is what turns the samples
+        # into a quadrature rule for that integral. Without it the effective
+        # beam is B / cos(dec), which manufactures an m = +-2 ellipticity of
+        # relative amplitude r^2 / 8 out of a perfectly symmetric beam — the
+        # very asymmetry this pipeline exists to measure. The constant part of
+        # the cell area cancels in the normalisation below.
         weighted_map = pixel_map * np.cos(dec)
 
         threshold = beam_threshold_map[bf]
         if threshold >= 1.0:
             # Every pixel contributes; skip the O(N log N) ranking entirely.
-            sel = np.ones(pixel_map.shape, dtype=bool)
+            sel = np.ones(weighted_map.shape, dtype=bool)
         else:
-            # Rank on the solid-angle-weighted values: the retained fraction is
-            # a fraction of integrated power, not of summed amplitude.
+            # Ranking on the weighted values makes the retained fraction a
+            # fraction of integrated power over the sphere.
             db_cut = _compute_dB_threshold_from_power(weighted_map, threshold)
             sel = 10 * np.log10(np.abs(weighted_map) + 1e-30) >= db_cut
         beam_vals = weighted_map[sel].astype(config.precision_dtype)

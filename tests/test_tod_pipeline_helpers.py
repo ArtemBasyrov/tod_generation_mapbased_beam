@@ -180,9 +180,10 @@ class TestPrepareBeamData:
     def test_symmetric_beam_stays_symmetric(self, monkeypatch):
         """A beam symmetric in RA<->Dec must produce weights symmetric under transpose.
 
-        Regression guard for both group-A defects at once: the missing Jacobian
-        breaks this symmetry by stretching one axis, and a transposed load
-        breaks it whenever the beam is not itself symmetric.
+        Guards two failure modes at once: dropping the cos(dec) cell Jacobian
+        stretches one axis relative to the other, and unpacking ``posmap()`` as
+        ``(ra, dec)`` instead of ``(dec, ra)`` reflects the beam about the
+        diagonal — visible here for any beam that is not itself symmetric.
         """
         ra, dec, pm = _make_gaussian_beam(n=21)
         npt.assert_allclose(pm, pm.T, atol=0)  # the input really is symmetric

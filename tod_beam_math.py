@@ -12,7 +12,14 @@ import numpy as np
 
 
 def compute_bell(
-    ra, dec, pixel_map, lmax=1024, power_cut=1.00, normalise=True, verbose=True
+    ra,
+    dec,
+    pixel_map,
+    lmax=1024,
+    power_cut=1.00,
+    normalise=True,
+    apply_jacobian=True,
+    verbose=True,
 ):
     """Compute the effective beam transfer function B_ell from a pixelised beam.
 
@@ -20,11 +27,13 @@ def compute_bell(
 
         B_ell = sum_i [ w_i * P_ell(cos θ_i) ]
 
-    where ``w_i`` are the normalised beam weights ``B_i cos(dec_i)`` — the
-    ``cos(dec)`` factor is the solid-angle Jacobian of the grid cell, without
-    which the sum evaluates ``int B / cos(dec) dOmega`` — ``θ_i`` is the angular
+    where ``w_i`` are the normalised beam weights, ``θ_i`` is the angular
     distance of pixel *i* from the beam centre, and ``P_ell`` are Legendre
     polynomials computed via the three-term recurrence (O(N) memory).
+
+    The weights must be a quadrature rule for ``int B dOmega``, so a
+    point-sampled beam map has to be multiplied by the ``cos(dec)`` cell
+    Jacobian first (see ``apply_jacobian``).
 
     The beam centre is taken to be the point with zero offset, i.e.
     ``ra_offset = 0, dec_offset = 0``, and the angular distance to each
@@ -39,12 +48,20 @@ def compute_bell(
             shape; flattened internally.
         dec (array-like): Dec offsets from beam centre [rad].  Same shape
             as ``ra``.
-        pixel_map (array-like): Beam power values (linear, **not** dB).
+        pixel_map (array-like): Beam amplitude values (linear, **not** dB).
             Same shape as ``ra`` and ``dec``.
         lmax (int): Maximum multipole ℓ (inclusive).
         power_cut (float): Fraction of total power for hard pixel selection.
             ``1.0`` selects all pixels (fast path, no sorting needed).
         normalise (bool): If ``True`` (default) normalise so that B_0 = 1.
+        apply_jacobian (bool): If ``True`` (default) fold the ``cos(dec)`` cell
+            Jacobian into ``pixel_map``, which is what a point-sampled beam map
+            needs. Pass ``False`` when ``pixel_map`` already holds finished
+            quadrature weights — e.g. ``beam_vals`` from
+            :func:`tod_pipeline_helpers.prepare_beam_data` or the output of
+            :func:`beam_cluster.cluster_beam_pixels` — otherwise the Jacobian is
+            applied twice and B_ell is tilted by the beam's second moment along
+            Dec.
         verbose (bool): Print selection and pixel-count diagnostics.
 
     Returns:
@@ -55,10 +72,9 @@ def compute_bell(
     pixel_map = np.asarray(pixel_map, dtype=np.float64)
     ra = np.asarray(ra, dtype=np.float64).ravel()
     dec = np.asarray(dec, dtype=np.float64).ravel()
-    # Weights are a quadrature rule for int B dOmega, so they carry the
-    # cos(dec) cell Jacobian; omitting it tilts B_ell by the beam's own
-    # second moment along Dec.
-    flat = pixel_map.ravel() * np.cos(dec)
+    flat = pixel_map.ravel()
+    if apply_jacobian:
+        flat = flat * np.cos(dec)
 
     # ── 1. Pixel selection ────────────────────────────────────────────────────
     if power_cut >= 1.0:

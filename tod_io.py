@@ -19,15 +19,21 @@ def load_beam(folder_beam, filename, center_x=None, center_y=None):
             Must end with a path separator.
         filename (str): Filename of the beam FITS file relative to
             ``folder_beam``.
-        center_x (int or None): Row index of the beam centre pixel in the
-            matrix. When ``None`` (default), ``H // 2`` is used.
-        center_y (int or None): Column index of the beam centre pixel in the
-            matrix. When ``None`` (default), ``W // 2`` is used.
+        center_x (int or None): Row index of the beam centre pixel, i.e. its
+            position along the **Dec** axis — note the name follows the matrix
+            row/column order, not enmap's ``{y, x}``. When ``None`` (default),
+            ``H // 2`` is used.
+        center_y (int or None): Column index of the beam centre pixel, i.e. its
+            position along the **RA** axis. When ``None`` (default), ``W // 2``
+            is used.
 
     Returns:
         tuple:
             - **ra** (*numpy.ndarray*) – RA offsets from beam centre [rad],
-              same shape as the beam map.
+              same shape as the beam map. Offsets follow the file's column
+              order, which may run either way (``CDELT1`` is negative for the
+              production beams); only the per-pixel pairing of ``(ra, dec,
+              pixel_map)`` matters downstream, never the array order.
             - **dec** (*numpy.ndarray*) – Dec offsets from beam centre [rad],
               same shape as the beam map.
             - **pixel_map** (*numpy.ndarray*) – Beam amplitude values (linear,

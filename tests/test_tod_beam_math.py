@@ -148,6 +148,73 @@ class TestComputeBell:
         ell_half = lmax // 2
         npt.assert_allclose(bell[:ell_half], gauss_ref[:ell_half], rtol=0.02)
 
+    # ── solid-angle Jacobian ──────────────────────────────────────────────────
+
+    def test_jacobian_weights_pixels_by_cell_area(self):
+        """Weights must be B cos(dec): a Dec-offset cell subtends less sky.
+
+        Two unit samples at different offsets, one purely in RA (full cell area)
+        and one purely in Dec (area shrunk by cos d), give a B_ell that is
+        analytic — so this pins the weighting itself, not just self-consistency.
+        """
+        d, e = 0.3, 0.1
+        ra = np.array([0.0, e])
+        dec = np.array([d, 0.0])
+        pixel_map = np.array([1.0, 1.0])
+        lmax = 6
+
+        _, bell = compute_bell(
+            ra, dec, pixel_map, lmax=lmax, power_cut=1.0, verbose=False
+        )
+
+        w = np.array([np.cos(d), 1.0])
+        w /= w.sum()
+        cos_theta = np.array([np.cos(d), np.cos(e)])
+        expected = np.array(
+            [
+                np.dot(w, np.polynomial.legendre.legval(cos_theta, [0] * l + [1]))
+                for l in range(lmax + 1)
+            ]
+        )
+        npt.assert_allclose(bell, np.abs(expected / expected[0]), rtol=1e-12)
+
+    def test_apply_jacobian_false_takes_weights_as_given(self):
+        """Pre-weighted input with apply_jacobian=False == raw input by default.
+
+        This is the contract the clustering calibration relies on: it passes
+        finished quadrature weights, which must not be multiplied by cos(dec)
+        a second time.
+        """
+        ra, dec, pixel_map = self._gaussian_grid(30.0)
+        _, bell_default = compute_bell(
+            ra, dec, pixel_map, lmax=200, power_cut=1.0, verbose=False
+        )
+        _, bell_preweighted = compute_bell(
+            ra,
+            dec,
+            pixel_map * np.cos(dec),
+            lmax=200,
+            power_cut=1.0,
+            apply_jacobian=False,
+            verbose=False,
+        )
+        npt.assert_allclose(bell_default, bell_preweighted, rtol=1e-12)
+
+    def test_double_jacobian_is_detectable(self):
+        """Applying cos(dec) twice must not pass as equal to applying it once.
+
+        Guards the guard: without this the two tests above would still pass if
+        the Jacobian were a numerical no-op on the test grid.
+        """
+        ra, dec, pixel_map = self._gaussian_grid(30.0, half_width_arcmin=180.0)
+        _, once = compute_bell(
+            ra, dec, pixel_map, lmax=200, power_cut=1.0, verbose=False
+        )
+        _, twice = compute_bell(
+            ra, dec, pixel_map * np.cos(dec), lmax=200, power_cut=1.0, verbose=False
+        )
+        assert not np.allclose(once, twice, rtol=1e-9, atol=0.0)
+
     # ── error / edge-case tests ───────────────────────────────────────────────
 
     def test_raises_on_no_pixels_selected(self):
