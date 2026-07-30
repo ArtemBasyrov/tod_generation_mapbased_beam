@@ -64,7 +64,7 @@ def compute_bell(
     else:
         dB_cut = _compute_dB_threshold_from_power(flat, power_cut)
         log_map = 10.0 * np.log10(np.abs(flat) + 1e-30)
-        sel = log_map > dB_cut
+        sel = log_map >= dB_cut
         if verbose:
             print(
                 f"  power_cut={power_cut}: "
@@ -121,32 +121,41 @@ def compute_bell(
 def _compute_dB_threshold_from_power(beam_vals, power_cut):
     """Compute the dB threshold that retains a given fraction of total beam power.
 
-    Finds the dB level such that the sum of all pixel amplitudes whose dB value
-    exceeds that level equals ``power_cut × total_power``. Used to select the
-    smallest set of beam pixels that accounts for the requested power fraction.
+    Returns the dB level of the faintest pixel that must be kept, so callers
+    select inclusively with ``10 log10(|val| + 1e-30) >= threshold``. Pixels are
+    ranked by ``|val|``: a lobe contributes its magnitude to the power budget
+    regardless of sign, so beams carrying negative sidelobes are handled.
 
     Args:
         beam_vals (numpy.ndarray): Beam pixel amplitude values (linear, not dB).
-            Can be any shape; flattened internally.
+            May be positive or negative. Any shape; flattened internally.
         power_cut (float): Fraction of total power to retain, e.g. ``0.99`` to
-            keep 99 % of the beam power.
+            keep 99 % of the beam power. ``>= 1.0`` retains every pixel.
 
     Returns:
-        float: dB threshold. Pixels whose ``10 log10(|val|)`` exceeds this
-            value collectively contribute ``≈ power_cut × total_power``.
+        float: dB threshold, or ``-inf`` when ``power_cut >= 1.0``. Pixels at or
+            above this level collectively contribute ``>= power_cut × total``.
     """
-    prof = np.asarray(beam_vals).flatten()
-    target_power = np.sum(prof) * power_cut
-    prof_dB = 10 * np.log10(prof)
+    # Retaining all the power means retaining every pixel, the faintest
+    # included; -inf makes the callers' inclusive test unconditionally true.
+    if power_cut >= 1.0:
+        return -np.inf
 
-    sort_idx = np.argsort(prof_dB)
-    sorted_dB = prof_dB[sort_idx]
-    sorted_prof = prof[sort_idx]
+    prof = np.abs(np.asarray(beam_vals, dtype=np.float64).ravel())
+    # Same epsilon as the callers' selection expression, so the comparison is
+    # exact at the boundary pixel instead of off by a rounding step.
+    prof_dB = 10.0 * np.log10(prof + 1e-30)
 
-    cumulative_sums = np.cumsum(sorted_prof[::-1])[::-1]
+    order = np.argsort(prof_dB)
+    sorted_dB = prof_dB[order]
+    # tail_power[i] = power carried by ranks i..N-1, i.e. every pixel at or
+    # above sorted_dB[i]. Non-increasing in i.
+    tail_power = np.cumsum(prof[order][::-1])[::-1]
 
-    # cumulative_sums is decreasing; flip to ascending for searchsorted.
-    rev_idx = np.searchsorted(cumulative_sums[::-1], target_power, side="left")
-    idx = max(0, len(cumulative_sums) - 1 - rev_idx)
+    target_power = prof.sum() * power_cut
+    # Faintest rank whose tail still covers the target. Negating makes the
+    # array ascending so searchsorted can locate it in one pass.
+    idx = int(np.searchsorted(-tail_power, -target_power, side="right")) - 1
+    idx = min(max(idx, 0), len(sorted_dB) - 1)
 
     return sorted_dB[idx]

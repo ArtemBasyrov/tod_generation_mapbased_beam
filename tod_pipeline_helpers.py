@@ -89,8 +89,13 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             center_y=config.beam_center_y,
         )
 
-        db_cut = _compute_dB_threshold_from_power(pixel_map, beam_threshold_map[bf])
-        sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) > db_cut
+        threshold = beam_threshold_map[bf]
+        if threshold >= 1.0:
+            # Every pixel contributes; skip the O(N log N) ranking entirely.
+            sel = np.ones(pixel_map.shape, dtype=bool)
+        else:
+            db_cut = _compute_dB_threshold_from_power(pixel_map, threshold)
+            sel = 10 * np.log10(np.abs(pixel_map) + 1e-30) >= db_cut
         beam_vals = pixel_map[sel].astype(config.precision_dtype)
         norm = beam_vals.sum()
         if norm != 0:

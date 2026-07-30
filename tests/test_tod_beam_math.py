@@ -201,32 +201,54 @@ class TestComputeDBThresholdFromPower:
         assert t_50 > t_99
 
     def test_threshold_consistent_with_selection(self):
-        """After applying the threshold, selected pixels cover approximately power_cut × total.
-
-        The source selects pixels with dB > threshold (strict), so the boundary
-        pixel is excluded. Including the boundary pixel (>=) always satisfies the
-        spec; the strict-> selection may be one pixel short.  We verify the >=
-        selection is correct, and also that the strict -> selection gives at most
-        one pixel's worth of shortfall.
-        """
+        """The inclusive (``>=``) selection covers at least power_cut × total."""
         rng = np.random.default_rng(13)
         beam_vals = rng.exponential(scale=1.0, size=200)
         power_cut = 0.85
         threshold = _compute_dB_threshold_from_power(beam_vals, power_cut=power_cut)
         log_map = 10.0 * np.log10(np.abs(beam_vals) + 1e-30)
 
-        # Inclusive selection (>= threshold) must satisfy the spec
-        sel_incl = log_map >= threshold
-        selected_power_incl = beam_vals[sel_incl].sum()
+        sel = log_map >= threshold
         total_power = beam_vals.sum()
-        assert selected_power_incl >= power_cut * total_power - 1e-9 * total_power
+        assert beam_vals[sel].sum() >= power_cut * total_power - 1e-9 * total_power
 
-        # Strict selection (> threshold, matching source) may exclude the boundary
-        # pixel; verify it accounts for most of the target power (within one pixel)
-        sel_strict = log_map > threshold
-        selected_power_strict = beam_vals[sel_strict].sum()
-        max_shortfall = beam_vals.max()  # at most one boundary pixel excluded
-        assert selected_power_strict >= power_cut * total_power - max_shortfall
+        # Minimality: dropping the faintest kept pixel must break the target,
+        # otherwise the threshold retained more pixels than necessary.
+        kept = np.sort(beam_vals[sel])
+        assert kept[1:].sum() < power_cut * total_power
+
+    def test_power_cut_one_retains_every_pixel(self):
+        """power_cut=1.0 must keep all pixels — including the faintest.
+
+        Regression: the threshold used to come back as the *minimum* dB level
+        and the callers selected strictly above it, silently dropping the
+        single lowest-amplitude beam pixel on every 100 %-power run.
+        """
+        rng = np.random.default_rng(3)
+        beam_vals = rng.exponential(scale=1.0, size=64)
+        threshold = _compute_dB_threshold_from_power(beam_vals, power_cut=1.0)
+        sel = 10.0 * np.log10(np.abs(beam_vals) + 1e-30) >= threshold
+        assert sel.all()
+        assert beam_vals[sel].sum() == pytest.approx(beam_vals.sum(), rel=1e-12)
+
+    def test_handles_negative_beam_values(self):
+        """A beam with negative sidelobes is ranked by magnitude, not by sign.
+
+        Selecting on signed values would sort every negative lobe below every
+        positive one and return NaN from log10 of a negative number.
+        """
+        beam_vals = np.array([1.0, -0.8, 0.05, -0.5, 0.02, 0.4])
+        threshold = _compute_dB_threshold_from_power(beam_vals, power_cut=0.9)
+        assert np.isfinite(threshold)
+
+        sel = 10.0 * np.log10(np.abs(beam_vals) + 1e-30) >= threshold
+        total = np.abs(beam_vals).sum()
+        assert np.abs(beam_vals[sel]).sum() >= 0.9 * total - 1e-12
+
+        # The two strongest lobes are of opposite sign; both must survive.
+        assert sel[0] and sel[1]
+        # The faintest pixel carries ~0.7 % of the power and must not.
+        assert not sel[4]
 
     def test_single_pixel_input(self):
         """A 1-element profile must return the dB value of that single pixel."""

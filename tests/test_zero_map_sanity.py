@@ -100,9 +100,11 @@ def test_zero_map_gives_bitexact_zero_tod(
 
     ra, dec, pm = _make_gaussian_beam(n=N)
     _install_fake_load_beam(monkeypatch, ra, dec, pm)
-    beam_files = ["I.fits" if 0 in active else None,
-                  "Q.fits" if 1 in active else None,
-                  "U.fits" if 2 in active else None]
+    beam_files = [
+        "I.fits" if 0 in active else None,
+        "Q.fits" if 1 in active else None,
+        "U.fits" if 2 in active else None,
+    ]
     _patch_config(monkeypatch, active, beam_files)
 
     beam_data = pph.prepare_beam_data(beam_files)
