@@ -102,11 +102,12 @@ def _gather_accum_fused_jit(
     Parallelised over the boresight dimension ``B``; each ``b`` owns
     ``tod[:, b]`` exclusively so there are no write races.
 
-    When Q/U are present the kernel amortises the spin-2 frame rotation
+    When Q/U are present the kernel amortises the spin-2 transport
     across repeated HEALPix neighbour pixels using a per-``b`` direct-mapped
-    cache (``_spin2_lookup_cached``): each pixel's ``cos(2δ), sin(2δ)`` is
+    cache (``_spin2_lookup_cached``): each pixel's rotation pair is
     computed at most once per boresight and reused on subsequent
-    occurrences.  Because the kernel is now called once per beam entry, the
+    occurrences.  The accumulation applies the conjugate of that pair,
+    giving the transport ``P → P e^{+2iδ}``; see :mod:`tod_spin2`.  Because the kernel is now called once per beam entry, the
     cache amortises across all ``4 * S`` bilinear stencils — not just one
     tile's worth, as in the pre-fusion pipeline.
 

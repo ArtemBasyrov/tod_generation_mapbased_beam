@@ -4,10 +4,20 @@ Spin-2 frame-rotation primitives for Q/U convolution kernels.
 Used by every interpolation path that touches Q/U; not specific to any one
 HEALPix interpolation method.
 
-_spin2_cos2d_sin2d_jit       — scalar cos(2δ), sin(2δ) for the spin-2 frame
-                               rotation between a HEALPix neighbour and the
-                               boresight, using spherical-trig + double-angle
-                               identities (no atan2).
+The transport phase is P → P e^{+2iδ}, with P = Q + iU in the HEALPix/COSMO
+convention and δ = α − γ built from *both* bearings of the geodesic joining the
+neighbour to the boresight (α at the neighbour looking toward the boresight,
+γ at the boresight looking back).  This is the unique phase that makes the
+convolution kernel a function of the angular separation alone — it is the
+inverse of the spin-weighted addition theorem's phase, and it is what puts the
+`-4` in `healpy.gauss_beam(..., pol=True)`.  A rule built on one bearing is not
+a transport.
+
+_spin2_cos2d_sin2d_jit       — the conjugate pair e^{2i(γ-α)} for the spin-2
+                               frame rotation between a HEALPix neighbour and
+                               the boresight, using spherical-trig +
+                               double-angle identities (no atan2).  Callers
+                               apply its conjugate; see the function docstring.
 _spin2_lookup_cached         — per-boresight direct-mapped cache wrapper that
                                amortises repeated calls to
                                _spin2_cos2d_sin2d_jit on the same neighbour
@@ -37,15 +47,24 @@ _SPIN2_CACHE_MASK = _SPIN2_CACHE_SIZE - 1
 
 @numba.jit(nopython=True, cache=True)
 def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
-    """Compute cos(2δ) and sin(2δ) for the spin-2 frame rotation.
+    """Compute the spin-2 frame-rotation pair for a HEALPix pixel → boresight.
 
     δ = alpha - gamma, where alpha is the bearing from the HEALPix pixel toward
     the boresight and gamma is the bearing from the boresight back toward the
-    pixel, both measured from their respective local meridians.
+    pixel, both measured east of north from their respective local meridians.
+
+    **The returned pair is e^{2i(gamma - alpha)}, i.e. (cos 2δ, -sin 2δ).** The
+    conjugation is deliberate: callers accumulate
+
+        Q' = Q·cos_2d + U·sin_2d,   U' = -Q·sin_2d + U·cos_2d,
+
+    which is P → P·conj(cos_2d + i·sin_2d) = P e^{+2iδ}, the transport phase.
+    Do not "fix" the sign here without flipping the accumulation with it — the
+    two are matched, and breaking the pair costs O(1) in polar Q/U.
 
     Uses the spherical triangle bearing formulas; avoids atan2 and beta by working
     directly with (cos α, sin α) and (cos γ, sin γ) and applying the
-    double-angle identities to find tan(δ) = N / D, then reconstructing cos(2δ) and sin(2δ) via the
+    double-angle identities to find tan(δ) = N / D, then reconstructing the pair via the
     double-angle formulas in terms of tan(δ) to avoid any loss of precision when
     δ is small.
 
@@ -56,7 +75,8 @@ def _spin2_cos2d_sin2d_jit(z_pix, sth_pix, phi_pix, z_pts, sth_pts, phi_pts):
 
     Returns
     -------
-    cos_2d, sin_2d : float
+    cos_2d, sin_2d : float   the pair e^{2i(gamma - alpha)}; callers apply its
+        conjugate to obtain the transport P → P e^{+2iδ}.
     """
     # same point check (also covers the sin_beta ≈ 0 case)
     if phi_pts == phi_pix and sth_pts == sth_pix and z_pts == z_pix:
@@ -110,10 +130,11 @@ def _spin2_lookup_cached(
 
     Cache slot is selected by Knuth's multiplicative hash so consecutive RING
     pixel indices on the same ring don't collide.  A slot whose stored pixel
-    index equals ``p`` is a hit (returns the cached ``(cos 2δ, sin 2δ)``); any
-    other value — including the initial sentinel ``-1`` — is a miss, in which
-    case the spin-2 rotation is computed via :func:`_spin2_cos2d_sin2d_jit`
-    and written into the slot, evicting any previous occupant.
+    index equals ``p`` is a hit (returns the cached pair); any other value —
+    including the initial sentinel ``-1`` — is a miss, in which case the spin-2
+    rotation is computed via :func:`_spin2_cos2d_sin2d_jit` and written into
+    the slot, evicting any previous occupant.  The pair is passed through
+    unchanged, so it carries that function's conjugate convention.
 
     The cache is boresight-scoped: its contents are valid only for the
     ``(z_pts, sth_pts, phi_pts)`` passed in.  Callers must reset the cache
@@ -131,7 +152,9 @@ def _spin2_lookup_cached(
 
     Returns
     -------
-    c2d, s2d : float64  cos(2δ), sin(2δ) for the pixel → boresight transport.
+    c2d, s2d : float64  the pair e^{2i(gamma - alpha)} for the pixel →
+        boresight transport, in the conjugate convention of
+        :func:`_spin2_cos2d_sin2d_jit`.
     """
     slot = (p * _SPIN2_CACHE_HASH) & cmask
     if cache_pix[slot] == p:
@@ -148,7 +171,10 @@ def compute_spin2_skip_z_threshold(beam_radius_rad, tol, n_az=128, n_theta=2048)
     """Largest |cos θ_pts| for which the spin-2 Q/U correction can be skipped.
 
     The spin-2 correction angle |2δ| between a sky pixel and the boresight
-    grows as the boresight approaches the poles.  Near the equator |2δ| is
+    grows as the boresight approaches the poles, following
+    ⟨δ²⟩^½ = r_rms · cot θ_pts / √2 with r_rms² the beam's second radial
+    moment — the same 1/sin θ enhancement behind every polar polarisation
+    pathology in this pipeline.  Near the equator |2δ| is
     negligible and skipping the rotation introduces an error
     ≈ |2δ| · max(|Q|, |U|).  This helper sweeps boresight colatitudes
     θ_pts ∈ (0, π/2] and finds the largest |z| = |cos θ_pts| at which the

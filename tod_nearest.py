@@ -2,8 +2,7 @@
 Nearest-pixel interpolation kernel for TOD generation.
 
 _gather_accum_nearest_jit — fully fused Rodrigues + HEALPix nearest-pixel
-                            lookup + spin-2 Q/U frame correction +
-                            accumulation.
+                            lookup + spin-2 Q/U transport + accumulation.
 """
 
 import math

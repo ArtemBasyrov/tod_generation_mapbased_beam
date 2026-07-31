@@ -85,7 +85,7 @@ def beam_tod_batch(
         interp_mode (str): Sky-map interpolation strategy. One of:
 
             * ``'bilinear'`` *(default)* — 4-pixel bilinear HEALPix
-              interpolation with spin-2 Q/U frame correction.
+              interpolation with spin-2 Q/U transport.
             * ``'nearest'`` — single nearest-pixel lookup; fastest, no pixel
               mixing.
             (``'gaussian'`` and ``'bicubic'`` are available on their respective branches.)
