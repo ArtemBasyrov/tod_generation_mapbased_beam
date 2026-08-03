@@ -134,6 +134,102 @@ def _to_unit(vec: np.ndarray) -> np.ndarray:
     return v / np.where(norms > 0, norms, 1.0)
 
 
+def _chart(vec: np.ndarray) -> tuple:
+    """Beam-frame (RA, Dec) offsets [rad] of unit vectors, the inverse of the
+    ``vec_orig`` construction in ``prepare_beam_data``."""
+    v = np.asarray(vec, dtype=np.float64)
+    return np.arctan2(v[:, 1], v[:, 0]), np.arcsin(np.clip(v[:, 2], -1.0, 1.0))
+
+
+def _whitener(vec: np.ndarray, bvals: np.ndarray) -> np.ndarray | None:
+    """
+    Map that makes the beam's own second moment isotropic.
+
+    The clustering error is exactly a beam second-moment deficit,
+    ``Delta M = -Sigma_bar``.  A deficit *proportional* to the beam's own
+    second moment M is a uniform narrowing: it moves b_ell but leaves the
+    ellipticity untouched, so it adds no asymmetry the beam did not already
+    have.  Any other deficit changes the beam's shape, and for a symmetric
+    beam manufactures a quadrupole out of nothing.
+
+    In ``u = W x`` with ``W = sqrt(mean eig) M^-1/2`` the beam is circular, so
+    the isotropic distortion k-means minimises is the right functional there.
+    Mapping back, ``Sigma_x = W^-1 Sigma_u W^-T = sigma^2 M`` — proportional by
+    construction.  The ``sqrt(mean eig)`` prefactor keeps the angular scale of
+    the footprint, which matters only because the assignment runs on the sphere.
+
+    Args:
+        vec: (S, 3) beam-pixel unit vectors.
+        bvals: (S,) beam weights.
+
+    Returns:
+        (2, 2) float64 whitening matrix, or ``None`` when the beam's second
+        moment is degenerate and the frame is undefined.
+    """
+    x, y = _chart(vec)
+    w = np.asarray(bvals, dtype=np.float64)
+    tot = w.sum()
+    if tot <= 0:
+        return None
+    M = (
+        np.array(
+            [
+                [(w * x * x).sum(), (w * x * y).sum()],
+                [(w * x * y).sum(), (w * y * y).sum()],
+            ]
+        )
+        / tot
+    )
+    ev, evec = np.linalg.eigh(M)
+    if ev.min() <= 0 or not np.all(np.isfinite(ev)):
+        return None
+    return np.sqrt(ev.mean()) * (evec @ np.diag(ev**-0.5) @ evec.T)
+
+
+def _apply_whitener(vec: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """Unit vectors whose chart offsets are ``W`` applied to those of ``vec``."""
+    x, y = _chart(vec)
+    p = np.stack([x, y], axis=1) @ W.T
+    th = np.pi / 2.0 - p[:, 1]
+    return np.stack(
+        [np.sin(th) * np.cos(p[:, 0]), np.sin(th) * np.sin(p[:, 0]), np.cos(th)],
+        axis=-1,
+    )
+
+
+def _centroids_from_labels(
+    vec: np.ndarray, bvals: np.ndarray, labels: np.ndarray, K: int
+) -> tuple:
+    """
+    Weighted-mean centroids of a partition, re-projected to the unit sphere.
+
+    Taking the centroid from the labels rather than from the k-means state
+    keeps the exact identity the error model rests on: the centroid *is* the
+    weighted mean of its own members, so the clustered measure carries the
+    grid's dipole unchanged and its whole leading error is the within-cluster
+    covariance.  With a whitened assignment it is also the only correct
+    source, since the k-means centroids live in the whitened frame.
+
+    Returns:
+        tuple: ``(centroids (K, 3) float64, weights (K,) float64)``.  Empty
+        clusters are parked on the beam centroid and carry zero weight.
+    """
+    w = np.asarray(bvals, dtype=np.float64)
+    v = np.asarray(vec, dtype=np.float64)
+    weights = np.bincount(labels, weights=w, minlength=K)
+    mom = np.column_stack(
+        [np.bincount(labels, weights=w * v[:, i], minlength=K) for i in range(3)]
+    )
+    norms = np.linalg.norm(mom, axis=1, keepdims=True)
+    dead = norms[:, 0] <= 0.0
+    centroids = mom / np.where(norms > 0, norms, 1.0)
+    if dead.any():
+        centre = (w[:, None] * v).sum(axis=0)
+        n = np.linalg.norm(centre)
+        centroids[dead] = centre / n if n > 0 else np.array([1.0, 0.0, 0.0])
+    return centroids, weights
+
+
 def _kmeans_sphere(
     vec: np.ndarray,
     bvals: np.ndarray,
@@ -251,6 +347,7 @@ def cluster_beam_pixels(
     tol: float = 1e-5,
     random_state: int = 42,
     verbose: bool = True,
+    whiten: bool = True,
 ) -> tuple:
     """
     Cluster beam pixels into representative centroids using weighted spherical
@@ -298,6 +395,14 @@ def cluster_beam_pixels(
     tol           : float           convergence threshold [rad]
     random_state  : int
     verbose       : bool            print progress messages; default ``True``
+    whiten        : bool            group pixels in the frame where the beam's
+                                    second moment is isotropic (see
+                                    ``_whitener``), so the clustering narrows
+                                    the beam without reshaping it.  Default
+                                    ``True``\, ``False`` reproduces a plain
+                                    spherical k-means, which manufactures a
+                                    grid-aligned ellipticity even from a
+                                    perfectly symmetric beam
 
     Returns
     -------
@@ -324,12 +429,13 @@ def cluster_beam_pixels(
         bvals = beam_vals.astype(np.float64)
         rng = np.random.default_rng(random_state)
 
-        centroids, labels = _kmeans_sphere(
-            vec, bvals, K, max_iter, tol, rng, verbose=verbose
-        )
+        W = _whitener(vec, bvals) if whiten else None
+        vec_assign = _apply_whitener(vec, W) if W is not None else vec
 
-        cluster_weights = np.zeros(K, dtype=np.float64)
-        np.add.at(cluster_weights, labels, bvals)
+        _, labels = _kmeans_sphere(
+            vec_assign, bvals, K, max_iter, tol, rng, verbose=verbose
+        )
+        centroids, cluster_weights = _centroids_from_labels(vec, bvals, labels, K)
         cluster_weights /= cluster_weights.sum()
 
         if verbose:
@@ -390,8 +496,17 @@ def cluster_beam_pixels(
         bv_t = beam_vals[tail_idx].astype(np.float64)
         rng = np.random.default_rng(random_state)
 
-        centroids_t, tail_labels = _kmeans_sphere(
-            vec_t,
+        # The whitening frame is set by the whole beam, not by the tail: it is
+        # the beam's own second moment that the clustering must not reshape.
+        W = (
+            _whitener(_to_unit(vec_orig), beam_vals.astype(np.float64))
+            if whiten
+            else None
+        )
+        vec_assign = _apply_whitener(vec_t, W) if W is not None else vec_t
+
+        _, tail_labels = _kmeans_sphere(
+            vec_assign,
             bv_t,
             K_tail,
             max_iter,
@@ -400,11 +515,9 @@ def cluster_beam_pixels(
             label=" tail",
             verbose=verbose,
         )
-
-        # Weighted cluster weights for tail
-        cw_t = np.zeros(K_tail, dtype=np.float64)
-        np.add.at(cw_t, tail_labels, bv_t)
-        # (No re-normalisation here — combined with main below)
+        # Centroids come from the labels in the ORIGINAL frame; the k-means
+        # ones are whitened.  (No re-normalisation here — combined with main.)
+        centroids_t, cw_t = _centroids_from_labels(vec_t, bv_t, tail_labels, K_tail)
 
         # Left in float64: both are combined with the main lobe and
         # renormalised below, and only then cast to the caller's dtype.

@@ -40,7 +40,75 @@ from beam_cluster import (
     cluster_beam_pixels,
     _build_weight_matrix,
     cluster_cached_arrays,
+    _chart,
+    _whitener,
+    _apply_whitener,
+    _centroids_from_labels,
 )
+
+
+# ===========================================================================
+# Helpers for the shape-preservation tests
+# ===========================================================================
+
+_ARCMIN = np.pi / 180.0 / 60.0
+
+
+def _gaussian_beam(sigma_x, sigma_y, half=60, step=1.0, tilt=0.0, jacobian=True):
+    """Gaussian beam point-sampled on a square arcmin grid, pipeline layout.
+
+    Returns ``(vec, bvals, X, Y)`` with ``vec`` the (S, 3) unit vectors
+    ``prepare_beam_data`` builds and ``bvals`` the ``B cos(dec)`` quadrature
+    weights normalised to 1.
+
+    ``jacobian=False`` drops the ``cos(dec)`` factor.  That factor is what the
+    pipeline uses, but it breaks the x/y symmetry of a circular Gaussian, so a
+    test that needs an *exactly* isotropic second moment must omit it.
+    """
+    g = np.arange(-half, half + 1, step) * _ARCMIN
+    X, Y = np.meshgrid(g, g, indexing="xy")
+    X, Y = X.ravel(), Y.ravel()
+    c, s = np.cos(tilt), np.sin(tilt)
+    u, v = c * X + s * Y, -s * X + c * Y
+    amp = np.exp(-0.5 * ((u / sigma_x) ** 2 + (v / sigma_y) ** 2))
+    bv = amp * np.cos(Y) if jacobian else amp
+    bv = bv / bv.sum()
+    th = np.pi / 2.0 - Y
+    vec = np.stack(
+        [np.sin(th) * np.cos(X), np.sin(th) * np.sin(X), np.cos(th)], axis=-1
+    )
+    return vec.astype(np.float32), bv.astype(np.float32), X, Y
+
+
+def _second_moment(X, Y, w):
+    return np.array(
+        [
+            [(w * X * X).sum(), (w * X * Y).sum()],
+            [(w * X * Y).sum(), (w * Y * Y).sum()],
+        ]
+    )
+
+
+def _sigma_bar(X, Y, w, labels, K_out):
+    """Power-weighted within-cluster covariance of a partition."""
+    Wc = np.bincount(labels, weights=w, minlength=K_out)
+    Ws = np.where(np.abs(Wc) > 0, Wc, 1.0)
+    cx = np.bincount(labels, weights=w * X, minlength=K_out) / Ws
+    cy = np.bincount(labels, weights=w * Y, minlength=K_out) / Ws
+    return _second_moment(X - cx[labels], Y - cy[labels], w)
+
+
+def _added_ellipticity(X, Y, w, labels, K_out):
+    """Part of the second-moment deficit that is NOT a uniform rescaling.
+
+    A deficit proportional to the beam's own M narrows the beam without
+    reshaping it; only the residual adds ellipticity the beam did not have.
+    """
+    M = _second_moment(X, Y, w)
+    S = _sigma_bar(X, Y, w, labels, K_out)
+    resid = S - (np.trace(S) / np.trace(M)) * M
+    ev = np.linalg.eigvalsh(resid)
+    return float(abs(ev[1] - ev[0]))
 
 
 # ===========================================================================
@@ -683,6 +751,189 @@ class TestClusterCachedArrays:
         cache = _make_cache(N_psi, S, rng)
         result = cluster_cached_arrays(cache, labels, bv, K)
         assert result["vec_rolled"].shape == (N_psi, K, 3)
+
+
+# ===========================================================================
+# Whitened assignment — shape preservation
+# ===========================================================================
+
+
+class TestChartAndWhitener:
+    def test_chart_inverts_the_vector_construction(self):
+        vec, bv, X, Y = _gaussian_beam(8 * _ARCMIN, 8 * _ARCMIN, half=10)
+        x, y = _chart(np.asarray(vec, dtype=np.float64))
+        assert np.allclose(x, X, atol=1e-12)
+        assert np.allclose(y, Y, atol=1e-12)
+
+    def test_whitener_is_a_scalar_multiple_of_identity_for_symmetric_beam(self):
+        vec, bv, X, Y = _gaussian_beam(8 * _ARCMIN, 8 * _ARCMIN, half=30)
+        W = _whitener(np.asarray(vec, dtype=np.float64), np.asarray(bv, np.float64))
+        assert W is not None
+        assert abs(W[0, 1]) < 1e-6 and abs(W[1, 0]) < 1e-6
+        assert W[0, 0] == pytest.approx(W[1, 1], rel=1e-3)
+        assert W[0, 0] == pytest.approx(1.0, rel=1e-3)
+
+    def test_whitener_isotropises_an_elliptical_beam(self):
+        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=40)
+        w64 = np.asarray(bv, dtype=np.float64)
+        W = _whitener(np.asarray(vec, dtype=np.float64), w64)
+        P = np.stack([X, Y], axis=1) @ W.T
+        Mw = _second_moment(P[:, 0], P[:, 1], w64 / w64.sum())
+        ev = np.linalg.eigvalsh(Mw)
+        assert (ev[1] - ev[0]) / ev.sum() < 1e-6  # isotropic in the new frame
+
+    def test_whitener_returns_none_on_degenerate_input(self):
+        vec = np.tile(np.array([[1.0, 0.0, 0.0]]), (5, 1))
+        assert _whitener(vec, np.ones(5)) is None
+        assert _whitener(vec, np.zeros(5)) is None
+
+    def test_apply_whitener_maps_chart_coords_linearly(self):
+        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=8)
+        W = _whitener(np.asarray(vec, dtype=np.float64), np.asarray(bv, np.float64))
+        x, y = _chart(_apply_whitener(np.asarray(vec, dtype=np.float64), W))
+        want = np.stack([X, Y], axis=1) @ W.T
+        assert np.allclose(x, want[:, 0], atol=1e-12)
+        assert np.allclose(y, want[:, 1], atol=1e-12)
+
+
+class TestCentroidsFromLabels:
+    def test_centroid_is_the_normalised_weighted_mean(self):
+        rng = np.random.default_rng(3)
+        vec, bv = _make_beam(S=120, rng=rng)
+        labels = rng.integers(0, 6, 120)
+        cen, wts = _centroids_from_labels(vec, bv, labels, 6)
+        assert np.allclose(np.linalg.norm(cen, axis=1), 1.0)
+        for k in range(6):
+            m = labels == k
+            want = (bv[m, None] * vec[m]).sum(axis=0)
+            want = want / np.linalg.norm(want)
+            assert np.allclose(cen[k], want, atol=1e-6)
+            assert wts[k] == pytest.approx(bv[m].sum(), rel=1e-6)
+
+    def test_empty_clusters_carry_zero_weight_and_a_finite_centroid(self):
+        vec, bv = _make_beam(S=40)
+        labels = np.zeros(40, dtype=np.int64)
+        cen, wts = _centroids_from_labels(vec, bv, labels, 3)
+        assert wts[1] == 0.0 and wts[2] == 0.0
+        assert np.all(np.isfinite(cen))
+        assert np.allclose(np.linalg.norm(cen, axis=1), 1.0)
+
+    def test_partition_dipole_is_preserved(self):
+        vec, bv = _make_beam(S=300)
+        rng = np.random.default_rng(11)
+        labels = rng.integers(0, 20, 300)
+        cen, wts = _centroids_from_labels(vec, bv, labels, 20)
+        got = (wts[:, None] * cen).sum(axis=0)
+        want = (np.asarray(bv, np.float64)[:, None] * np.asarray(vec, np.float64)).sum(
+            axis=0
+        )
+        # centroids are re-projected to the sphere, so agreement is to the
+        # third order in the cluster size, not exact
+        assert np.allclose(
+            got / np.linalg.norm(got), want / np.linalg.norm(want), atol=1e-4
+        )
+
+
+class TestWhiteningPreservesBeamShape:
+    """The clustering must narrow the beam without reshaping it."""
+
+    def test_whitening_is_exactly_inert_on_an_isotropic_beam(self):
+        """An isotropic M gives W = sqrt(mean eig) M^-1/2 = I, so the
+        assignment geometry is untouched and the partition must come out
+        *identical* — not merely similar.
+
+        This is the boundary of what whitening can do: it re-aims the
+        second-moment deficit onto the beam's own axes, so a beam with no
+        axes gets nothing.  The residual ellipticity of a truly symmetric
+        beam is grid-induced and needs a different fix.
+        """
+        vec, bv, _, _ = _gaussian_beam(
+            9 * _ARCMIN, 9 * _ARCMIN, half=45, jacobian=False
+        )
+        W = _whitener(np.asarray(vec, np.float64), np.asarray(bv, np.float64))
+        assert np.allclose(W, np.eye(2), atol=1e-10)
+
+        kw = dict(n_clusters=300, tail_fraction=0.05, verbose=False)
+        _, _, lab_plain = cluster_beam_pixels(vec, bv, whiten=False, **kw)
+        _, _, lab_white = cluster_beam_pixels(vec, bv, whiten=True, **kw)
+        assert np.array_equal(lab_plain, lab_white)
+
+    def test_pipeline_jacobian_makes_a_circular_gaussian_slightly_elliptical(self):
+        """The ``cos(dec)`` quadrature factor is not azimuthally symmetric, so
+        the beam the pipeline actually clusters is never exactly isotropic —
+        which is why the whitener is not exactly the identity in production
+        even for a nominally circular beam."""
+        _, bv_j, X, Y = _gaussian_beam(9 * _ARCMIN, 9 * _ARCMIN, half=45)
+        _, bv_n, _, _ = _gaussian_beam(
+            9 * _ARCMIN, 9 * _ARCMIN, half=45, jacobian=False
+        )
+
+        def traceless_fraction(w):
+            ev = np.linalg.eigvalsh(_second_moment(X, Y, np.asarray(w, np.float64)))
+            return (ev[1] - ev[0]) / ev.sum()
+
+        assert traceless_fraction(bv_n) < 1e-12
+        assert traceless_fraction(bv_j) > 1e-6
+
+    def test_elliptical_beam_keeps_only_its_own_asymmetry(self):
+        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=45)
+        w64 = np.asarray(bv, dtype=np.float64)
+        out = {}
+        for wh in (False, True):
+            _, bo, lab = cluster_beam_pixels(
+                vec,
+                bv,
+                n_clusters=300,
+                tail_fraction=0.05,
+                verbose=False,
+                whiten=wh,
+            )
+            out[wh] = _added_ellipticity(X, Y, w64, lab, len(bo))
+        assert out[True] < out[False]
+
+    def test_whitened_deficit_aligns_with_the_beam_axis(self):
+        """Sigma_bar should end up proportional to M, hence sharing its axis."""
+        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=45, tilt=0.4)
+        w64 = np.asarray(bv, dtype=np.float64)
+        _, bo, lab = cluster_beam_pixels(
+            vec, bv, n_clusters=300, tail_fraction=0.05, verbose=False, whiten=True
+        )
+
+        def axis(S):
+            _, e = np.linalg.eigh(S)
+            return (np.degrees(np.arctan2(e[1, 1], e[0, 1])) + 90.0) % 180.0 - 90.0
+
+        beam_axis = axis(_second_moment(X, Y, w64))
+        sig_axis = axis(_sigma_bar(X, Y, w64, lab, len(bo)))
+        sep = abs((sig_axis - beam_axis + 90.0) % 180.0 - 90.0)
+        assert sep < 20.0
+
+    def test_whiten_flag_changes_the_partition(self):
+        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=30)
+        _, _, lab_a = cluster_beam_pixels(
+            vec, bv, n_clusters=200, tail_fraction=0.05, verbose=False, whiten=False
+        )
+        _, _, lab_b = cluster_beam_pixels(
+            vec, bv, n_clusters=200, tail_fraction=0.05, verbose=False, whiten=True
+        )
+        assert not np.array_equal(lab_a, lab_b)
+
+    @pytest.mark.parametrize("whiten", [False, True])
+    @pytest.mark.parametrize("tail_fraction", [None, 0.05])
+    def test_mass_and_dtype_are_preserved_either_way(self, whiten, tail_fraction):
+        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=30)
+        for dt in (np.float32, np.float64):
+            vo, bo, lab = cluster_beam_pixels(
+                vec.astype(dt),
+                bv.astype(dt),
+                n_clusters=200,
+                tail_fraction=tail_fraction,
+                verbose=False,
+                whiten=whiten,
+            )
+            assert vo.dtype == dt and bo.dtype == dt
+            assert bo.astype(np.float64).sum() == pytest.approx(1.0, rel=1e-6)
+            assert lab.max() < len(bo)
 
 
 # ---------------------------------------------------------------------------
