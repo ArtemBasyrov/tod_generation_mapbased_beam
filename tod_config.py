@@ -142,6 +142,17 @@ clustering_error_threshold = _cfg.get("clustering_error_threshold", 1e-3)
 # only the least-ellipticity configuration; larger values trade ellipticity
 # for speed; None ignores the term and reports it.
 clustering_ellipticity_tolerance = _cfg.get("clustering_ellipticity_tolerance", 1.0)
+if clustering_ellipticity_tolerance is not None:
+    clustering_ellipticity_tolerance = float(clustering_ellipticity_tolerance)
+    if clustering_ellipticity_tolerance < 1.0:
+        raise ValueError(
+            "clustering_ellipticity_tolerance is a factor over the least added "
+            "ellipticity the (tail_fraction, n_clusters) sweep can reach for "
+            "this beam, so a value below 1.0 rejects every candidate including "
+            f"the best one. Got {clustering_ellipticity_tolerance!r}; use 1.0 to "
+            "keep only the least-ellipticity configuration, or null to report "
+            "the term without gating on it."
+        )
 
 # Half-wave plate (HWP) modulation.
 # When hwp_enabled is True, the TOD generator rotates the per-sample (Q, U)

@@ -56,9 +56,9 @@
   #
   # Quickstart:
   #   1. Set clustering_calibration_enabled: true and run once.
-  #      The calibration sweeps a (tail_fraction × n_clusters) grid, selects
-  #      the pair that maximises speedup while keeping B_ell divergence below
-  #      clustering_error_threshold, saves the result, and resets the flag.
+  #      The calibration sweeps a (tail_fraction × n_clusters) grid and picks
+  #      the fastest pair that stays inside BOTH error bounds below, saves the
+  #      result, and resets the flag.
   #   2. On all subsequent runs the saved values are used directly.
   #
   # Manual override: set clustering_calibration_enabled: false and fill in
@@ -67,11 +67,30 @@
   n_beam_clusters: null               # int → enable; null → no clustering
   beam_cluster_tail_fraction: null    # fraction of beam power treated as tail
   clustering_calibration_enabled: false
-  # Maximum tolerated relative RMS divergence in the beam transfer function
-  # B_ell between the clustered and reference (unclustered) beam.  The
-  # calibration picks the fastest (tail_fraction, n_clusters) pair whose
-  # B_ell divergence does not exceed this value.
+  # --- error bounds: the two harmonics behave differently ------------------
+  # Clustering's whole leading error is a deficit in the beam's second moment.
+  # The part proportional to the beam's own second moment narrows the beam
+  # without reshaping it; the rest is ellipticity added to the beam, which is
+  # what sources T→P leakage.  The two bounds below constrain one each, and
+  # neither implies the other.
+  #
+  # m = 0 (width).  Maximum tolerated relative RMS divergence of the beam
+  # transfer function B_ell between the clustered and unclustered beam.
+  # B_ell depends on each beam node only through its distance from the beam
+  # centre, so it is the m = 0 harmonic alone and is blind to any reshaping.
   clustering_error_threshold: 1.0e-5
+  # m = ±2 (shape).  Bound on the ellipticity the clustering ADDS, given as a
+  # factor over the least any point in the sweep achieves for this beam — not
+  # as an absolute number, because what is achievable depends on the beam, the
+  # grid spacing and the cluster budget together and cannot be known before
+  # running.  Must be ≥ 1.0: no configuration can beat the sweep's own floor.
+  #   1.0  keep only the least-ellipticity configuration (default)
+  #   2.0  accept up to twice that, in exchange for speed
+  #   null report the number without gating on it
+  # The calibration table also prints the added ellipticity as a fraction of
+  # the beam's own quadrupole, which is the number to weigh against a leakage
+  # budget.
+  clustering_ellipticity_tolerance: 1.0
   # Working precision for the float32-side of the pipeline (sky map, pointings,
   # beam values, Rodrigues rotation, saved TOD). Float64 surfaces (bilinear
   # weights, spin-2 cache, accumulators, B_ell) are unchanged either way.
