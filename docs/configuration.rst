@@ -241,19 +241,27 @@ proportional reduction in computation.
 
 1. Set ``clustering_calibration_enabled: true`` and run the pipeline once.
    The calibration sweeps a ``(tail_fraction × n_clusters)`` grid.  For
-   each pair it clusters the beam pixels and computes the beam transfer
-   function B_ℓ from the clustered geometry, comparing it against the
-   reference B_ℓ of the unclustered beam.  The pair that maximises the
-   pixel-count speedup while keeping B_ℓ divergence below
-   ``clustering_error_threshold`` is written back to the config.
+   each pair it clusters the beam pixels and measures two errors: the
+   divergence of the beam transfer function B_ℓ against the unclustered
+   reference, and the ellipticity the clustering adds to the beam.  The
+   pair that maximises the pixel-count speedup subject to both bounds is
+   written back to the config.
 2. On all subsequent runs the saved values are used directly and clustering
    calibration is skipped (``clustering_calibration_enabled`` is reset to
    ``false`` automatically).
 
-No scan data or TOD generation is needed during calibration — the metric
-is computed purely from beam geometry.  See :doc:`beam_cluster_calibration`
-for a detailed description of the B_ℓ divergence metric and guidance on
-choosing the threshold.
+No scan data or TOD generation is needed during calibration — both metrics
+are computed purely from beam geometry.  See :doc:`beam_cluster_calibration`
+for the metric definitions and guidance on choosing the bounds.
+
+.. warning::
+
+   The two bounds constrain different harmonics and neither implies the
+   other.  B_ℓ depends on each beam node only through its distance from the
+   beam centre, so it is the :math:`m = 0` harmonic — it bounds the beam
+   *width* and is blind to any reshaping.  ``clustering_ellipticity_tolerance``
+   bounds the :math:`m = \pm 2` term, which is the one that sources T→P
+   leakage.
 
 **Manual override:** set ``clustering_calibration_enabled: false`` and
 fill in ``n_beam_clusters`` and ``beam_cluster_tail_fraction`` by hand.
@@ -287,11 +295,20 @@ fill in ``n_beam_clusters`` and ``beam_cluster_tail_fraction`` by hand.
    * - ``clustering_error_threshold``
      - ``float``
      - ``1.0e-5``
-     - Maximum tolerated relative RMS B_ℓ divergence between the clustered
-       and reference beam transfer function.  The calibration selects the
-       pair that maximises speedup subject to this constraint.  See
-       :doc:`beam_cluster_calibration` for metric definition and
-       tier-based recommendations.
+     - **m = 0 bound.**  Maximum tolerated relative RMS B_ℓ divergence
+       between the clustered and reference beam transfer function.  Bounds
+       the beam width.  See :doc:`beam_cluster_calibration` for metric
+       definition and tier-based recommendations.
+   * - ``clustering_ellipticity_tolerance``
+     - ``float | null``
+     - ``1.0``
+     - **m = ±2 bound.**  Maximum tolerated ellipticity *added* to the beam,
+       as a factor over the least the sweep achieves for this beam.  Relative
+       rather than absolute because what is achievable depends on the beam,
+       the beam-grid spacing and the cluster budget together.  ``1.0`` keeps
+       only the least-ellipticity configuration; larger values trade shape
+       for speed; ``null`` reports without gating.  Values below ``1.0``
+       raise at config load — they would reject every candidate.
 
 Full Example
 ------------

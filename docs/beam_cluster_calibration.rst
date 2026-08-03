@@ -2,8 +2,8 @@ Beam Pixel Clustering & Calibration
 =====================================
 
 This page explains how the beam pixel clustering calibration works, defines
-the B_ℓ divergence quality metric, and gives guidance on choosing
-``clustering_error_threshold``.
+the two quality metrics it enforces, and gives guidance on choosing
+``clustering_error_threshold`` and ``clustering_ellipticity_tolerance``.
 
 Overview
 --------
@@ -14,12 +14,48 @@ clustered (controlled by ``beam_cluster_tail_fraction``); the bright main-lobe
 pixels are kept pixel-exact.  The gain is a proportional speed-up in the
 innermost Numba gather loops with a small, controllable accuracy loss.
 
+Pixels are grouped in the frame where the beam's own second moment is
+isotropic, so that the clustering narrows the beam without reshaping it.  See
+:ref:`clustering_error_structure` for why that matters and
+:ref:`whitened_assignment` for what it does.
+
 .. note::
 
    Clustering is applied **only** to the TOD-generation path.  The beam
    transfer function B_ℓ must always be computed from the full, unclustered
    beam pixel set.  Legendre polynomial oscillations on scales ~π/ℓ are
    destroyed by pixel merging, so any B_ℓ computation must bypass this step.
+
+.. _clustering_error_structure:
+
+What the Clustering Error Is
+-----------------------------
+
+Clustering replaces each group of beam nodes by a single centroid.  Mass and
+dipole are preserved exactly — the centroid *is* the weighted mean of its
+members — so the whole leading error is a deficit in the beam's second moment,
+
+.. math::
+
+   \Delta M_{ij} \,=\, -\bar\Sigma_{ij} \,,\qquad
+   \bar\Sigma_{ij} \,=\, \sum_k W_k \,\Sigma^{(k)}_{ij}
+
+with :math:`\Sigma^{(k)}` the within-cluster covariance of cluster *k* and
+:math:`W_k` its mass.  That deficit splits into two pieces that behave very
+differently:
+
+* the part **proportional to the beam's own second moment** :math:`M` is a
+  uniform narrowing.  It moves :math:`b_\ell` but leaves the beam's
+  ellipticity untouched, so it adds no systematic that was not already there.
+* the remainder is **ellipticity added to the beam**, an :math:`m = \pm 2`
+  change.  A symmetric beam manufactures it out of nothing, and it is what
+  sources T→P leakage.
+
+Only the second is dangerous, and ``B_ℓ`` cannot see it: ``B_ℓ`` depends on
+each node only through its angular distance from the beam centre, so it is the
+:math:`m = 0` harmonic alone and **no rearrangement of nodes at fixed radius
+changes it**.  A clustering that reshapes the beam scores identically to one
+that does not.  This is why the calibration enforces two bounds.
 
 How the Calibration Works
 --------------------------
@@ -32,15 +68,18 @@ When ``clustering_calibration_enabled: true`` is set, the pipeline sweeps a
    (power_cut = 1.0).
 3. Computes the reference B_ℓ from the full unclustered beam (computed once,
    reused for all grid points).
-4. Measures the relative RMS B_ℓ divergence (see below).
-5. Records the pixel-count speedup as ``S / K_out``.
+4. Measures the relative RMS B_ℓ divergence — the :math:`m = 0` bound.
+5. Measures the added ellipticity :math:`q_2` from the cluster labels — the
+   :math:`m = \pm 2` bound.
+6. Records the pixel-count speedup as ``S / K_out``.
 
-The pair that achieves the highest speedup while keeping B_ℓ divergence
-below ``clustering_error_threshold`` is written to the config.  If no pair
-qualifies, the pair with the lowest divergence is used with a warning.
+The pair that achieves the highest speedup while staying inside **both** bounds
+is written to the config.  If no pair qualifies, the pair with the **least
+added ellipticity** is used with a warning — an :math:`m = \pm 2` error
+reshapes the beam, where the :math:`m = 0` term only rescales its width.
 
-No scan data or TOD generation is performed during calibration — the metric
-depends only on beam geometry, making the sweep fast.
+No scan data or TOD generation is performed during calibration — both metrics
+depend only on beam geometry, making the sweep fast.
 
 B_ℓ Divergence Metric
 -----------------------
@@ -64,33 +103,79 @@ where:
   :math:`\ell_{\max}` defaults to ``2 × nside`` of the sky map (or 500 if no
   map is available).
 
-**Why B_ℓ divergence rather than TOD error?**
+**Why B_ℓ divergence?**
 
 * **No scan data needed.** The metric is computed from beam geometry alone,
   so the calibration sweep is fast and can be run independently of the
   observation schedule.
-* **Direct beam fidelity.** B_ℓ controls how the beam couples to each angular
-  scale of the sky.  A clustering that faithfully reproduces B_ℓ will also
-  reproduce the TOD accurately, because TOD errors ultimately arise from
-  beam-shape distortions that are captured in B_ℓ.
+* **Direct width fidelity.** B_ℓ controls how the azimuthally averaged beam
+  couples to each angular scale of the sky.
+
+.. warning::
+
+   B_ℓ is the :math:`m = 0` harmonic and bounds the beam *width* only.  It
+   cannot bound the ellipticity clustering adds, because no rearrangement of
+   nodes at fixed radius changes it.  Measured on the SAT 90 GHz beam, a
+   shape-preserving clustering scores 10 % *worse* on B_ℓ divergence than one
+   that reshapes the beam, while committing 10× less added ellipticity.  The
+   second metric below exists for exactly that reason.
+
+Added-Ellipticity Metric
+--------------------------
+
+The shape error is the part of the second-moment deficit that is not a uniform
+rescaling,
+
+.. math::
+
+   \bar\Sigma^{\rm shape} \,=\, \bar\Sigma \,-\,
+       \frac{\operatorname{tr}\bar\Sigma}{\operatorname{tr}M}\,M \,,
+
+reported as the beam-quadrupole modulation at the band edge,
+
+.. math::
+
+   q_2 \,=\, \frac{\ell_{\max}^2}{4}\,
+             \bigl\lvert \bar\Sigma^{\rm shape} \bigr\rvert \,.
+
+Both moments are formed in geodesic-polar coordinates about the beam centre,
+never in the ``(RA, Dec)`` offset chart.  That chart is not distance
+preserving — :math:`\cos\rho = \cos(\mathrm{dec})\cos(\mathrm{RA})` gives
+:math:`\rho^2 = x^2 + y^2 - x^2y^2/3` — so it manufactures a traceless second
+moment of relative size :math:`\sigma^2/2` out of a beam that has none.  For
+the 30′ spherical beam that artifact measures 6.87e-06 against a predicted
+:math:`\sigma^2/2 = 6.87\times10^{-6}`; a criterion built on that chart would
+score it as real.
+
+The table also reports :math:`q_2 / q_{2,\rm beam}`, the added ellipticity as
+a fraction of the beam's *own* quadrupole.  That is the number to weigh
+against a leakage budget.
+
+.. note::
+
+   For a symmetric beam :math:`q_{2,\rm beam} \to 0` and the ratio column is
+   meaningless — correctly so, since a quadrupole created from nothing has no
+   natural scale to be measured against.  Use
+   ``clustering_ellipticity_tolerance: 1.0`` for such beams.
 
 Calibration Output Table
 -------------------------
 
 When the calibration runs it prints an ASCII table of the form::
 
-   [clust_calib] error_threshold=1.0e-05
-    tail%      K   K_out   speedup   B_ell div  status
-   --------------------------------------------------------
-     0.5%     10      10      1.00   1.23e-07  ✓
-     0.5%     20      20      1.00   1.23e-07  ✓
-     ...
-     5.0%    500     487      2.63   8.41e-06  ✓
-     5.0%   1000     912      3.11   3.92e-06  ✓
-   --------------------------------------------------------
+   [clust_calib] B_ell (m=0) <= 1.0e-05
+   [clust_calib] added ellipticity q2(l=2048) <= 1 x 3.37e-04 = 3.37e-04
+                 (beam's own quadrupole q2_beam = 2.22e+00)
+    tail%      K   K_out   speedup   B_ell div    q2 added   /q2_beam  status
+   --------------------------------------------------------------------------
+    15.0%    500    2421     14.42    1.97e-04    2.87e-03   1.29e-03  ✗ m=±2
+    15.0%   1000    2921     11.95    2.06e-04    9.54e-04   4.31e-04  ✗ m=±2
+    15.0%   2000    3921      8.91    2.41e-04    3.37e-04   1.52e-04  ✓
+    15.0%   4000    5921      5.90    2.55e-04    8.87e-04   4.00e-04  ✗ m=±2
+   --------------------------------------------------------------------------
 
-   [clust_calib] Recommendation: tail_fraction=0.05, n_clusters=1000
-     (speedup=3.11x, B_ell div=3.92e-06)
+   [clust_calib] Recommendation: tail_fraction=0.15, n_clusters=2000
+     (speedup=8.91x, B_ell div=2.41e-04, q2 added=3.37e-04)
 
 Columns:
 
@@ -98,8 +183,21 @@ Columns:
 * **K** — requested number of tail clusters.
 * **K_out** — actual number of output pixels (``n_main + K_tail``).
 * **speedup** — ratio ``S / K_out`` where ``S`` is the original pixel count.
-* **B_ell div** — :math:`\varepsilon_{B_\ell}` for this pair.
-* **status** — ✓ if ``B_ell div ≤ clustering_error_threshold``, ✗ otherwise.
+* **B_ell div** — :math:`\varepsilon_{B_\ell}`, the :math:`m = 0` bound.
+* **q2 added** — the ellipticity this pair adds to the beam.
+* **/q2_beam** — that ellipticity as a fraction of the beam's own quadrupole.
+* **status** — ✓ if both bounds hold; ``✗ m=0`` or ``✗ m=±2`` names which one
+  failed.
+
+.. note::
+
+   Added ellipticity is **not** monotone in ``n_clusters``.  In the table above
+   it bottoms at K = 2000 and rises again by 2.6× at K = 4000, because a large
+   cluster budget forces near-degenerate cells: a cell holding two grid nodes
+   has a rank-1 covariance locked to a grid direction, and such cells carry
+   87 % of the manufactured quadrupole at K = 4000 while holding only 36 % of
+   the width error.  More clusters buys width accuracy and can cost shape
+   accuracy.
 
 .. _clustering_error_threshold_guidance:
 
@@ -142,3 +240,77 @@ Practical notes:
   independently.
 * B_ℓ divergence is **independent of scan strategy** — it depends
   only on beam geometry and the clustering parameters.
+
+.. _ellipticity_tolerance_guidance:
+
+Choosing ``clustering_ellipticity_tolerance``
+-----------------------------------------------
+
+This bound is **relative, not absolute**: it is a factor over the least added
+ellipticity any point in the sweep achieves *for this beam*.
+
+An absolute bound cannot be chosen before running.  What is achievable depends
+on the beam, the beam-grid spacing and the cluster budget together, so there is
+no value a user can know in advance — and setting one too low simply causes
+every candidate to fail, dropping the calibration into its fallback.  The
+calibrator measures the floor instead and expresses the tolerance against it.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
+
+   * - Value
+     - Behaviour
+   * - ``1.0`` (default)
+     - Keep only the least-ellipticity configuration.  Use this for symmetric
+       or near-symmetric beams, where any added quadrupole is manufactured
+       from nothing.
+   * - ``2.0``
+     - Accept up to twice the floor in exchange for speed.  Reasonable for a
+       strongly asymmetric beam, where the added term perturbs an existing
+       asymmetry rather than creating one.
+   * - ``null``
+     - Report the term without gating on it.  The columns still appear in the
+       table.
+
+Values below ``1.0`` raise a ``ValueError`` at config load: no configuration
+can beat the sweep's own floor, so such a bound would reject every candidate
+including the best one.
+
+.. _whitened_assignment:
+
+Shape-Preserving Assignment
+-----------------------------
+
+Pixels are grouped in the frame where the beam's second moment is isotropic,
+
+.. math::
+
+   W \,=\, \sqrt{\bar\lambda}\; M^{-1/2} \,,
+
+so that k-means — which minimises an *isotropic* distortion — is optimising the
+right functional.  Mapping back gives
+:math:`\bar\Sigma = \sigma^2 M`, proportional to the beam's own second moment
+by construction: the clustering narrows the beam without reshaping it.
+
+Only the assignment is whitened.  Centroids remain the weighted mean of the
+original vectors, so dipole preservation and the exact
+:math:`\Delta M = -\bar\Sigma` identity are untouched.
+
+Measured on the SAT 90 GHz beam at ``n_clusters=2000``, ``tail_fraction=0.15``:
+added ellipticity falls from 3.8e-02 to 3.8e-03 — a factor of 10 — for +0.02 %
+on the width term, with the deficit axis moving from −4.4° (the beam-grid axis)
+to +65.5°, against the beam's own axis of +71.8°.
+
+.. note::
+
+   On a beam that is a function of angular distance alone the whitener is
+   exactly the identity and the transform is skipped, so the partition is
+   reproduced bit for bit.  Whitening re-aims the second-moment deficit onto
+   the beam's own axes; a beam with no axes has nothing to re-aim onto.  Such
+   a beam's residual ellipticity is grid-induced and is not addressed by this
+   mechanism.
+
+   Set ``whiten=False`` when calling
+   :func:`beam_cluster.cluster_beam_pixels` directly to recover a plain
+   spherical k-means.
