@@ -124,7 +124,24 @@ n_beam_clusters = _cfg.get("n_beam_clusters", None)
 beam_cluster_tail_fraction = _cfg.get("beam_cluster_tail_fraction", None)
 
 clustering_calibration_enabled = _cfg.get("clustering_calibration_enabled", False)
+# B_ell divergence bound. B_ell depends on each beam node only through its
+# angular distance from the centre, so it is the m = 0 harmonic alone and no
+# rearrangement of nodes at fixed radius changes it: this bounds the width
+# error and is blind to any ellipticity the clustering manufactures.
 clustering_error_threshold = _cfg.get("clustering_error_threshold", 1e-3)
+# Bound on the ellipticity clustering ADDS to the beam, which is what the
+# m = 0 statistic cannot see.  Clustering's whole leading error is a beam
+# second-moment deficit; the part proportional to the beam's own second moment
+# narrows the beam without reshaping it and is harmless, and the rest is added
+# ellipticity that sources T->P leakage.
+#
+# Expressed as a factor over the least added ellipticity the (tail_fraction,
+# n_clusters) sweep can reach for *this* beam, not as an absolute bound: what
+# is achievable depends on the beam, the grid spacing and the cluster budget
+# together, so an absolute number cannot be chosen before running. 1.0 accepts
+# only the least-ellipticity configuration; larger values trade ellipticity
+# for speed; None ignores the term and reports it.
+clustering_ellipticity_tolerance = _cfg.get("clustering_ellipticity_tolerance", 1.0)
 
 # Half-wave plate (HWP) modulation.
 # When hwp_enabled is True, the TOD generator rotates the per-sample (Q, U)

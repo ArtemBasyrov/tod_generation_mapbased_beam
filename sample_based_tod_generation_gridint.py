@@ -269,6 +269,7 @@ def main(n_cpu_ceiling):
             probe_day=start,
             mp=MP,
             error_threshold=config.clustering_error_threshold,
+            ellipticity_tolerance=config.clustering_ellipticity_tolerance,
             interp_mode=interp_mode,
         )
         save_clustering_calibration(best_tf, best_K)

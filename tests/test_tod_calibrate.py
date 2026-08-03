@@ -922,3 +922,126 @@ class TestCalibrateRuntime:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ===========================================================================
+# Clustering criterion — the m = +-2 term B_ell cannot see
+# ===========================================================================
+
+import tod_calibrate  # noqa: E402
+from tod_calibrate import _beam_quadrupole  # noqa: E402
+from beam_cluster import cluster_beam_pixels  # noqa: E402
+
+_ARCMIN = np.pi / 180.0 / 60.0
+
+
+def _beam_on_grid(sigma_x, sigma_y, half=45):
+    """Elliptical Gaussian on a 1' grid in the pipeline's node layout."""
+    g = np.arange(-half, half + 1, 1.0) * _ARCMIN
+    X, Y = np.meshgrid(g, g, indexing="xy")
+    X, Y = X.ravel(), Y.ravel()
+    bv = np.exp(-0.5 * ((X / sigma_x) ** 2 + (Y / sigma_y) ** 2)) * np.cos(Y)
+    bv = (bv / bv.sum()).astype(np.float32)
+    th = np.pi / 2.0 - Y
+    vec = np.stack(
+        [np.sin(th) * np.cos(X), np.sin(th) * np.sin(X), np.cos(th)], axis=-1
+    ).astype(np.float32)
+    return vec, bv
+
+
+class TestClusteringShapeError:
+    """tod_calibrate._clustering_shape_error."""
+
+    def test_identity_partition_commits_no_error(self):
+        vec, bv = _beam_on_grid(9 * _ARCMIN, 6 * _ARCMIN, half=20)
+        labels = np.arange(len(bv))
+        q0, q2 = tod_calibrate._clustering_shape_error(vec, bv, labels, len(bv), 3000)
+        assert q0 == pytest.approx(0.0, abs=1e-20)
+        assert q2 == pytest.approx(0.0, abs=1e-20)
+
+    def test_a_uniform_rescaling_scores_zero_added_ellipticity(self):
+        """Sigma_bar proportional to the beam's own M narrows the beam without
+        reshaping it, so the added-ellipticity term must vanish even though the
+        width term does not.
+
+        Pairing every node with its antipode through the beam centre builds
+        exactly that case: each pair's centroid is the centre, so its
+        covariance is ``t t^T``, and summing over a centrally symmetric weight
+        distribution gives ``Sigma_bar = M``.
+        """
+        half = 25
+        vec, bv = _beam_on_grid(9 * _ARCMIN, 6 * _ARCMIN, half=half)
+        n = 2 * half + 1
+        idx = np.arange(n * n)
+        labels = np.minimum(idx, n * n - 1 - idx)
+        K_out = int(labels.max()) + 1
+        q0, q2 = tod_calibrate._clustering_shape_error(vec, bv, labels, K_out, 3000)
+        assert q0 > 0.0
+        assert q2 < 1e-8 * q0
+
+    def test_grows_with_cluster_count(self):
+        """Coarser clustering commits a larger second-moment deficit."""
+        vec, bv = _beam_on_grid(9 * _ARCMIN, 6 * _ARCMIN, half=25)
+        prev = None
+        for K in (400, 100, 25):
+            _, _, labels = cluster_beam_pixels(
+                vec, bv, n_clusters=K, tail_fraction=0.05, verbose=False
+            )
+            q0, _ = tod_calibrate._clustering_shape_error(
+                vec, bv, labels, int(labels.max()) + 1, 3000
+            )
+            if prev is not None:
+                assert q0 > prev
+            prev = q0
+
+    def test_moments_use_the_tangent_frame_not_the_offset_chart(self):
+        """A radial beam is round, so a partition whose deficit is
+        proportional to M must score zero added ellipticity.  Formed in the
+        (RA, Dec) offset chart it would instead pick up sigma^2/2."""
+        half, sigma = 60, 9 * _ARCMIN
+        g = np.arange(-half, half + 1, 1.0) * _ARCMIN
+        X, Y = np.meshgrid(g, g, indexing="xy")
+        X, Y = X.ravel(), Y.ravel()
+        rho = np.arccos(np.clip(np.cos(Y) * np.cos(X), -1.0, 1.0))
+        bv = np.exp(-0.5 * (rho / sigma) ** 2) * np.cos(Y)
+        bv = (bv / bv.sum()).astype(np.float32)
+        th = np.pi / 2.0 - Y
+        vec = np.stack(
+            [np.sin(th) * np.cos(X), np.sin(th) * np.sin(X), np.cos(th)], axis=-1
+        ).astype(np.float32)
+        _, _, labels = cluster_beam_pixels(
+            vec, bv, n_clusters=200, tail_fraction=0.05, verbose=False
+        )
+        q0, q2 = tod_calibrate._clustering_shape_error(
+            vec, bv, labels, int(labels.max()) + 1, 3000
+        )
+        assert q2 < q0
+
+
+class TestBeamQuadrupole:
+    """tod_calibrate._beam_quadrupole — the scale added ellipticity is read against."""
+
+    def test_zero_for_a_radial_beam(self):
+        half, sigma = 60, 9 * _ARCMIN
+        g = np.arange(-half, half + 1, 1.0) * _ARCMIN
+        X, Y = np.meshgrid(g, g, indexing="xy")
+        X, Y = X.ravel(), Y.ravel()
+        rho = np.arccos(np.clip(np.cos(Y) * np.cos(X), -1.0, 1.0))
+        bv = np.exp(-0.5 * (rho / sigma) ** 2) * np.cos(Y)
+        bv = (bv / bv.sum()).astype(np.float32)
+        th = np.pi / 2.0 - Y
+        vec = np.stack(
+            [np.sin(th) * np.cos(X), np.sin(th) * np.sin(X), np.cos(th)], axis=-1
+        ).astype(np.float32)
+        q0 = _beam_quadrupole(vec, bv, 2048)
+        vec_e, bv_e = _beam_on_grid(12 * _ARCMIN, 6 * _ARCMIN, half=40)
+        assert q0 < 1e-6 * _beam_quadrupole(vec_e, bv_e, 2048)
+
+    def test_grows_with_beam_ellipticity(self):
+        prev = None
+        for sy in (11.0, 9.0, 6.0):
+            vec, bv = _beam_on_grid(12 * _ARCMIN, sy * _ARCMIN, half=40)
+            q = _beam_quadrupole(vec, bv, 2048)
+            if prev is not None:
+                assert q > prev
+            prev = q

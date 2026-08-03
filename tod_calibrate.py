@@ -31,7 +31,96 @@ from tod_io import load_scan_data_batch
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
 from tod_utils import _fmt_time, _get_memory_per_process
 from tod_beam_math import compute_bell
-from beam_cluster import cluster_beam_pixels
+from beam_cluster import cluster_beam_pixels, _tangent_frame, _log_map, _to_unit
+
+
+def _second_moment(t1, t2, w):
+    """(2, 2) power-weighted second moment of tangent-plane offsets."""
+    return np.array(
+        [
+            [(w * t1 * t1).sum(), (w * t1 * t2).sum()],
+            [(w * t1 * t2).sum(), (w * t2 * t2).sum()],
+        ]
+    )
+
+
+def _beam_quadrupole(vec_orig, beam_vals, lmax):
+    """The beam's OWN quadrupole modulation ``q2 = l^2 |M_traceless| / 4``.
+
+    The scale against which added ellipticity is interpreted: a clustering
+    that adds a small fraction of the asymmetry the beam already has perturbs
+    an existing systematic, where the same absolute amount added to a
+    symmetric beam creates one from nothing.
+    """
+    v = _to_unit(vec_orig)
+    w = np.asarray(beam_vals, dtype=np.float64)
+    frame = _tangent_frame(v, w)
+    total = w.sum()
+    if frame is None or total <= 0:
+        return 0.0
+    t1, t2 = _log_map(v, frame)
+    ev = np.linalg.eigvalsh(_second_moment(t1, t2, w) / total)
+    return float(lmax) ** 2 / 4.0 * float(ev[1] - ev[0])
+
+
+def _clustering_shape_error(vec_orig, beam_vals, labels, K_out, lmax):
+    """Beam width and ellipticity error committed by a clustering.
+
+    Clustering replaces each group of beam nodes by one centroid, and its whole
+    leading effect is a deficit in the beam's second moment, ``Delta M =
+    -Sigma_bar``, with ``Sigma_bar`` the power-weighted within-cluster
+    covariance.  Splitting that deficit is what makes it interpretable:
+
+    * the part proportional to the beam's own second moment ``M`` narrows the
+      beam without reshaping it — it moves ``b_ell`` but leaves the ellipticity
+      alone, so it creates no leakage that was not already there;
+    * the remainder is **added ellipticity**, an ``m = ±2`` change that a
+      symmetric beam manufactures out of nothing.
+
+    Both are reported as the beam-quadrupole modulation ``q = l^2 |.| / 4`` at
+    the band edge, so they are dimensionless and directly comparable.
+
+    Moments are formed in geodesic-polar coordinates about the beam centre.
+    The ``(RA, Dec)`` offset chart is not distance preserving and gives a
+    perfectly round beam a traceless second moment of relative size
+    ``sigma^2 / 2``, which a criterion built on it would score as real.
+
+    Args:
+        vec_orig: (S, 3) pre-clustering beam-pixel unit vectors.
+        beam_vals: (S,) pre-clustering beam weights.
+        labels: (S,) output index per original pixel, from
+            :func:`beam_cluster.cluster_beam_pixels`.
+        K_out: number of output pixels.
+        lmax: multipole at which to quote the modulation.
+
+    Returns:
+        tuple[float, float]: ``(q0, q2)`` — the width term and the added
+        ellipticity, both dimensionless.
+    """
+    v = _to_unit(vec_orig)
+    w = np.asarray(beam_vals, dtype=np.float64)
+    frame = _tangent_frame(v, w)
+    if frame is None:
+        return 0.0, 0.0
+    t1, t2 = _log_map(v, frame)
+
+    mass = np.bincount(labels, weights=w, minlength=K_out)
+    safe = np.where(np.abs(mass) > 0, mass, 1.0)
+    c1 = np.bincount(labels, weights=w * t1, minlength=K_out) / safe
+    c2 = np.bincount(labels, weights=w * t2, minlength=K_out) / safe
+
+    total = w.sum()
+    if total <= 0:
+        return 0.0, 0.0
+    M = _second_moment(t1, t2, w) / total
+    Sigma = _second_moment(t1 - c1[labels], t2 - c2[labels], w) / total
+
+    trM = np.trace(M)
+    shape = Sigma - (np.trace(Sigma) / trM) * M if trM > 0 else Sigma
+    ev = np.linalg.eigvalsh(shape)
+    k2 = float(lmax) ** 2 / 4.0
+    return k2 * float(np.trace(Sigma)), k2 * float(abs(ev[1] - ev[0]))
+
 
 _BYTES_PER_SAMPLE_TRANSIENT = {
     "nearest": 80,
@@ -426,24 +515,48 @@ def calibrate_beam_clustering(
     probe_day=None,
     mp=None,
     error_threshold=1e-3,
+    ellipticity_tolerance=2.0,
     bell_lmax=None,
     interp_mode="bilinear",
     tail_fractions=None,
     n_clusters_list=None,
 ):
-    """Find (tail_fraction, n_clusters) maximising speedup s.t. B_ell error
-    ≤ error_threshold.
+    """Find (tail_fraction, n_clusters) maximising speedup within the error
+        budget.
 
-    Computes reference B_ell (power_cut=1.0) from unclustered beam, then
-    sweeps a (tail_fraction × n_clusters) grid. The pair maximising
-    speedup with relative-RMS B_ell divergence ≤ error_threshold wins; if
-    no pair qualifies, the minimum-divergence pair is returned with a warning.
+        Two bounds are enforced, because they are sensitive to different harmonics
+        and neither implies the other.
 
-    ``tail_fractions`` overrides the default tail-fraction grid — e.g. to
-    enforce a lower bound derived from the noise floor of a measured beam,
-    so that the exactly-kept main-lobe pixels stay signal-dominated.
-    ``n_clusters_list`` overrides the default cluster-count grid — e.g. to
-    probe beyond 2000 clusters when the error budget is tight.
+        ``error_threshold`` bounds the relative-RMS divergence of ``B_ell``, which
+        depends on each node only through its distance from the beam centre and is
+        therefore the ``m = 0`` harmonic alone: it constrains the beam *width*.
+
+    ``ellipticity_tolerance`` bounds the ellipticity the clustering *adds* to
+        the beam — the part of the second-moment deficit that is not proportional
+        to the beam's own second moment, quoted as ``q2 = l^2 |Sigma_shape| / 4``.
+        ``B_ell`` cannot see this at all: no rearrangement of nodes at fixed radius
+        changes it, so a clustering that reshapes the beam scores identically to
+        one that does not.  It is the harmful term, since an ``m = ±2`` error is
+        what sources T->P leakage.
+
+        The bound is relative — a factor over the smallest ``q2`` any point in the
+        sweep achieves for this beam — because what is achievable depends on the
+        beam, the grid spacing and the cluster budget together and cannot be known
+        before running.  1.0 keeps only the least-ellipticity configuration, larger
+        values trade ellipticity for speed, ``None`` reports ``q2`` without gating.
+        The table also carries ``q2`` as a fraction of the beam's own quadrupole,
+        which is the number to compare against a leakage budget.
+
+        Computes reference B_ell (power_cut=1.0) from unclustered beam, then
+        sweeps a (tail_fraction × n_clusters) grid. The pair maximising
+        speedup subject to both bounds wins; if no pair qualifies, the pair with
+        the smallest added ellipticity is returned with a warning.
+
+        ``tail_fractions`` overrides the default tail-fraction grid — e.g. to
+        enforce a lower bound derived from the noise floor of a measured beam,
+        so that the exactly-kept main-lobe pixels stay signal-dominated.
+        ``n_clusters_list`` overrides the default cluster-count grid — e.g. to
+        probe beyond 2000 clusters when the error budget is tight.
     """
     if tail_fractions is None:
         tail_fractions = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
@@ -485,6 +598,13 @@ def calibrate_beam_clustering(
         ref_bells[bf] = _bell_from_vecs(data["vec_orig"], data["beam_vals"])
 
     S_bf = {bf: data["n_sel"] for bf, data in beam_data.items()}
+    q2_beam = max(
+        (
+            _beam_quadrupole(data["vec_orig"], data["beam_vals"], bell_lmax)
+            for data in beam_data.values()
+        ),
+        default=0.0,
+    )
 
     # Pre-compute n_tail for each (beam_file, tail_fraction) to enable
     # short-circuiting when K_req >= n_tail (no clustering occurs).
@@ -505,14 +625,16 @@ def calibrate_beam_clustering(
         for K_req in n_clusters_list:
             K_out_per_bf = {}
             bell_divs = []
+            q2s = []
             for bf, data in beam_data.items():
                 n_tail = n_tail_per_bf_tf[bf][tf]
                 if K_req >= n_tail:
                     # Tail already fits in K_req clusters — no reduction possible.
                     K_out_per_bf[bf] = S_bf[bf]
                     bell_divs.append(0.0)
+                    q2s.append(0.0)
                     continue
-                vec_c, bv_c, _ = cluster_beam_pixels(
+                vec_c, bv_c, labels_c = cluster_beam_pixels(
                     data["vec_orig"],
                     data["beam_vals"],
                     n_clusters=K_req,
@@ -527,51 +649,86 @@ def calibrate_beam_clustering(
                     ref_rms + 1e-30
                 )
                 bell_divs.append(bell_div)
+                _, q2 = _clustering_shape_error(
+                    data["vec_orig"],
+                    data["beam_vals"],
+                    labels_c,
+                    len(bv_c),
+                    bell_lmax,
+                )
+                q2s.append(q2)
 
             mean_bell_div = float(np.mean(bell_divs))
+            max_q2 = float(np.max(q2s))
             speedup = float(np.mean([S_bf[bf] / K_out_per_bf[bf] for bf in beam_data]))
             K_out_repr = int(np.mean(list(K_out_per_bf.values())))
-            results.append((tf, K_req, K_out_repr, speedup, mean_bell_div))
+            results.append((tf, K_req, K_out_repr, speedup, mean_bell_div, max_q2))
+
+    # The achievable floor is measured, not assumed: it is the least added
+    # ellipticity anywhere in the sweep that already meets the m = 0 bound.
+    ok_m0 = [r for r in results if r[4] <= error_threshold]
+    q2_floor = min((r[5] for r in ok_m0), default=0.0)
+    q2_cap = (
+        ellipticity_tolerance * q2_floor
+        if (ellipticity_tolerance and q2_floor > 0)
+        else None
+    )
 
     print()
-    print(f"[clust_calib] error_threshold={error_threshold:.1e}")
+    print(f"[clust_calib] B_ell (m=0) <= {error_threshold:.1e}")
+    if q2_cap:
+        print(
+            f"[clust_calib] added ellipticity q2(l={bell_lmax}) <= "
+            f"{ellipticity_tolerance:g} x {q2_floor:.2e} = {q2_cap:.2e}   "
+            f"(beam's own quadrupole q2_beam = {q2_beam:.2e})"
+        )
+    else:
+        print("[clust_calib] added ellipticity: reported only")
     print(
         f"{'tail%':>6s}  {'K':>5s}  {'K_out':>6s}  {'speedup':>8s}  "
-        f"{'B_ell div':>10s}  {'status'}"
+        f"{'B_ell div':>10s}  {'q2 added':>10s}  {'/q2_beam':>9s}  {'status'}"
     )
-    print("-" * 56)
+    print("-" * 80)
     prev_tf = None
-    for tf, K_req, K_out, speedup, bell_div in results:
+    for tf, K_req, K_out, speedup, bell_div, q2 in results:
         if prev_tf is not None and tf != prev_tf:
-            print("-" * 56)
-        status = "✓" if bell_div <= error_threshold else "✗"
+            print("-" * 80)
+        good_m0 = bell_div <= error_threshold
+        good_m2 = (q2_cap is None) or q2 <= q2_cap
+        status = "✓" if good_m0 and good_m2 else ("✗ m=0" if not good_m0 else "✗ m=±2")
+        rel = q2 / q2_beam if q2_beam > 0 else float("inf")
         print(
             f"{tf * 100:>5.1f}%  {K_req:>5d}  {K_out:>6d}  {speedup:>8.2f}x  "
-            f"{bell_div:>10.2e}  {status}"
+            f"{bell_div:>10.2e}  {q2:>10.2e}  {rel:>9.2e}  {status}"
         )
         prev_tf = tf
-    print("-" * 56)
+    print("-" * 80)
 
-    passing = [r for r in results if r[4] <= error_threshold]
+    passing = [r for r in ok_m0 if (q2_cap is None) or r[5] <= q2_cap]
     if passing:
         best = max(passing, key=lambda x: x[3])
         best_tf, best_K_req = best[0], best[1]
         print(
             f"\n[clust_calib] Recommendation: tail_fraction={best_tf}, "
             f"n_clusters={best_K_req}  "
-            f"(speedup={best[3]:.2f}x, B_ell div={best[4]:.2e})"
+            f"(speedup={best[3]:.2f}x, B_ell div={best[4]:.2e}, "
+            f"q2 added={best[5]:.2e})"
         )
     else:
-        best = min(results, key=lambda x: x[4])
+        # Fall back on the harmful term: an m=+-2 error reshapes the beam and
+        # sources T->P leakage, where the m=0 term only rescales its width.
+        best = min(results, key=lambda x: x[5])
         best_tf, best_K_req = best[0], best[1]
         print(
-            f"\n[clust_calib] WARNING: no (tf, K) pair achieved B_ell div "
-            f"<= {error_threshold:.1e}."
+            f"\n[clust_calib] WARNING: no (tf, K) pair met both bounds "
+            f"(B_ell <= {error_threshold:.1e}"
+            + (f", q2 <= {q2_cap:.1e}" if q2_cap else "")
+            + ")."
         )
         print(
-            f"[clust_calib] Returning minimum-divergence pair: "
-            f"tail_fraction={best_tf}, n_clusters={best_K_req}  "
-            f"(B_ell div={best[4]:.2e})"
+            f"[clust_calib] Returning the pair with the least added "
+            f"ellipticity: tail_fraction={best_tf}, n_clusters={best_K_req}  "
+            f"(B_ell div={best[4]:.2e}, q2 added={best[5]:.2e})"
         )
 
     return float(best_tf), int(best_K_req)
