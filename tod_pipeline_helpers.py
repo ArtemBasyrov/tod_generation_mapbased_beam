@@ -109,6 +109,14 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             # fraction of integrated power over the sphere.
             db_cut = _compute_dB_threshold_from_power(weighted_map, threshold)
             sel = 10 * np.log10(np.abs(weighted_map) + 1e-30) >= db_cut
+
+        # A pixel of weight zero contributes beam_val * sky = 0 to every
+        # sample, so dropping it changes no output bit. Keeping it costs:
+        # it consumes beam-clustering budget and a slot in the gather loop.
+        # Tested on the working dtype, which also catches weights that
+        # underflow to zero when precision is float32.
+        sel &= weighted_map.astype(config.precision_dtype) != 0
+
         beam_vals = weighted_map[sel].astype(config.precision_dtype)
         norm = beam_vals.sum()
         if norm != 0:
