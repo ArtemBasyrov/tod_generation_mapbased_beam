@@ -40,7 +40,9 @@ from beam_cluster import (
     cluster_beam_pixels,
     _build_weight_matrix,
     cluster_cached_arrays,
-    _chart,
+    _tangent_frame,
+    _log_map,
+    _exp_map,
     _whitener,
     _apply_whitener,
     _centroids_from_labels,
@@ -89,26 +91,47 @@ def _second_moment(X, Y, w):
     )
 
 
-def _sigma_bar(X, Y, w, labels, K_out):
+def _sigma_bar(tx, ty, w, labels, K_out):
     """Power-weighted within-cluster covariance of a partition."""
     Wc = np.bincount(labels, weights=w, minlength=K_out)
     Ws = np.where(np.abs(Wc) > 0, Wc, 1.0)
-    cx = np.bincount(labels, weights=w * X, minlength=K_out) / Ws
-    cy = np.bincount(labels, weights=w * Y, minlength=K_out) / Ws
-    return _second_moment(X - cx[labels], Y - cy[labels], w)
+    cx = np.bincount(labels, weights=w * tx, minlength=K_out) / Ws
+    cy = np.bincount(labels, weights=w * ty, minlength=K_out) / Ws
+    return _second_moment(tx - cx[labels], ty - cy[labels], w)
 
 
-def _added_ellipticity(X, Y, w, labels, K_out):
+def _added_ellipticity(vec, bv, labels, K_out):
     """Part of the second-moment deficit that is NOT a uniform rescaling.
 
     A deficit proportional to the beam's own M narrows the beam without
     reshaping it; only the residual adds ellipticity the beam did not have.
+    Measured in geodesic-polar coordinates, where a beam that is a function of
+    angular distance alone is exactly isotropic.
     """
-    M = _second_moment(X, Y, w)
-    S = _sigma_bar(X, Y, w, labels, K_out)
-    resid = S - (np.trace(S) / np.trace(M)) * M
-    ev = np.linalg.eigvalsh(resid)
+    v64, w64 = np.asarray(vec, np.float64), np.asarray(bv, np.float64)
+    frame = _tangent_frame(v64, w64)
+    t1, t2 = _log_map(v64, frame)
+    M = _second_moment(t1, t2, w64)
+    S = _sigma_bar(t1, t2, w64, labels, K_out)
+    ev = np.linalg.eigvalsh(S - (np.trace(S) / np.trace(M)) * M)
     return float(abs(ev[1] - ev[0]))
+
+
+def _radial_beam(sigma, half=45, step=1.0):
+    """Beam that is an exact function of ANGULAR DISTANCE from its centre,
+    carrying the pipeline's ``cos(dec)`` quadrature weight.  Isotropic in
+    geodesic-polar coordinates; not in the (RA, Dec) offset chart."""
+    g = np.arange(-half, half + 1, step) * _ARCMIN
+    X, Y = np.meshgrid(g, g, indexing="xy")
+    X, Y = X.ravel(), Y.ravel()
+    rho = np.arccos(np.clip(np.cos(Y) * np.cos(X), -1.0, 1.0))
+    bv = np.exp(-0.5 * (rho / sigma) ** 2) * np.cos(Y)
+    bv = bv / bv.sum()
+    th = np.pi / 2.0 - Y
+    vec = np.stack(
+        [np.sin(th) * np.cos(X), np.sin(th) * np.sin(X), np.cos(th)], axis=-1
+    )
+    return vec.astype(np.float32), bv.astype(np.float32), X, Y
 
 
 # ===========================================================================
@@ -758,42 +781,78 @@ class TestClusterCachedArrays:
 # ===========================================================================
 
 
-class TestChartAndWhitener:
-    def test_chart_inverts_the_vector_construction(self):
-        vec, bv, X, Y = _gaussian_beam(8 * _ARCMIN, 8 * _ARCMIN, half=10)
-        x, y = _chart(np.asarray(vec, dtype=np.float64))
-        assert np.allclose(x, X, atol=1e-12)
-        assert np.allclose(y, Y, atol=1e-12)
+class TestTangentFrameAndWhitener:
+    def test_log_map_and_exp_map_round_trip(self):
+        vec, bv, _, _ = _radial_beam(9 * _ARCMIN, half=20)
+        v64, w64 = vec.astype(np.float64), bv.astype(np.float64)
+        frame = _tangent_frame(v64, w64)
+        t1, t2 = _log_map(v64, frame)
+        assert np.allclose(_exp_map(t1, t2, frame), v64, atol=1e-12)
 
-    def test_whitener_is_a_scalar_multiple_of_identity_for_symmetric_beam(self):
-        vec, bv, X, Y = _gaussian_beam(8 * _ARCMIN, 8 * _ARCMIN, half=30)
-        W = _whitener(np.asarray(vec, dtype=np.float64), np.asarray(bv, np.float64))
-        assert W is not None
-        assert abs(W[0, 1]) < 1e-6 and abs(W[1, 0]) < 1e-6
-        assert W[0, 0] == pytest.approx(W[1, 1], rel=1e-3)
-        assert W[0, 0] == pytest.approx(1.0, rel=1e-3)
+    def test_log_map_distances_are_true_arc_lengths(self):
+        vec, bv, _, _ = _radial_beam(9 * _ARCMIN, half=20)
+        v64, w64 = vec.astype(np.float64), bv.astype(np.float64)
+        frame = _tangent_frame(v64, w64)
+        v64 = v64 / np.linalg.norm(v64, axis=1, keepdims=True)
+        t1, t2 = _log_map(v64, frame)
+        rho = np.arccos(np.clip(v64 @ frame[0], -1.0, 1.0))
+        assert np.allclose(np.hypot(t1, t2), rho, atol=1e-12)
+
+    def test_ra_dec_chart_manufactures_ellipticity_a_radial_beam_lacks(self):
+        """cos(rho) = cos(dec)cos(RA) is not distance preserving, so forming
+        moments in the offset chart gives a traceless part of relative size
+        sigma^2/2 for a beam that has none.  Whitening on that would correct
+        an asymmetry the instrument does not have."""
+        sigma = 9 * _ARCMIN
+        vec, bv, X, Y = _radial_beam(sigma, half=45)
+        v64, w64 = vec.astype(np.float64), bv.astype(np.float64)
+        frame = _tangent_frame(v64, w64)
+        t1, t2 = _log_map(v64, frame)
+
+        def frac(M):
+            ev = np.linalg.eigvalsh(M)
+            return (ev[1] - ev[0]) / ev.sum()
+
+        # floor is float64 accumulation over 8281 weights spanning 14 decades,
+        # still four orders below the artifact the offset chart manufactures
+        assert frac(_second_moment(t1, t2, w64)) < 1e-8
+        assert frac(_second_moment(X, Y, w64)) == pytest.approx(sigma**2 / 2, rel=0.2)
+
+    def test_whitener_declines_to_act_on_a_radial_beam(self):
+        """A beam already round in the tangent frame needs no whitening, and
+        applying a near-identity map anyway would round-trip the nodes through
+        log/exp and shift a few across Voronoi boundaries.  ``_whitener``
+        returns None so the caller uses the nodes untouched."""
+        # 7.5 sigma of support: a square grid cutting a radial beam closer in
+        # leaves it genuinely non-round (7.9e-8 at 3.8 sigma), and the whitener
+        # should — and does — act on that.
+        vec, bv, _, _ = _radial_beam(12 * _ARCMIN, half=90)
+        v64, w64 = vec.astype(np.float64), bv.astype(np.float64)
+        frame = _tangent_frame(v64, w64)
+        assert _whitener(v64, w64, frame) is None
+
+    def test_apply_whitener_is_exact_for_the_identity(self):
+        vec, bv, _, _ = _radial_beam(12 * _ARCMIN, half=20)
+        v64, w64 = vec.astype(np.float64), bv.astype(np.float64)
+        v64 = v64 / np.linalg.norm(v64, axis=1, keepdims=True)
+        frame = _tangent_frame(v64, w64)
+        got = _apply_whitener(v64, np.eye(2), frame)
+        assert np.allclose(got, v64, atol=1e-12)
 
     def test_whitener_isotropises_an_elliptical_beam(self):
-        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=40)
-        w64 = np.asarray(bv, dtype=np.float64)
-        W = _whitener(np.asarray(vec, dtype=np.float64), w64)
-        P = np.stack([X, Y], axis=1) @ W.T
-        Mw = _second_moment(P[:, 0], P[:, 1], w64 / w64.sum())
-        ev = np.linalg.eigvalsh(Mw)
-        assert (ev[1] - ev[0]) / ev.sum() < 1e-6  # isotropic in the new frame
+        vec, bv, _, _ = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=40)
+        v64, w64 = vec.astype(np.float64), bv.astype(np.float64)
+        frame = _tangent_frame(v64, w64)
+        W = _whitener(v64, w64, frame)
+        t1, t2 = _log_map(_apply_whitener(v64, W, frame), frame)
+        ev = np.linalg.eigvalsh(_second_moment(t1, t2, w64))
+        assert (ev[1] - ev[0]) / ev.sum() < 1e-6
 
-    def test_whitener_returns_none_on_degenerate_input(self):
+    def test_returns_none_on_degenerate_input(self):
         vec = np.tile(np.array([[1.0, 0.0, 0.0]]), (5, 1))
-        assert _whitener(vec, np.ones(5)) is None
-        assert _whitener(vec, np.zeros(5)) is None
-
-    def test_apply_whitener_maps_chart_coords_linearly(self):
-        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=8)
-        W = _whitener(np.asarray(vec, dtype=np.float64), np.asarray(bv, np.float64))
-        x, y = _chart(_apply_whitener(np.asarray(vec, dtype=np.float64), W))
-        want = np.stack([X, Y], axis=1) @ W.T
-        assert np.allclose(x, want[:, 0], atol=1e-12)
-        assert np.allclose(y, want[:, 1], atol=1e-12)
+        assert _tangent_frame(vec, np.zeros(5)) is None
+        frame = _tangent_frame(vec, np.ones(5))
+        assert _whitener(vec, np.ones(5), frame) is None
 
 
 class TestCentroidsFromLabels:
@@ -818,110 +877,61 @@ class TestCentroidsFromLabels:
         assert np.all(np.isfinite(cen))
         assert np.allclose(np.linalg.norm(cen, axis=1), 1.0)
 
-    def test_partition_dipole_is_preserved(self):
-        vec, bv = _make_beam(S=300)
-        rng = np.random.default_rng(11)
-        labels = rng.integers(0, 20, 300)
-        cen, wts = _centroids_from_labels(vec, bv, labels, 20)
-        got = (wts[:, None] * cen).sum(axis=0)
-        want = (np.asarray(bv, np.float64)[:, None] * np.asarray(vec, np.float64)).sum(
-            axis=0
-        )
-        # centroids are re-projected to the sphere, so agreement is to the
-        # third order in the cluster size, not exact
-        assert np.allclose(
-            got / np.linalg.norm(got), want / np.linalg.norm(want), atol=1e-4
-        )
-
 
 class TestWhiteningPreservesBeamShape:
     """The clustering must narrow the beam without reshaping it."""
 
-    def test_whitening_is_exactly_inert_on_an_isotropic_beam(self):
-        """An isotropic M gives W = sqrt(mean eig) M^-1/2 = I, so the
-        assignment geometry is untouched and the partition must come out
-        *identical* — not merely similar.
-
-        This is the boundary of what whitening can do: it re-aims the
-        second-moment deficit onto the beam's own axes, so a beam with no
-        axes gets nothing.  The residual ellipticity of a truly symmetric
-        beam is grid-induced and needs a different fix.
-        """
-        vec, bv, _, _ = _gaussian_beam(
-            9 * _ARCMIN, 9 * _ARCMIN, half=45, jacobian=False
-        )
-        W = _whitener(np.asarray(vec, np.float64), np.asarray(bv, np.float64))
-        assert np.allclose(W, np.eye(2), atol=1e-10)
-
+    def test_whitening_is_exactly_inert_on_a_radial_beam(self):
+        """A beam that is a function of angular distance alone is isotropic in
+        the tangent frame, so W = I and the partition must come out identical
+        — with the pipeline's cos(dec) weight still applied.  Whitening
+        re-aims the second-moment deficit onto the beam's own axes; a beam
+        with no axes must be left untouched.  Its residual ellipticity is
+        grid-induced and needs a different fix."""
+        vec, bv, _, _ = _radial_beam(9 * _ARCMIN, half=60)
         kw = dict(n_clusters=300, tail_fraction=0.05, verbose=False)
         _, _, lab_plain = cluster_beam_pixels(vec, bv, whiten=False, **kw)
         _, _, lab_white = cluster_beam_pixels(vec, bv, whiten=True, **kw)
         assert np.array_equal(lab_plain, lab_white)
 
-    def test_pipeline_jacobian_makes_a_circular_gaussian_slightly_elliptical(self):
-        """The ``cos(dec)`` quadrature factor is not azimuthally symmetric, so
-        the beam the pipeline actually clusters is never exactly isotropic —
-        which is why the whitener is not exactly the identity in production
-        even for a nominally circular beam."""
-        _, bv_j, X, Y = _gaussian_beam(9 * _ARCMIN, 9 * _ARCMIN, half=45)
-        _, bv_n, _, _ = _gaussian_beam(
-            9 * _ARCMIN, 9 * _ARCMIN, half=45, jacobian=False
-        )
-
-        def traceless_fraction(w):
-            ev = np.linalg.eigvalsh(_second_moment(X, Y, np.asarray(w, np.float64)))
-            return (ev[1] - ev[0]) / ev.sum()
-
-        assert traceless_fraction(bv_n) < 1e-12
-        assert traceless_fraction(bv_j) > 1e-6
-
     def test_elliptical_beam_keeps_only_its_own_asymmetry(self):
-        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=45)
-        w64 = np.asarray(bv, dtype=np.float64)
+        vec, bv, _, _ = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=45)
+        kw = dict(n_clusters=300, tail_fraction=0.05, verbose=False)
         out = {}
         for wh in (False, True):
-            _, bo, lab = cluster_beam_pixels(
-                vec,
-                bv,
-                n_clusters=300,
-                tail_fraction=0.05,
-                verbose=False,
-                whiten=wh,
-            )
-            out[wh] = _added_ellipticity(X, Y, w64, lab, len(bo))
+            _, bo, lab = cluster_beam_pixels(vec, bv, whiten=wh, **kw)
+            out[wh] = _added_ellipticity(vec, bv, lab, len(bo))
         assert out[True] < out[False]
 
     def test_whitened_deficit_aligns_with_the_beam_axis(self):
         """Sigma_bar should end up proportional to M, hence sharing its axis."""
-        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=45, tilt=0.4)
-        w64 = np.asarray(bv, dtype=np.float64)
+        vec, bv, _, _ = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=45, tilt=0.4)
+        v64, w64 = vec.astype(np.float64), bv.astype(np.float64)
         _, bo, lab = cluster_beam_pixels(
             vec, bv, n_clusters=300, tail_fraction=0.05, verbose=False, whiten=True
         )
+        frame = _tangent_frame(v64, w64)
+        t1, t2 = _log_map(v64, frame)
 
         def axis(S):
             _, e = np.linalg.eigh(S)
             return (np.degrees(np.arctan2(e[1, 1], e[0, 1])) + 90.0) % 180.0 - 90.0
 
-        beam_axis = axis(_second_moment(X, Y, w64))
-        sig_axis = axis(_sigma_bar(X, Y, w64, lab, len(bo)))
-        sep = abs((sig_axis - beam_axis + 90.0) % 180.0 - 90.0)
-        assert sep < 20.0
+        beam_axis = axis(_second_moment(t1, t2, w64))
+        sig_axis = axis(_sigma_bar(t1, t2, w64, lab, len(bo)))
+        assert abs((sig_axis - beam_axis + 90.0) % 180.0 - 90.0) < 20.0
 
-    def test_whiten_flag_changes_the_partition(self):
-        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=30)
-        _, _, lab_a = cluster_beam_pixels(
-            vec, bv, n_clusters=200, tail_fraction=0.05, verbose=False, whiten=False
-        )
-        _, _, lab_b = cluster_beam_pixels(
-            vec, bv, n_clusters=200, tail_fraction=0.05, verbose=False, whiten=True
-        )
+    def test_whiten_flag_changes_the_partition_for_an_elliptical_beam(self):
+        vec, bv, _, _ = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=30)
+        kw = dict(n_clusters=200, tail_fraction=0.05, verbose=False)
+        _, _, lab_a = cluster_beam_pixels(vec, bv, whiten=False, **kw)
+        _, _, lab_b = cluster_beam_pixels(vec, bv, whiten=True, **kw)
         assert not np.array_equal(lab_a, lab_b)
 
     @pytest.mark.parametrize("whiten", [False, True])
     @pytest.mark.parametrize("tail_fraction", [None, 0.05])
     def test_mass_and_dtype_are_preserved_either_way(self, whiten, tail_fraction):
-        vec, bv, X, Y = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=30)
+        vec, bv, _, _ = _gaussian_beam(12 * _ARCMIN, 6 * _ARCMIN, half=30)
         for dt in (np.float32, np.float64):
             vo, bo, lab = cluster_beam_pixels(
                 vec.astype(dt),

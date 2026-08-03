@@ -134,14 +134,69 @@ def _to_unit(vec: np.ndarray) -> np.ndarray:
     return v / np.where(norms > 0, norms, 1.0)
 
 
-def _chart(vec: np.ndarray) -> tuple:
-    """Beam-frame (RA, Dec) offsets [rad] of unit vectors, the inverse of the
-    ``vec_orig`` construction in ``prepare_beam_data``."""
+# Below this deviation from the identity the whitening is not worth applying:
+# it would displace nodes by less than 1e-9 of a beam radius, which is two
+# orders below the smallest term the error budget resolves, while the map's own
+# round-trip is enough to flip a node across a Voronoi boundary and perturb the
+# partition.  Skipping it makes a symmetric beam reproduce the unwhitened run
+# bit for bit.  Real beams sit at 1e-2, eleven orders above this.
+_WHITEN_MIN_ANISOTROPY = 1e-9
+
+
+def _tangent_frame(vec: np.ndarray, bvals: np.ndarray) -> tuple | None:
+    """Beam-centre direction plus an orthonormal basis of its tangent plane."""
     v = np.asarray(vec, dtype=np.float64)
-    return np.arctan2(v[:, 1], v[:, 0]), np.arcsin(np.clip(v[:, 2], -1.0, 1.0))
+    w = np.asarray(bvals, dtype=np.float64)
+    c = (w[:, None] * v).sum(axis=0)
+    n = float(np.linalg.norm(c))
+    if n <= 0.0:
+        return None
+    c = c / n
+    e1 = np.cross(np.array([0.0, 0.0, 1.0]), c)
+    if np.linalg.norm(e1) < 1e-12:  # centre on a pole: any perpendicular serves
+        e1 = np.cross(np.array([0.0, 1.0, 0.0]), c)
+    e1 = e1 / np.linalg.norm(e1)
+    return c, e1, np.cross(c, e1)
 
 
-def _whitener(vec: np.ndarray, bvals: np.ndarray) -> np.ndarray | None:
+def _log_map(vec: np.ndarray, frame: tuple) -> tuple:
+    """
+    Geodesic-polar (exponential-map) coordinates about the beam centre.
+
+    Distances from the centre are true arc lengths and angles about it are
+    true bearings, so a beam that is a function of angular distance alone has
+    an exactly isotropic second moment here.  The ``(RA, Dec)`` offset chart
+    does not: ``cos rho = cos(dec) cos(RA)`` gives ``rho^2 = x^2 + y^2 -
+    x^2y^2/3``, which turns a perfectly round beam into one with a traceless
+    second moment of relative size ``sigma^2/2``.  Whitening on that would
+    correct an asymmetry the instrument does not have.
+    """
+    c, e1, e2 = frame
+    # Unit norm is load-bearing here, not hygiene: |perp| is compared against
+    # sin(rho) recovered from the dot product, and a norm error d inflates it
+    # by 2d/sin^2(rho) — a factor of 10^4 at half-arcmin separations.
+    v = _to_unit(vec)
+    cos_r = np.clip(v @ c, -1.0, 1.0)
+    rho = np.arccos(cos_r)
+    perp = v - cos_r[:, None] * c[None, :]
+    n = np.linalg.norm(perp, axis=1)
+    scale = np.where(n > 0, rho / np.where(n > 0, n, 1.0), 0.0)
+    return scale * (perp @ e1), scale * (perp @ e2)
+
+
+def _exp_map(t1: np.ndarray, t2: np.ndarray, frame: tuple) -> np.ndarray:
+    """Inverse of :func:`_log_map`: tangent coordinates back onto the sphere."""
+    c, e1, e2 = frame
+    r = np.hypot(t1, t2)
+    s = np.where(r > 0, np.sin(r) / np.where(r > 0, r, 1.0), 1.0)
+    return (
+        np.cos(r)[:, None] * c[None, :]
+        + (s * t1)[:, None] * e1[None, :]
+        + (s * t2)[:, None] * e2[None, :]
+    )
+
+
+def _whitener(vec: np.ndarray, bvals: np.ndarray, frame: tuple) -> np.ndarray | None:
     """
     Map that makes the beam's own second moment isotropic.
 
@@ -152,21 +207,29 @@ def _whitener(vec: np.ndarray, bvals: np.ndarray) -> np.ndarray | None:
     have.  Any other deficit changes the beam's shape, and for a symmetric
     beam manufactures a quadrupole out of nothing.
 
-    In ``u = W x`` with ``W = sqrt(mean eig) M^-1/2`` the beam is circular, so
+    In ``u = W t`` with ``W = sqrt(mean eig) M^-1/2`` the beam is circular, so
     the isotropic distortion k-means minimises is the right functional there.
-    Mapping back, ``Sigma_x = W^-1 Sigma_u W^-T = sigma^2 M`` — proportional by
+    Mapping back, ``Sigma_t = W^-1 Sigma_u W^-T = sigma^2 M`` — proportional by
     construction.  The ``sqrt(mean eig)`` prefactor keeps the angular scale of
     the footprint, which matters only because the assignment runs on the sphere.
+
+    M is formed in the geodesic-polar coordinates of :func:`_log_map`, so a
+    beam that is a function of angular distance alone gives exactly the
+    identity and the clustering is left untouched.
 
     Args:
         vec: (S, 3) beam-pixel unit vectors.
         bvals: (S,) beam weights.
+        frame: tangent frame from :func:`_tangent_frame`.
 
     Returns:
-        (2, 2) float64 whitening matrix, or ``None`` when the beam's second
-        moment is degenerate and the frame is undefined.
+        (2, 2) float64 whitening matrix, or ``None`` when no whitening should
+        be applied — either the beam's second moment is degenerate and the
+        frame is undefined, or the beam is already round to within
+        ``_WHITEN_MIN_ANISOTROPY`` and the caller should use the nodes as they
+        stand.
     """
-    x, y = _chart(vec)
+    t1, t2 = _log_map(vec, frame)
     w = np.asarray(bvals, dtype=np.float64)
     tot = w.sum()
     if tot <= 0:
@@ -174,8 +237,8 @@ def _whitener(vec: np.ndarray, bvals: np.ndarray) -> np.ndarray | None:
     M = (
         np.array(
             [
-                [(w * x * x).sum(), (w * x * y).sum()],
-                [(w * x * y).sum(), (w * y * y).sum()],
+                [(w * t1 * t1).sum(), (w * t1 * t2).sum()],
+                [(w * t1 * t2).sum(), (w * t2 * t2).sum()],
             ]
         )
         / tot
@@ -183,18 +246,18 @@ def _whitener(vec: np.ndarray, bvals: np.ndarray) -> np.ndarray | None:
     ev, evec = np.linalg.eigh(M)
     if ev.min() <= 0 or not np.all(np.isfinite(ev)):
         return None
-    return np.sqrt(ev.mean()) * (evec @ np.diag(ev**-0.5) @ evec.T)
+    W = np.sqrt(ev.mean()) * (evec @ np.diag(ev**-0.5) @ evec.T)
+    if np.abs(W - np.eye(2)).max() < _WHITEN_MIN_ANISOTROPY:
+        return None  # beam already round in this frame — leave it alone
+    return W
 
 
-def _apply_whitener(vec: np.ndarray, W: np.ndarray) -> np.ndarray:
-    """Unit vectors whose chart offsets are ``W`` applied to those of ``vec``."""
-    x, y = _chart(vec)
-    p = np.stack([x, y], axis=1) @ W.T
-    th = np.pi / 2.0 - p[:, 1]
-    return np.stack(
-        [np.sin(th) * np.cos(p[:, 0]), np.sin(th) * np.sin(p[:, 0]), np.cos(th)],
-        axis=-1,
-    )
+def _apply_whitener(vec: np.ndarray, W: np.ndarray, frame: tuple) -> np.ndarray:
+    """Unit vectors whose tangent coordinates are ``W`` applied to those of
+    ``vec``.  ``W = I`` reproduces the input exactly."""
+    t1, t2 = _log_map(vec, frame)
+    p = np.stack([t1, t2], axis=1) @ W.T
+    return _exp_map(p[:, 0], p[:, 1], frame)
 
 
 def _centroids_from_labels(
@@ -429,8 +492,9 @@ def cluster_beam_pixels(
         bvals = beam_vals.astype(np.float64)
         rng = np.random.default_rng(random_state)
 
-        W = _whitener(vec, bvals) if whiten else None
-        vec_assign = _apply_whitener(vec, W) if W is not None else vec
+        frame = _tangent_frame(vec, bvals) if whiten else None
+        W = _whitener(vec, bvals, frame) if frame is not None else None
+        vec_assign = _apply_whitener(vec, W, frame) if W is not None else vec
 
         _, labels = _kmeans_sphere(
             vec_assign, bvals, K, max_iter, tol, rng, verbose=verbose
@@ -498,12 +562,10 @@ def cluster_beam_pixels(
 
         # The whitening frame is set by the whole beam, not by the tail: it is
         # the beam's own second moment that the clustering must not reshape.
-        W = (
-            _whitener(_to_unit(vec_orig), beam_vals.astype(np.float64))
-            if whiten
-            else None
-        )
-        vec_assign = _apply_whitener(vec_t, W) if W is not None else vec_t
+        vec_all, bv_all = _to_unit(vec_orig), beam_vals.astype(np.float64)
+        frame = _tangent_frame(vec_all, bv_all) if whiten else None
+        W = _whitener(vec_all, bv_all, frame) if frame is not None else None
+        vec_assign = _apply_whitener(vec_t, W, frame) if W is not None else vec_t
 
         _, tail_labels = _kmeans_sphere(
             vec_assign,
