@@ -106,6 +106,30 @@ def _kmeans_plus_plus_init(
 # ── Core k-means EM loop ──────────────────────────────────────────────────────
 
 
+def _to_unit(vec: np.ndarray) -> np.ndarray:
+    """
+    Promote beam-pixel vectors to float64 and restore unit norm.
+
+    Assignment ranks candidates by the raw dot product v·c, so a centroid
+    seeded straight from a stored pixel carries that pixel's norm error into
+    the comparison.  Vectors stored in float32 miss unit norm by ~2e-8, while
+    1 - cos(ρ) is only ~1e-8 across a half-arcmin cluster: the norm error would
+    then outrank the angular separation the clustering exists to minimise, and
+    the run would lose a factor of four in intra-cluster scatter.
+
+    Parameters
+    ----------
+    vec : (S, 3) array   beam-pixel vectors in any precision
+
+    Returns
+    -------
+    (S, 3) float64 unit vectors
+    """
+    v = np.asarray(vec, dtype=np.float64)
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    return v / np.where(norms > 0, norms, 1.0)
+
+
 def _kmeans_sphere(
     vec: np.ndarray,
     bvals: np.ndarray,
@@ -121,7 +145,7 @@ def _kmeans_sphere(
 
     Parameters
     ----------
-    vec    : (S, 3) float64  unit vectors (already float64)
+    vec    : (S, 3) float64  unit vectors, norm restored by `_to_unit`
     bvals  : (S,)   float64  beam weights (already float64, need not sum to 1)
     K      : int             number of clusters (must be < S)
     max_iter, tol, rng, label, verbose : as in cluster_beam_pixels
@@ -149,14 +173,16 @@ def _kmeans_sphere(
             ]
         )
 
-        # Reinitialise empty clusters from the pixel farthest from its centroid
-        empty_mask = new_weights == 0
-        if empty_mask.any():
+        # Reinitialise empty clusters from the pixels farthest from their own
+        # centroid — one pixel each, or the empty clusters land on top of one
+        # another, only one of them wins the next assignment, and the rest stay
+        # empty for every remaining iteration.
+        empty = np.where(new_weights == 0)[0]
+        if empty.size:
             cos_to_assigned = sim[np.arange(S), labels]
-            for k in np.where(empty_mask)[0]:
-                idx = int(np.argmin(cos_to_assigned))
-                new_centroids[k] = vec[idx]
-                new_weights[k] = bvals[idx]
+            far = np.argpartition(cos_to_assigned, empty.size - 1)[: empty.size]
+            new_centroids[empty] = vec[far]
+            new_weights[empty] = bvals[far]
 
         norms = np.linalg.norm(new_centroids, axis=1, keepdims=True)
         norms = np.where(norms > 0, norms, 1.0)
@@ -279,7 +305,7 @@ def cluster_beam_pixels(
             return (vec_orig.copy(), beam_vals.copy(), np.arange(S, dtype=np.int32))
 
         t0 = time.time()
-        vec = vec_orig.astype(np.float64)
+        vec = _to_unit(vec_orig)
         bvals = beam_vals.astype(np.float64)
         rng = np.random.default_rng(random_state)
 
@@ -345,7 +371,7 @@ def cluster_beam_pixels(
                 f"    [cluster] Tail has only {n_tail} pixels — kept as-is (K_tail={K_tail})"
             )
     else:
-        vec_t = vec_orig[tail_idx].astype(np.float64)
+        vec_t = _to_unit(vec_orig[tail_idx])
         bv_t = beam_vals[tail_idx].astype(np.float64)
         rng = np.random.default_rng(random_state)
 
