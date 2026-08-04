@@ -263,6 +263,81 @@ def _apply_whitener(vec: np.ndarray, W: np.ndarray, frame: tuple) -> np.ndarray:
     return _exp_map(p[:, 0], p[:, 1], frame)
 
 
+def c4_orbits(di: np.ndarray, dj: np.ndarray) -> tuple:
+    """Group beam-grid nodes into orbits of the 90-degree rotation group C4.
+
+    C4 is the group of rotations by 0, 90, 180 and 270 degrees about the beam
+    centre.  Under ``(di, dj) -> (-dj, di)`` every node off the centre belongs
+    to an orbit of four; the centre node is fixed and forms an orbit of one.
+
+    Clustering one quadrant and copying the partition onto the other three is
+    what removes the ``m = +-2`` error a merged cell would otherwise commit.
+    Ellipticity is a two-fold pattern: rotating an ellipse by 90 degrees swaps
+    its axes, so the four siblings of a cell contribute
+    ``sum_n exp(2i(phi + n*pi/2)) = 0``.  The cancellation is exact and owes
+    nothing to the cluster count or to any threshold — but it needs the beam's
+    own weights to be C4-symmetric, which only a symmetric beam is.
+
+    Args:
+        di: (S,) integer row offsets from the beam-centre pixel.
+        dj: (S,) integer column offsets from the beam-centre pixel.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: ``(orbit, rot)``. ``orbit`` labels the
+        C4 orbit each node belongs to, ``rot`` is which of the four rotations
+        maps the orbit's representative onto that node. Nodes whose orbit is
+        not fully present on the grid get a unique orbit of their own and
+        ``rot = 0``, so they are simply left unmerged.
+    """
+    di = np.asarray(di, dtype=np.int64)
+    dj = np.asarray(dj, dtype=np.int64)
+    rots = [(di, dj), (-dj, di), (-di, -dj), (dj, -di)]
+    # A single integer key per position, valid while |offset| < 2**20.
+    keys = np.stack([a * (1 << 21) + b for a, b in rots])
+    canon = keys.max(axis=0)
+    rot = keys.argmax(axis=0).astype(np.int8)
+
+    present = {int(k): n for n, k in enumerate(keys[0])}
+    closed = np.ones(len(di), dtype=bool)
+    for a, b in rots[1:]:
+        k = a * (1 << 21) + b
+        closed &= np.array([int(x) in present for x in k])
+
+    orbit = np.empty(len(di), dtype=np.int64)
+    _, orbit_closed = np.unique(canon[closed], return_inverse=True)
+    orbit[closed] = orbit_closed
+    n_closed = int(orbit_closed.max()) + 1 if closed.any() else 0
+    orbit[~closed] = n_closed + np.arange(int((~closed).sum()))
+    rot[~closed] = 0
+    return orbit, rot
+
+
+def c4_asymmetry(beam_vals: np.ndarray, orbit: np.ndarray, rot: np.ndarray) -> float:
+    """How far the beam is from invariant under a 90-degree rotation.
+
+    The RMS spread of the weights within each C4 orbit, relative to the peak
+    weight.  A perfectly symmetric beam scores 0; measured values are ~1.5e-3
+    for a symmetric beam carrying detector noise and ~1e-2 for a genuinely
+    asymmetric one, so the two are cleanly separated.
+
+    Args:
+        beam_vals: (S,) beam weights.
+        orbit: (S,) orbit label from :func:`c4_orbits`.
+        rot: (S,) rotation index from :func:`c4_orbits`.
+
+    Returns:
+        float: RMS within-orbit weight spread divided by the peak weight.
+    """
+    w = np.asarray(beam_vals, dtype=np.float64)
+    peak = np.abs(w).max()
+    if peak <= 0 or len(w) == 0:
+        return 0.0
+    n = int(orbit.max()) + 1
+    cnt = np.bincount(orbit, minlength=n)
+    mean = np.bincount(orbit, weights=w, minlength=n) / np.maximum(cnt, 1)
+    return float(np.sqrt(np.mean((w - mean[orbit]) ** 2)) / peak)
+
+
 def _centroids_from_labels(
     vec: np.ndarray, bvals: np.ndarray, labels: np.ndarray, K: int
 ) -> tuple:
@@ -414,6 +489,7 @@ def cluster_beam_pixels(
     random_state: int = 42,
     verbose: bool = True,
     whiten: bool = True,
+    c4: tuple | None = None,
 ) -> tuple:
     """
     Cluster beam pixels into representative centroids using weighted spherical
@@ -469,6 +545,15 @@ def cluster_beam_pixels(
                                     spherical k-means, which manufactures a
                                     grid-aligned ellipticity even from a
                                     perfectly symmetric beam
+    c4            : tuple | None    ``(orbit, rot)`` from :func:`c4_orbits`.
+                                    Clusters one quadrant and copies the
+                                    partition onto the other three by 90°
+                                    rotation, so each cell's ``m = ±2`` error
+                                    is cancelled by its three siblings.  Valid
+                                    only for a beam whose weights are
+                                    90°-invariant; ``None`` disables it.
+                                    Whitening is ignored on this path, being a
+                                    no-op for a beam round enough to use it
 
     Returns
     -------
@@ -526,7 +611,20 @@ def cluster_beam_pixels(
 
     # Split pixels into main (high-power) and tail (low-power).
     # Ascending sort → cumulative sum from the weakest pixel up.
-    sort_idx = np.argsort(beam_vals)  # ascending by weight
+    if c4 is not None:
+        # Rank by the orbit's mean weight, so the four members of an orbit sort
+        # together and the main/tail cut never splits one.  A cut through an
+        # orbit would leave part of a cell unmatched and break the very
+        # cancellation the C4 path exists to get.
+        orbit_all, rot_all = c4
+        n_orb = int(orbit_all.max()) + 1
+        cnt = np.bincount(orbit_all, minlength=n_orb)
+        omean = np.bincount(orbit_all, weights=beam_vals, minlength=n_orb) / np.maximum(
+            cnt, 1
+        )
+        sort_idx = np.lexsort((orbit_all, omean[orbit_all]))
+    else:
+        sort_idx = np.argsort(beam_vals)  # ascending by weight
     cumsum = np.cumsum(beam_vals[sort_idx])  # cumulative power from weakest
 
     # Number of tail pixels: smallest subset whose total weight ≥ tail_fraction.
@@ -534,6 +632,12 @@ def cluster_beam_pixels(
     # i.e. k is already the count of pixels needed (unambiguous when cumsum[k] == tail_fraction).
     n_tail = int(np.searchsorted(cumsum, tail_fraction, side="right"))
     n_tail = max(1, min(n_tail, S - 1))  # keep at least 1 main pixel
+
+    if c4 is not None:
+        # Advance the cut to the next orbit boundary so no orbit straddles it.
+        ordered = orbit_all[sort_idx]
+        while 0 < n_tail < S - 1 and ordered[n_tail] == ordered[n_tail - 1]:
+            n_tail += 1
 
     tail_idx = sort_idx[:n_tail]  # (n_tail,)  low-power pixels
     main_idx = sort_idx[n_tail:]  # (n_main,)  high-power pixels, ascending
@@ -558,6 +662,49 @@ def cluster_beam_pixels(
             print(
                 f"    [cluster] Tail has only {n_tail} pixels — kept as-is (K_tail={K_tail})"
             )
+    elif c4 is not None:
+        # ── C4 mode: cluster one quadrant, rotate the partition onto the
+        # other three.  Every cell then has three siblings at 90, 180 and 270
+        # degrees, whose m = +-2 contributions cancel against it exactly.
+        vec_t = _to_unit(vec_orig[tail_idx])
+        bv_t = beam_vals[tail_idx].astype(np.float64)
+        orbit_t, rot_t = orbit_all[tail_idx], rot_all[tail_idx]
+        rng = np.random.default_rng(random_state)
+
+        fd = rot_t == 0  # the fundamental domain: one representative per orbit
+        _, orbit_c = np.unique(orbit_t, return_inverse=True)
+        K_fd = max(1, min(K_tail // 4, int(fd.sum())))
+
+        if K_fd >= int(fd.sum()):
+            base_of_orbit = np.empty(orbit_c.max() + 1, dtype=np.int64)
+            base_of_orbit[orbit_c[fd]] = np.arange(int(fd.sum()))
+        else:
+            # Whitening is a no-op on a beam round enough for the C4 path and
+            # would only perturb the partition, so the quadrant is clustered
+            # in the original frame.
+            _, lab_fd = _kmeans_sphere(
+                vec_t[fd],
+                bv_t[fd],
+                K_fd,
+                max_iter,
+                tol,
+                rng,
+                label=" tail/C4",
+                verbose=verbose,
+            )
+            base_of_orbit = np.empty(orbit_c.max() + 1, dtype=np.int64)
+            base_of_orbit[orbit_c[fd]] = lab_fd
+
+        tail_labels = base_of_orbit[orbit_c] * 4 + rot_t.astype(np.int64)
+        _, tail_labels = np.unique(tail_labels, return_inverse=True)
+        K_tail = int(tail_labels.max()) + 1
+        if verbose:
+            print(
+                f"    [cluster] C4 tail: {n_tail} → {K_tail} clusters "
+                f"({int(fd.sum())} quadrant nodes → {K_fd} × 4)"
+            )
+        centroids_t, cw_t = _centroids_from_labels(vec_t, bv_t, tail_labels, K_tail)
+        vec_tail, bv_tail = centroids_t, cw_t
     else:
         vec_t = _to_unit(vec_orig[tail_idx])
         bv_t = beam_vals[tail_idx].astype(np.float64)

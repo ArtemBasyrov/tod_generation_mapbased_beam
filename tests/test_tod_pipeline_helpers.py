@@ -270,7 +270,9 @@ class TestApplyBeamClustering:
 
         called = {}
 
-        def fake_cluster(vec_orig, beam_vals, n_clusters, tail_fraction, whiten=True):
+        def fake_cluster(
+            vec_orig, beam_vals, n_clusters, tail_fraction, whiten=True, c4=None
+        ):
             called["args"] = (
                 vec_orig.shape,
                 beam_vals.shape,
@@ -278,6 +280,7 @@ class TestApplyBeamClustering:
                 tail_fraction,
             )
             called["whiten"] = whiten
+            called["c4"] = c4
             return v_out, bv_out, labels
 
         monkeypatch.setattr(pph, "cluster_beam_pixels", fake_cluster)

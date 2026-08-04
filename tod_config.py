@@ -136,6 +136,27 @@ beam_cluster_tail_fraction = _cfg.get("beam_cluster_tail_fraction", None)
 # n_clusters) rather than guessing.
 beam_cluster_whiten = bool(_cfg.get("beam_cluster_whiten", True))
 
+# beam_symmetric : bool — declare the beam to be a function of angular distance
+# alone.  Clustering merges beam nodes, and a merged cell is a small anisotropic
+# smear: it makes the effective beam slightly elliptical even when the real one
+# is round.  That manufactured m = ±2 is what sources T→P leakage, and unlike
+# the interpolation kernel it is NOT in the mapmaker's forward model, so it
+# survives into the maps.
+#
+# With this set, clustering groups one quadrant of the beam and copies the
+# partition onto the other three by 90° rotation.  Every cell then has three
+# siblings whose m = ±2 contributions cancel it exactly, since rotating an
+# ellipse by 90° swaps its axes.  Measured on the SAT 90 GHz symmetric beam,
+# the manufactured ellipticity drops from 5.2× the beam's own residual to
+# 0.035× of it, at unchanged node count.
+#
+# Only declare this for a beam that really is symmetric.  The cancellation
+# needs the beam's own weights to be 90°-invariant, and on a genuinely
+# asymmetric beam the construction both fails to help and costs node
+# reduction.  The measured C4 asymmetry is printed at load so the choice can be
+# checked (~1e-4 symmetric, ~1e-2 asymmetric), but it is not enforced.
+beam_symmetric = bool(_cfg.get("beam_symmetric", False))
+
 clustering_calibration_enabled = _cfg.get("clustering_calibration_enabled", False)
 # B_ell divergence bound. B_ell depends on each beam node only through its
 # angular distance from the centre, so it is the m = 0 harmonic alone and no

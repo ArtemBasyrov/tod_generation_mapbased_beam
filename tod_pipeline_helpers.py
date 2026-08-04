@@ -23,7 +23,12 @@ import tod_config as config
 from tod_io import load_beam
 from tod_beam_math import _compute_dB_threshold_from_power
 from tod_spin2 import compute_spin2_skip_z_threshold
-from beam_cluster import cluster_beam_pixels, cluster_cached_arrays
+from beam_cluster import (
+    c4_asymmetry,
+    c4_orbits,
+    cluster_beam_pixels,
+    cluster_cached_arrays,
+)
 
 
 def prepare_beam_data(beam_filenames, active_fields=None):
@@ -141,6 +146,25 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             "n_sel": int(sel.sum()),
             "vec_orig": vec_orig,
         }
+
+        if config.beam_symmetric:
+            # Grid offsets from the beam-centre pixel, in the same convention
+            # load_beam used to centre the RA/Dec offsets.
+            H, W = weighted_map.shape
+            ci = config.beam_center_x if config.beam_center_x is not None else H // 2
+            cj = config.beam_center_y if config.beam_center_y is not None else W // 2
+            gi, gj = np.divmod(np.arange(weighted_map.size)[sel.ravel()], W)
+            orbit, rot = c4_orbits(gi - ci, gj - cj)
+            beam_data[bf]["c4"] = (orbit, rot)
+            # Reported, not enforced. The cancellation degrades smoothly as the
+            # beam departs from 90-degree symmetry, so this is the number that
+            # says whether the path was worth taking: ~1e-4 for a symmetric
+            # beam, ~1e-2 for a genuinely asymmetric one, where the
+            # construction also costs node reduction.
+            print(
+                f"  Beam {bf}: quadrant clustering on, C4 asymmetry "
+                f"{c4_asymmetry(beam_vals, orbit, rot):.2e}"
+            )
         print(f"  Beam {bf}: {sel.sum()} selected pixels")
 
     return beam_data
@@ -182,6 +206,7 @@ def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None, whiten=None
             n_clusters=n_clusters,
             tail_fraction=tail_fraction,
             whiten=whiten,
+            c4=data.get("c4"),
         )
         K = len(bv_out)
 
