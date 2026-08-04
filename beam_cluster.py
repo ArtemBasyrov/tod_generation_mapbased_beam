@@ -134,13 +134,16 @@ def _to_unit(vec: np.ndarray) -> np.ndarray:
     return v / np.where(norms > 0, norms, 1.0)
 
 
-# Below this deviation from the identity the whitening is not worth applying:
-# it would displace nodes by less than 1e-9 of a beam radius, which is two
-# orders below the smallest term the error budget resolves, while the map's own
-# round-trip is enough to flip a node across a Voronoi boundary and perturb the
-# partition.  Skipping it makes a symmetric beam reproduce the unwhitened run
-# bit for bit.  Real beams sit at 1e-2, eleven orders above this.
-_WHITEN_MIN_ANISOTROPY = 1e-9
+# Below this deviation from the identity the whitening is skipped, so that a
+# beam with no ellipticity to correct reproduces the unwhitened partition.  The
+# threshold must clear the anisotropy a round beam only *appears* to have from
+# finite-precision storage: a float32-stored 30' symmetric beam measures
+# |W - I| ~ 1e-9, so a 1e-9 guard is decided by rounding rather than by the
+# beam.  1e-6 sits three orders above that floor and four below the roundest
+# real beam measured here (SAT 90 GHz, |W - I| = 9.6e-3).  It is a shape
+# threshold, not an accuracy one: an unwhitened run on a beam this round adds
+# an ellipticity of eps_beam * tr(Sigma_bar), which 1e-6 makes negligible.
+_WHITEN_MIN_ANISOTROPY = 1e-6
 
 
 def _tangent_frame(vec: np.ndarray, bvals: np.ndarray) -> tuple | None:
