@@ -120,13 +120,17 @@ class TestRotationParams:
         assert cos_p.shape == (B,)
         assert sin_p.shape == (B,)
 
-    def test_all_float32(self):
-        """All returned arrays have dtype float32."""
+    def test_all_working_precision(self):
+        """All returned arrays carry the configured working precision."""
+        import tod_config
+
         B = 5
         rot_vecs, phi_b, theta_b, psis_b = self._make_inputs(B)
         outputs = _rotation_params(rot_vecs, phi_b, theta_b, psis_b)
         for arr in outputs:
-            assert arr.dtype == np.float32, f"Expected float32, got {arr.dtype}"
+            assert arr.dtype == tod_config.precision_dtype, (
+                f"Expected {tod_config.precision_dtype}, got {arr.dtype}"
+            )
 
     def test_zero_rot_vecs(self):
         """Zero rot_vecs produce axes=0, cos_a=1, sin_a=0."""
@@ -447,12 +451,14 @@ class TestRecenterAndRotate:
         out = _recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
         assert out.shape == (B, S, 3)
 
-    def test_output_dtype_float32(self):
-        """Output dtype is float32."""
+    def test_output_dtype_is_working_precision(self):
+        """Output dtype follows the configured working precision."""
+        import tod_config
+
         B, S = 3, 8
         vec_orig, rot_vecs, phi_b, theta_b, psis = self._make_inputs(B, S)
         out = _recenter_and_rotate(vec_orig, rot_vecs, phi_b, theta_b, psis)
-        assert out.dtype == np.float32
+        assert out.dtype == tod_config.precision_dtype
 
     def test_identity_zero_rot_vecs_zero_psis(self):
         """Zero rot_vecs and zero psis leave vec_orig unchanged (broadcast over B)."""

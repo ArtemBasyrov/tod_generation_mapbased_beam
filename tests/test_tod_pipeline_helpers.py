@@ -38,6 +38,7 @@ import numpy.testing as npt
 import pytest
 import yaml
 
+import tod_config
 import tod_pipeline_helpers as pph
 
 
@@ -215,7 +216,7 @@ class TestPrepareBeamData:
         npt.assert_allclose(dec_node, ra_node.T, atol=1e-6)
 
     def test_vec_orig_dtype_and_unit_norm(self, monkeypatch):
-        """vec_orig is float32 and rows have unit norm."""
+        """vec_orig carries the working precision and rows have unit norm."""
         ra, dec, pm = _make_gaussian_beam(n=21)
         self._install_fake_load_beam(monkeypatch, ra, dec, pm)
         _patch_tod_config(
@@ -227,7 +228,7 @@ class TestPrepareBeamData:
 
         beam_data = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])
         v = beam_data["b.fits"]["vec_orig"]
-        assert v.dtype == np.float32
+        assert v.dtype == tod_config.precision_dtype
         norms = np.linalg.norm(v.astype(np.float64), axis=1)
         npt.assert_allclose(norms, 1.0, atol=1e-6)
 
@@ -269,13 +270,14 @@ class TestApplyBeamClustering:
 
         called = {}
 
-        def fake_cluster(vec_orig, beam_vals, n_clusters, tail_fraction):
+        def fake_cluster(vec_orig, beam_vals, n_clusters, tail_fraction, whiten=True):
             called["args"] = (
                 vec_orig.shape,
                 beam_vals.shape,
                 n_clusters,
                 tail_fraction,
             )
+            called["whiten"] = whiten
             return v_out, bv_out, labels
 
         monkeypatch.setattr(pph, "cluster_beam_pixels", fake_cluster)

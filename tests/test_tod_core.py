@@ -110,7 +110,9 @@ class TestBeamTodBatch:
         }
 
     def test_output_keys_shape_dtype(self):
-        """Output is a dict with exactly comp_indices keys; each value is shape (B,) float32."""
+        """Output has exactly comp_indices keys, each (B,) in the working precision."""
+        import tod_config
+
         nside = 32
         B = 5
         data = self._build_data(S=30)
@@ -122,7 +124,9 @@ class TestBeamTodBatch:
         assert set(tod.keys()) == set(data["comp_indices"])
         for comp in data["comp_indices"]:
             assert tod[comp].shape == (B,), f"Wrong shape for comp={comp}"
-            assert tod[comp].dtype == np.float32, f"Wrong dtype for comp={comp}"
+            assert tod[comp].dtype == tod_config.precision_dtype, (
+                f"Wrong dtype for comp={comp}"
+            )
 
     def test_constant_sky_map_gives_ones(self):
         """Constant (all-ones) sky map with normalised beam gives tod ≈ 1.0 for all comps."""

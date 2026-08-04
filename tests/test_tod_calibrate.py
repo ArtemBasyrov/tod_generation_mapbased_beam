@@ -217,6 +217,7 @@ def _mock_cluster_pixels(
     tol=1e-5,
     random_state=42,
     verbose=True,
+    whiten=True,
 ):
     """Deterministic cluster_beam_pixels stub (no k-means EM).
 
@@ -228,7 +229,8 @@ def _mock_cluster_pixels(
         bvals (np.ndarray): (S,) beam weights.
         n_clusters (int): Requested cluster count.
         tail_fraction (float | None): Fraction of power treated as tail.
-        max_iter, tol, random_state, verbose: Unused; accepted for signature compat.
+        max_iter, tol, random_state, verbose, whiten: Unused; accepted for
+            signature compat.
 
     Returns:
         tuple: (vec_out, bvals_out, labels) with shapes (K_out, 3), (K_out,), (S,).
@@ -409,8 +411,11 @@ class TestCalibrateBeamClustering:
     """
 
     # Hard-coded grid values copied from calibrate_beam_clustering source.
+    # The cluster-count grid is derived from each beam's own crossover K_x
+    # unless overridden, so tests that assert grid membership pass this
+    # explicitly rather than mirroring an internal default.
     _TAIL_FRACTIONS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
-    _N_CLUSTERS_LIST = (10, 20, 50, 100, 200, 500, 1000, 2000)
+    _N_CLUSTERS_LIST = (2, 5, 10, 20)
 
     # ── stub helpers ──────────────────────────────────────────────────────
 
@@ -468,24 +473,83 @@ class TestCalibrateBeamClustering:
 
     # ── basic return-value tests ──────────────────────────────────────────
 
-    def test_returns_tuple_float_int(self):
-        """Return value is a (float, int) 2-tuple."""
+    def test_returns_tuple_float_int_bool(self):
+        """Return value is a (float, int, bool) 3-tuple."""
         with self._patched():
-            tf, K = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+            tf, K, wh = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
         assert isinstance(tf, float)
         assert isinstance(K, int)
+        assert isinstance(wh, bool)
 
     def test_tail_fraction_in_search_grid(self):
         """Returned tail_fraction is one of the internally defined grid values."""
         with self._patched():
-            tf, _ = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+            tf, _, _ = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
         assert tf in self._TAIL_FRACTIONS
 
     def test_n_clusters_in_search_grid(self):
-        """Returned n_clusters is one of the internally defined grid values."""
+        """Returned n_clusters comes from the supplied cluster-count grid."""
         with self._patched():
-            _, K = calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+            _, K, _ = calibrate_beam_clustering(
+                _fake_beam_data(),
+                ".",
+                0,
+                _fake_mp(),
+                n_clusters_list=self._N_CLUSTERS_LIST,
+            )
         assert K in self._N_CLUSTERS_LIST
+
+    def test_whiten_axis_is_swept(self):
+        """Both whiten settings reach cluster_beam_pixels by default."""
+        with self._patched() as (m_cluster, _):
+            calibrate_beam_clustering(
+                _fake_beam_data(),
+                ".",
+                0,
+                _fake_mp(),
+                n_clusters_list=self._N_CLUSTERS_LIST,
+            )
+        seen = {call.kwargs.get("whiten") for call in m_cluster.call_args_list}
+        assert seen == {False, True}
+
+    def test_whiten_axis_can_be_pinned(self):
+        """A single-element whiten_options pins the choice and halves the sweep."""
+        with self._patched() as (m_cluster, _):
+            _, _, wh = calibrate_beam_clustering(
+                _fake_beam_data(),
+                ".",
+                0,
+                _fake_mp(),
+                n_clusters_list=self._N_CLUSTERS_LIST,
+                whiten_options=(False,),
+            )
+        assert wh is False
+        assert {call.kwargs.get("whiten") for call in m_cluster.call_args_list} == {
+            False
+        }
+
+    def test_empty_whiten_options_rejected(self):
+        """An empty whiten axis is a configuration error, not a silent default."""
+        with pytest.raises(ValueError, match="whiten_options"):
+            calibrate_beam_clustering(
+                _fake_beam_data(), ".", 0, _fake_mp(), whiten_options=()
+            )
+
+    def test_cluster_grid_tracks_k_crossover(self):
+        """Without an override the grid is built around the beam's own K_x.
+
+        The stub beam has uniform weights, so every node is already its own
+        optimal cell and K_x equals n_tail. The grid must then span roughly
+        0.1 to 4 times that, and never request more clusters than the tail has
+        nodes.
+        """
+        with self._patched() as (m_cluster, _):
+            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+        requested = sorted({c.kwargs["n_clusters"] for c in m_cluster.call_args_list})
+        assert requested, "sweep requested no clustering at all"
+        # n_tail <= S - 1 for the stub beam, so nothing may exceed it.
+        assert max(requested) < _C_S
+        assert min(requested) >= 1
 
     # ── side-effect freedom ───────────────────────────────────────────────
 
@@ -507,25 +571,30 @@ class TestCalibrateBeamClustering:
         """When B_ell divergence=0 everywhere, the pair with the highest speedup
         is chosen (every pair qualifies with a permissive threshold)."""
         with self._patched():
-            tf, K = calibrate_beam_clustering(
+            tf, K, _ = calibrate_beam_clustering(
                 _fake_beam_data(),
                 ".",
                 0,
                 _fake_mp(),
                 error_threshold=1.0,  # accept everything
+                n_clusters_list=self._N_CLUSTERS_LIST,
             )
         assert tf in self._TAIL_FRACTIONS
         assert K in self._N_CLUSTERS_LIST
 
-    def test_fallback_on_all_fail_returns_min_error(self, capsys):
-        """When every clustered (tf, K) pair exceeds error_threshold, entries
-        where K_req >= n_tail short-circuit with bell_div=0.0 and still pass.
-        The function returns a valid result without a WARNING.
+    def test_fallback_on_all_fail_warns(self, capsys):
+        """When every clustering that actually reduces the node count exceeds
+        error_threshold, the calibrator must warn.
+
+        Entries where K_req >= n_tail short-circuit with bell_div = 0.0 and
+        q2 = 0.0 because no nodes are merged. Those rows measure nothing, so
+        they are excluded from the bounds: counting them would let a sweep in
+        which every real candidate failed report success, and would drive the
+        added-ellipticity floor to zero and switch the m = ±2 gate off.
 
         The first compute_bell call (reference) returns bell=1; all subsequent
         calls (clustered) return bell=0.5, giving a non-zero divergence for the
-        clustered entries that are actually evaluated.  Short-circuited entries
-        (K_req >= n_tail) are never evaluated and record bell_div=0.0 directly.
+        clustered entries that are actually evaluated.
         """
         call_count = [0]
 
@@ -542,26 +611,29 @@ class TestCalibrateBeamClustering:
             return ell, bell
 
         with self._patched(bell_side_effect=_bell_nonzero):
-            tf, K = calibrate_beam_clustering(
+            tf, K, wh = calibrate_beam_clustering(
                 _fake_beam_data(),
                 ".",
                 0,
                 _fake_mp(),
                 error_threshold=1e-10,
+                n_clusters_list=self._N_CLUSTERS_LIST,
             )
 
         captured = capsys.readouterr()
-        # Short-circuited entries (K_req >= n_tail) always have bell_div=0.0 and
-        # pass any non-negative threshold, so WARNING is never printed.
-        assert "WARNING" not in captured.out
-        assert isinstance(tf, float) and isinstance(K, int)
+        assert "WARNING" in captured.out
+        assert isinstance(tf, float) and isinstance(K, int) and isinstance(wh, bool)
         assert tf in self._TAIL_FRACTIONS
         assert K in self._N_CLUSTERS_LIST
 
     def test_strict_threshold_triggers_fallback(self, capsys):
-        """With error_threshold=0.0, short-circuited entries (K_req >= n_tail)
-        have bell_div=0.0 which passes the threshold exactly, so the function
-        returns a valid result without a WARNING."""
+        """error_threshold=0.0 rejects every clustering that reduces anything,
+        so the calibrator falls back on the least added ellipticity and warns.
+
+        A short-circuited entry has bell_div = 0.0, which passes a zero
+        threshold exactly. Such entries no longer count as passing, since they
+        clustered nothing.
+        """
         call_count = [0]
 
         def _bell_nonzero(
@@ -577,17 +649,18 @@ class TestCalibrateBeamClustering:
             return ell, bell
 
         with self._patched(bell_side_effect=_bell_nonzero):
-            tf, K = calibrate_beam_clustering(
+            tf, K, wh = calibrate_beam_clustering(
                 _fake_beam_data(),
                 ".",
                 0,
                 _fake_mp(),
                 error_threshold=0.0,
+                n_clusters_list=self._N_CLUSTERS_LIST,
             )
 
         captured = capsys.readouterr()
-        assert "WARNING" not in captured.out
-        assert isinstance(tf, float) and isinstance(K, int)
+        assert "WARNING" in captured.out
+        assert isinstance(tf, float) and isinstance(K, int) and isinstance(wh, bool)
 
     def test_permissive_threshold_no_warning(self, capsys):
         """A threshold of 1.0 (all pass) must not print a WARNING."""
@@ -605,8 +678,9 @@ class TestCalibrateBeamClustering:
     def test_backward_compat_optional_args(self):
         """folder_scan / probe_day / mp are now optional; call without them."""
         with self._patched():
-            tf, K = calibrate_beam_clustering(_fake_beam_data())
+            tf, K, wh = calibrate_beam_clustering(_fake_beam_data())
         assert isinstance(tf, float) and isinstance(K, int)
+        assert isinstance(wh, bool)
 
 
 # ===========================================================================
