@@ -44,6 +44,53 @@ def _second_moment(t1, t2, w):
     )
 
 
+def _k_crossover(beam_vals, n_tail):
+    """Cluster count at which the optimal quantizer cell shrinks to one node.
+
+    Clustering has two regimes, and which one a configuration sits in decides
+    both how fast the error falls with the cluster budget and whether whitened
+    assignment helps at all.
+
+    Below the crossover the cells are large compared with the node grid, the
+    continuum (Zador) optimum applies, and the within-cluster scatter falls as
+    ``1/K``.  Above it the optimum asks for cells smaller than one grid cell,
+    which cannot be delivered: the inner tail degenerates into one-node cells
+    of zero scatter and each extra centroid instead pushes that singleton
+    boundary outward into steeply falling beam power, so the error falls
+    exponentially.  Cells above the crossover are pinned to the node lattice
+    rather than free to take the shape an anisotropic distortion measure asks
+    for, which is why whitened assignment stops paying there.
+
+    The crossover is where the singleton region closes.  Equating the centroid
+    budget at that point gives ``K_x = S(B_cut) / (a^2 sqrt(B_cut))`` with
+    ``S(B) = int sqrt(B) dOmega`` over the clustered region.  Written in the
+    normalised node weights ``w_s`` the grid spacing cancels, which is what
+    makes this evaluable for an arbitrary beam:
+
+        K_x = sum_{s in tail} sqrt(w_s) / sqrt(max_{s in tail} w_s).
+
+    A Gaussian beam collapses this to ``2 * P / a^2`` with
+    ``P = 2 * pi * sigma_x * sigma_y``, independent of the tail fraction.  Real
+    beams are not Gaussian and their crossover does move with the tail
+    fraction, so it is measured here rather than taken from a fitted width.
+
+    Args:
+        beam_vals: (S,) beam weights, any normalisation.
+        n_tail: number of lowest-weight nodes forming the clustered tail.
+
+    Returns:
+        float: the crossover cluster count, or 0.0 for an empty tail.
+    """
+    w = np.asarray(beam_vals, dtype=np.float64)
+    if n_tail <= 0 or w.size == 0:
+        return 0.0
+    tail = np.sort(w)[:n_tail]
+    w_cut = tail[-1]
+    if w_cut <= 0:
+        return 0.0
+    return float(np.sqrt(np.clip(tail, 0.0, None)).sum() / np.sqrt(w_cut))
+
+
 def _beam_quadrupole(vec_orig, beam_vals, lmax):
     """The beam's OWN quadrupole modulation ``q2 = l^2 |M_traceless| / 4``.
 
@@ -520,9 +567,10 @@ def calibrate_beam_clustering(
     interp_mode="bilinear",
     tail_fractions=None,
     n_clusters_list=None,
+    whiten_options=(False, True),
 ):
-    """Find (tail_fraction, n_clusters) maximising speedup within the error
-        budget.
+    """Find (tail_fraction, n_clusters, whiten) maximising speedup within the
+        error budget.
 
         Two bounds are enforced, because they are sensitive to different harmonics
         and neither implies the other.
@@ -547,25 +595,42 @@ def calibrate_beam_clustering(
         The table also carries ``q2`` as a fraction of the beam's own quadrupole,
         which is the number to compare against a leakage budget.
 
+        ``whiten_options`` is the third axis.  Whitened assignment is
+        shape-preserving only below the crossover cluster count ``K_x``
+        (:func:`_k_crossover`), and above it it loses on *both* harmonics.
+        Where that boundary falls depends on the beam and the node grid
+        together, so it is swept rather than predicted.  Pass a single-element
+        tuple to pin the choice and halve the sweep.
+
         Computes reference B_ell (power_cut=1.0) from unclustered beam, then
-        sweeps a (tail_fraction × n_clusters) grid. The pair maximising
-        speedup subject to both bounds wins; if no pair qualifies, the pair with
+        sweeps a (tail_fraction × n_clusters × whiten) grid. The point maximising
+        speedup subject to both bounds wins; if none qualifies, the point with
         the smallest added ellipticity is returned with a warning.
 
         ``tail_fractions`` overrides the default tail-fraction grid — e.g. to
         enforce a lower bound derived from the noise floor of a measured beam,
         so that the exactly-kept main-lobe pixels stay signal-dominated.
-        ``n_clusters_list`` overrides the default cluster-count grid — e.g. to
-        probe beyond 2000 clusters when the error budget is tight.
+        ``n_clusters_list`` overrides the cluster-count grid.  Left at ``None``
+        the grid is built per tail fraction around that beam's own ``K_x``,
+        spanning ``0.1`` to ``4`` times it, so both regimes are sampled and the
+        exponential leg above ``K_x`` is reachable.  A fixed grid cannot do
+        this: ``K_x`` varies by a factor of four across tail fractions on a real
+        beam, and the cluster count a tight error budget needs sits above the
+        crossover, where a grid capped below it would never look.
+
+    Returns:
+        tuple[float, int, bool]: the chosen ``(tail_fraction, n_clusters,
+        whiten)``.
     """
     if tail_fractions is None:
         tail_fractions = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.30)
     else:
         tail_fractions = tuple(sorted(float(tf) for tf in tail_fractions))
-    if n_clusters_list is None:
-        n_clusters_list = (10, 20, 50, 100, 200, 500, 1000, 2000)
-    else:
+    if n_clusters_list is not None:
         n_clusters_list = tuple(sorted(int(k) for k in n_clusters_list))
+    whiten_options = tuple(dict.fromkeys(bool(w) for w in whiten_options))
+    if not whiten_options:
+        raise ValueError("whiten_options must contain at least one value")
 
     if bell_lmax is None:
         if mp is not None:
@@ -619,55 +684,107 @@ def calibrate_beam_clustering(
             n_tail = int(np.searchsorted(cumsum, tf, side="right"))
             n_tail_per_bf_tf[bf][tf] = max(1, min(n_tail, S - 1))
 
+    # The crossover cluster count separates the two error regimes and decides
+    # whether whitening can work, so it sets where the sweep looks.  It is the
+    # most constraining beam's value, and it moves with the tail fraction.
+    k_cross_per_tf = {
+        tf: max(
+            (
+                _k_crossover(data["beam_vals"], n_tail_per_bf_tf[bf][tf])
+                for bf, data in beam_data.items()
+            ),
+            default=0.0,
+        )
+        for tf in tail_fractions
+    }
+
+    def _k_grid(tf):
+        """Cluster counts to try at this tail fraction."""
+        if n_clusters_list is not None:
+            return n_clusters_list
+        n_tail_min = min(n_tail_per_bf_tf[bf][tf] for bf in beam_data)
+        kx = k_cross_per_tf[tf]
+        if kx <= 0:
+            return (max(1, n_tail_min - 1),)
+        grid = np.unique(np.round(kx * np.geomspace(0.1, 4.0, 8)).astype(int))
+        grid = grid[(grid >= 1) & (grid < n_tail_min)]
+        return tuple(int(k) for k in grid) or (max(1, n_tail_min - 1),)
+
     print("[clust_calib] Sweeping clustering parameters …")
+    print(
+        "[clust_calib] K_x (crossover) per tail fraction: "
+        + ", ".join(f"{tf:g}→{k_cross_per_tf[tf]:.0f}" for tf in tail_fractions)
+    )
     results = []
     for tf in tail_fractions:
-        for K_req in n_clusters_list:
-            K_out_per_bf = {}
-            bell_divs = []
-            q2s = []
-            for bf, data in beam_data.items():
-                n_tail = n_tail_per_bf_tf[bf][tf]
-                if K_req >= n_tail:
-                    # Tail already fits in K_req clusters — no reduction possible.
-                    K_out_per_bf[bf] = S_bf[bf]
-                    bell_divs.append(0.0)
-                    q2s.append(0.0)
-                    continue
-                vec_c, bv_c, labels_c = cluster_beam_pixels(
-                    data["vec_orig"],
-                    data["beam_vals"],
-                    n_clusters=K_req,
-                    tail_fraction=tf,
-                    verbose=False,
-                )
-                K_out_per_bf[bf] = len(bv_c)
-                bell_clust = _bell_from_vecs(vec_c, bv_c)
-                bell_ref = ref_bells[bf]
-                ref_rms = float(np.sqrt(np.mean(bell_ref**2)))
-                bell_div = float(np.sqrt(np.mean((bell_clust - bell_ref) ** 2))) / (
-                    ref_rms + 1e-30
-                )
-                bell_divs.append(bell_div)
-                _, q2 = _clustering_shape_error(
-                    data["vec_orig"],
-                    data["beam_vals"],
-                    labels_c,
-                    len(bv_c),
-                    bell_lmax,
-                )
-                q2s.append(q2)
+        for K_req in _k_grid(tf):
+            for whiten in whiten_options:
+                K_out_per_bf = {}
+                bell_divs = []
+                q2s = []
+                reduced = True
+                for bf, data in beam_data.items():
+                    n_tail = n_tail_per_bf_tf[bf][tf]
+                    if K_req >= n_tail:
+                        # Tail already fits in K_req clusters — no reduction
+                        # possible, so this row measures nothing.
+                        K_out_per_bf[bf] = S_bf[bf]
+                        bell_divs.append(0.0)
+                        q2s.append(0.0)
+                        reduced = False
+                        continue
+                    vec_c, bv_c, labels_c = cluster_beam_pixels(
+                        data["vec_orig"],
+                        data["beam_vals"],
+                        n_clusters=K_req,
+                        tail_fraction=tf,
+                        verbose=False,
+                        whiten=whiten,
+                    )
+                    K_out_per_bf[bf] = len(bv_c)
+                    bell_clust = _bell_from_vecs(vec_c, bv_c)
+                    bell_ref = ref_bells[bf]
+                    ref_rms = float(np.sqrt(np.mean(bell_ref**2)))
+                    bell_div = float(np.sqrt(np.mean((bell_clust - bell_ref) ** 2))) / (
+                        ref_rms + 1e-30
+                    )
+                    bell_divs.append(bell_div)
+                    _, q2 = _clustering_shape_error(
+                        data["vec_orig"],
+                        data["beam_vals"],
+                        labels_c,
+                        len(bv_c),
+                        bell_lmax,
+                    )
+                    q2s.append(q2)
 
-            mean_bell_div = float(np.mean(bell_divs))
-            max_q2 = float(np.max(q2s))
-            speedup = float(np.mean([S_bf[bf] / K_out_per_bf[bf] for bf in beam_data]))
-            K_out_repr = int(np.mean(list(K_out_per_bf.values())))
-            results.append((tf, K_req, K_out_repr, speedup, mean_bell_div, max_q2))
+                mean_bell_div = float(np.mean(bell_divs))
+                max_q2 = float(np.max(q2s))
+                speedup = float(
+                    np.mean([S_bf[bf] / K_out_per_bf[bf] for bf in beam_data])
+                )
+                K_out_repr = int(np.mean(list(K_out_per_bf.values())))
+                results.append(
+                    (
+                        tf,
+                        K_req,
+                        whiten,
+                        K_out_repr,
+                        speedup,
+                        mean_bell_div,
+                        max_q2,
+                        reduced,
+                        K_req / k_cross_per_tf[tf] if k_cross_per_tf[tf] > 0 else 0.0,
+                    )
+                )
 
     # The achievable floor is measured, not assumed: it is the least added
     # ellipticity anywhere in the sweep that already meets the m = 0 bound.
-    ok_m0 = [r for r in results if r[4] <= error_threshold]
-    q2_floor = min((r[5] for r in ok_m0), default=0.0)
+    # Rows that clustered nothing are excluded: they score q2 = 0 because no
+    # nodes were merged, and a single one would drag the floor to zero and
+    # switch the m = ±2 gate off without saying so.
+    ok_m0 = [r for r in results if r[7] and r[5] <= error_threshold]
+    q2_floor = min((r[6] for r in ok_m0), default=0.0)
     q2_cap = (
         ellipticity_tolerance * q2_floor
         if (ellipticity_tolerance and q2_floor > 0)
@@ -685,50 +802,59 @@ def calibrate_beam_clustering(
     else:
         print("[clust_calib] added ellipticity: reported only")
     print(
-        f"{'tail%':>6s}  {'K':>5s}  {'K_out':>6s}  {'speedup':>8s}  "
-        f"{'B_ell div':>10s}  {'q2 added':>10s}  {'/q2_beam':>9s}  {'status'}"
+        f"{'tail%':>6s}  {'K':>6s}  {'K/K_x':>6s}  {'whiten':>6s}  {'K_out':>6s}  "
+        f"{'speedup':>8s}  {'B_ell div':>10s}  {'q2 added':>10s}  "
+        f"{'/q2_beam':>9s}  {'status'}"
     )
-    print("-" * 80)
+    print("-" * 100)
     prev_tf = None
-    for tf, K_req, K_out, speedup, bell_div, q2 in results:
+    for tf, K_req, whiten, K_out, speedup, bell_div, q2, reduced, k_ratio in results:
         if prev_tf is not None and tf != prev_tf:
-            print("-" * 80)
+            print("-" * 100)
         good_m0 = bell_div <= error_threshold
         good_m2 = (q2_cap is None) or q2 <= q2_cap
-        status = "✓" if good_m0 and good_m2 else ("✗ m=0" if not good_m0 else "✗ m=±2")
+        if not reduced:
+            status = "— no reduction"
+        elif good_m0 and good_m2:
+            status = "✓"
+        else:
+            status = "✗ m=0" if not good_m0 else "✗ m=±2"
         rel = q2 / q2_beam if q2_beam > 0 else float("inf")
         print(
-            f"{tf * 100:>5.1f}%  {K_req:>5d}  {K_out:>6d}  {speedup:>8.2f}x  "
+            f"{tf * 100:>5.1f}%  {K_req:>6d}  {k_ratio:>6.2f}  "
+            f"{'yes' if whiten else 'no':>6s}  {K_out:>6d}  {speedup:>8.2f}x  "
             f"{bell_div:>10.2e}  {q2:>10.2e}  {rel:>9.2e}  {status}"
         )
         prev_tf = tf
-    print("-" * 80)
+    print("-" * 100)
 
-    passing = [r for r in ok_m0 if (q2_cap is None) or r[5] <= q2_cap]
+    passing = [r for r in ok_m0 if (q2_cap is None) or r[6] <= q2_cap]
     if passing:
-        best = max(passing, key=lambda x: x[3])
-        best_tf, best_K_req = best[0], best[1]
+        best = max(passing, key=lambda x: x[4])
         print(
-            f"\n[clust_calib] Recommendation: tail_fraction={best_tf}, "
-            f"n_clusters={best_K_req}  "
-            f"(speedup={best[3]:.2f}x, B_ell div={best[4]:.2e}, "
-            f"q2 added={best[5]:.2e})"
+            f"\n[clust_calib] Recommendation: tail_fraction={best[0]}, "
+            f"n_clusters={best[1]}, whiten={best[2]}  "
+            f"(speedup={best[4]:.2f}x, B_ell div={best[5]:.2e}, "
+            f"q2 added={best[6]:.2e}, K/K_x={best[8]:.2f})"
         )
     else:
         # Fall back on the harmful term: an m=+-2 error reshapes the beam and
         # sources T->P leakage, where the m=0 term only rescales its width.
-        best = min(results, key=lambda x: x[5])
-        best_tf, best_K_req = best[0], best[1]
+        # Rows that clustered nothing are excluded, or the fallback would
+        # "win" by recommending a configuration that does no clustering.
+        candidates = [r for r in results if r[7]] or results
+        best = min(candidates, key=lambda x: x[6])
         print(
-            f"\n[clust_calib] WARNING: no (tf, K) pair met both bounds "
+            f"\n[clust_calib] WARNING: no (tf, K, whiten) point met both bounds "
             f"(B_ell <= {error_threshold:.1e}"
             + (f", q2 <= {q2_cap:.1e}" if q2_cap else "")
             + ")."
         )
         print(
-            f"[clust_calib] Returning the pair with the least added "
-            f"ellipticity: tail_fraction={best_tf}, n_clusters={best_K_req}  "
-            f"(B_ell div={best[4]:.2e}, q2 added={best[5]:.2e})"
+            f"[clust_calib] Returning the point with the least added "
+            f"ellipticity: tail_fraction={best[0]}, n_clusters={best[1]}, "
+            f"whiten={best[2]}  "
+            f"(B_ell div={best[5]:.2e}, q2 added={best[6]:.2e})"
         )
 
-    return float(best_tf), int(best_K_req)
+    return float(best[0]), int(best[1]), bool(best[2])

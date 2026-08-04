@@ -263,7 +263,7 @@ def main(n_cpu_ceiling):
 
     if config.clustering_calibration_enabled:
         print("Running beam clustering calibration …")
-        best_tf, best_K = calibrate_beam_clustering(
+        best_tf, best_K, best_whiten = calibrate_beam_clustering(
             beam_data,
             folder_scan=folder_scan,
             probe_day=start,
@@ -272,21 +272,24 @@ def main(n_cpu_ceiling):
             ellipticity_tolerance=config.clustering_ellipticity_tolerance,
             interp_mode=interp_mode,
         )
-        save_clustering_calibration(best_tf, best_K)
+        save_clustering_calibration(best_tf, best_K, best_whiten)
         # Update in-memory config so clustering is applied this run too
         config.n_beam_clusters = best_K
         config.beam_cluster_tail_fraction = best_tf
+        config.beam_cluster_whiten = best_whiten
 
     if config.n_beam_clusters is not None:
         print(
             f"Applying beam clustering "
             f"(tail_fraction={config.beam_cluster_tail_fraction}, "
-            f"n_clusters={config.n_beam_clusters}) …"
+            f"n_clusters={config.n_beam_clusters}, "
+            f"whiten={config.beam_cluster_whiten}) …"
         )
         apply_beam_clustering(
             beam_data,
             n_clusters=config.n_beam_clusters,
             tail_fraction=config.beam_cluster_tail_fraction,
+            whiten=config.beam_cluster_whiten,
         )
 
     # Stack sky-map components per beam entry into a contiguous (C, N) array

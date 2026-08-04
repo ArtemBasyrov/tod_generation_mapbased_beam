@@ -12,8 +12,8 @@ apply_hwp_modulation         — rotate Q/U rows of a TOD batch in place to
                                model an ideal continuously rotating HWP.
 save_runtime_calibration     — persist (n_processes, numba_threads, batch_size)
                                back into the active config YAML.
-save_clustering_calibration  — persist (n_clusters, tail_fraction) back into
-                               the active config YAML.
+save_clustering_calibration  — persist (n_clusters, tail_fraction, whiten)
+                               back into the active config YAML.
 """
 
 import numpy as np
@@ -149,7 +149,7 @@ def prepare_beam_data(beam_filenames, active_fields=None):
 _CLUSTER_CACHE_KEYS = ("vec_rolled", "dtheta", "dphi")
 
 
-def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
+def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None, whiten=None):
     """Apply weighted spherical k-means clustering to ``beam_data`` in-place.
 
     Pre-clustering ``beam_vals`` serve as pixel weights for both the k-means
@@ -165,7 +165,12 @@ def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
             mode).
         tail_fraction (float | None): Fraction of power to treat as tail.
             ``None`` → full mode (cluster all pixels).
+        whiten (bool | None): Assign in the frame where the beam's second
+            moment is isotropic. ``None`` → ``config.beam_cluster_whiten``.
     """
+    if whiten is None:
+        whiten = config.beam_cluster_whiten
+
     for bf, data in beam_data.items():
         bv_pre = data["beam_vals"]  # (S,) — needed as weights before overwrite
         vo_pre = data["vec_orig"]  # (S, 3)
@@ -176,6 +181,7 @@ def apply_beam_clustering(beam_data, n_clusters, tail_fraction=None):
             bv_pre,
             n_clusters=n_clusters,
             tail_fraction=tail_fraction,
+            whiten=whiten,
         )
         K = len(bv_out)
 
@@ -334,16 +340,18 @@ def apply_hwp_modulation(tod_batch, day_index, sample_start, fsamp, f_hwp, phi0)
     tod_batch[2] = -Q * s + U * c
 
 
-def save_clustering_calibration(tail_fraction, n_clusters):
+def save_clustering_calibration(tail_fraction, n_clusters, whiten=None):
     """Write clustering calibration results back to the active config YAML."""
-    _write_config(
-        {
-            "n_beam_clusters": int(n_clusters),
-            "beam_cluster_tail_fraction": float(tail_fraction),
-            "clustering_calibration_enabled": False,
-        }
-    )
+    written = {
+        "n_beam_clusters": int(n_clusters),
+        "beam_cluster_tail_fraction": float(tail_fraction),
+        "clustering_calibration_enabled": False,
+    }
+    if whiten is not None:
+        written["beam_cluster_whiten"] = bool(whiten)
+    _write_config(written)
     print(
         f"Clustering calibration saved: tail_fraction={tail_fraction:.4f}, "
         f"n_clusters={n_clusters}"
+        + ("" if whiten is None else f", whiten={bool(whiten)}")
     )
