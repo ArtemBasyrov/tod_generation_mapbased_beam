@@ -83,27 +83,33 @@ def main():
 
     if run_clustering:
         print("Running beam clustering calibration...")
-        best_tf, best_K = calibrate_beam_clustering(
+        best_tf, best_K, best_whiten = calibrate_beam_clustering(
             beam_data,
             folder_scan=config.FOLDER_SCAN,
             probe_day=probe_day,
             mp=MP,
             error_threshold=config.clustering_error_threshold,
+            ellipticity_tolerance=config.clustering_ellipticity_tolerance,
             interp_mode=config.beam_interp_method,
         )
-        save_clustering_calibration(best_tf, best_K)
-        n_clusters, tail_fraction = best_K, best_tf
+        save_clustering_calibration(best_tf, best_K, best_whiten)
+        n_clusters, tail_fraction, whiten = best_K, best_tf, best_whiten
     else:
         n_clusters = config.n_beam_clusters
         tail_fraction = config.beam_cluster_tail_fraction
+        whiten = config.beam_cluster_whiten
 
     if n_clusters is not None:
         print(
             f"Applying beam clustering "
-            f"(tail_fraction={tail_fraction}, n_clusters={n_clusters}) ..."
+            f"(tail_fraction={tail_fraction}, n_clusters={n_clusters}, "
+            f"whiten={whiten}) ..."
         )
         apply_beam_clustering(
-            beam_data, n_clusters=n_clusters, tail_fraction=tail_fraction
+            beam_data,
+            n_clusters=n_clusters,
+            tail_fraction=tail_fraction,
+            whiten=whiten,
         )
 
     for data in beam_data.values():
