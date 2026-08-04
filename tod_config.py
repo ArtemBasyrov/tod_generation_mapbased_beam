@@ -123,6 +123,19 @@ spin2_skip_tolerance = _cfg.get("spin2_skip_tolerance", None)
 n_beam_clusters = _cfg.get("n_beam_clusters", None)
 beam_cluster_tail_fraction = _cfg.get("beam_cluster_tail_fraction", None)
 
+# beam_cluster_whiten : bool — group tail pixels in the frame where the beam's
+# second moment is isotropic, so the within-cluster covariance comes out
+# proportional to the beam's own second moment and narrows the beam without
+# reshaping it.  That construction is a continuum-quantizer argument and holds
+# only below the crossover cluster count K_x, where cells are still free to
+# take the shape the distortion measure asks for.  Above K_x the cells are
+# pinned by the node lattice, the whitening cannot reach them, and it loses on
+# both the width and the added ellipticity.  K_x depends on the beam and the
+# grid together, so no fixed default is right for every beam: let
+# `clustering_calibration_enabled` sweep this alongside (tail_fraction,
+# n_clusters) rather than guessing.
+beam_cluster_whiten = bool(_cfg.get("beam_cluster_whiten", True))
+
 clustering_calibration_enabled = _cfg.get("clustering_calibration_enabled", False)
 # B_ell divergence bound. B_ell depends on each beam node only through its
 # angular distance from the centre, so it is the m = 0 harmonic alone and no
