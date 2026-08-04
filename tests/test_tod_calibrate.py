@@ -218,6 +218,7 @@ def _mock_cluster_pixels(
     random_state=42,
     verbose=True,
     whiten=True,
+    c4=None,
 ):
     """Deterministic cluster_beam_pixels stub (no k-means EM).
 
@@ -229,8 +230,8 @@ def _mock_cluster_pixels(
         bvals (np.ndarray): (S,) beam weights.
         n_clusters (int): Requested cluster count.
         tail_fraction (float | None): Fraction of power treated as tail.
-        max_iter, tol, random_state, verbose, whiten: Unused; accepted for
-            signature compat.
+        max_iter, tol, random_state, verbose, whiten, c4: Unused; accepted
+            for signature compat.
 
     Returns:
         tuple: (vec_out, bvals_out, labels) with shapes (K_out, 3), (K_out,), (S,).
@@ -1019,7 +1020,6 @@ if __name__ == "__main__":
 # ===========================================================================
 
 import tod_calibrate  # noqa: E402
-from tod_calibrate import _beam_quadrupole  # noqa: E402
 from beam_cluster import cluster_beam_pixels  # noqa: E402
 
 _ARCMIN = np.pi / 180.0 / 60.0
@@ -1039,99 +1039,69 @@ def _beam_on_grid(sigma_x, sigma_y, half=45):
     return vec, bv
 
 
-class TestClusteringShapeError:
-    """tod_calibrate._clustering_shape_error."""
+class TestBeamM2Multipoles:
+    """tod_calibrate.beam_m2_multipoles — the exact spherical m = +-2 gate."""
 
-    def test_identity_partition_commits_no_error(self):
-        vec, bv = _beam_on_grid(9 * _ARCMIN, 6 * _ARCMIN, half=20)
-        labels = np.arange(len(bv))
-        q0, q2 = tod_calibrate._clustering_shape_error(vec, bv, labels, len(bv), 3000)
-        assert q0 == pytest.approx(0.0, abs=1e-20)
-        assert q2 == pytest.approx(0.0, abs=1e-20)
+    _ELLS = np.array([300, 1000, 2048])
 
-    def test_a_uniform_rescaling_scores_zero_added_ellipticity(self):
-        """Sigma_bar proportional to the beam's own M narrows the beam without
-        reshaping it, so the added-ellipticity term must vanish even though the
-        width term does not.
+    def test_symmetric_beam_has_no_m2(self):
+        """A beam that is a function of angular distance alone has none.
 
-        Pairing every node with its antipode through the beam centre builds
-        exactly that case: each pair's centroid is the centre, so its
-        covariance is ``t t^T``, and summing over a centrally symmetric weight
-        distribution gives ``Sigma_bar = M``.
+        The floor is float32 node storage, not the beam: ~5e-8 against an
+        elliptical beam's ~1e-2, so the two are five orders apart.
         """
-        half = 25
-        vec, bv = _beam_on_grid(9 * _ARCMIN, 6 * _ARCMIN, half=half)
-        n = 2 * half + 1
-        idx = np.arange(n * n)
-        labels = np.minimum(idx, n * n - 1 - idx)
-        K_out = int(labels.max()) + 1
-        q0, q2 = tod_calibrate._clustering_shape_error(vec, bv, labels, K_out, 3000)
-        assert q0 > 0.0
-        assert q2 < 1e-8 * q0
+        vec, bv = _beam_on_grid(9 * _ARCMIN, 9 * _ARCMIN, half=40)
+        b2 = tod_calibrate.beam_m2_multipoles(vec, bv, self._ELLS)
+        assert np.abs(b2).max() < 1e-6
 
-    def test_grows_with_cluster_count(self):
-        """Coarser clustering commits a larger second-moment deficit."""
-        vec, bv = _beam_on_grid(9 * _ARCMIN, 6 * _ARCMIN, half=25)
-        prev = None
-        for K in (400, 100, 25):
-            _, _, labels = cluster_beam_pixels(
-                vec, bv, n_clusters=K, tail_fraction=0.05, verbose=False
-            )
-            q0, _ = tod_calibrate._clustering_shape_error(
-                vec, bv, labels, int(labels.max()) + 1, 3000
-            )
-            if prev is not None:
-                assert q0 > prev
-            prev = q0
+    def test_elliptical_beam_has_m2(self):
+        vec, bv = _beam_on_grid(12 * _ARCMIN, 6 * _ARCMIN, half=40)
+        b2 = tod_calibrate.beam_m2_multipoles(vec, bv, self._ELLS)
+        assert np.abs(b2).max() > 1e-3
 
-    def test_moments_use_the_tangent_frame_not_the_offset_chart(self):
-        """A radial beam is round, so a partition whose deficit is
-        proportional to M must score zero added ellipticity.  Formed in the
-        (RA, Dec) offset chart it would instead pick up sigma^2/2."""
-        half, sigma = 60, 9 * _ARCMIN
-        g = np.arange(-half, half + 1, 1.0) * _ARCMIN
-        X, Y = np.meshgrid(g, g, indexing="xy")
-        X, Y = X.ravel(), Y.ravel()
-        rho = np.arccos(np.clip(np.cos(Y) * np.cos(X), -1.0, 1.0))
-        bv = np.exp(-0.5 * (rho / sigma) ** 2) * np.cos(Y)
-        bv = (bv / bv.sum()).astype(np.float32)
-        th = np.pi / 2.0 - Y
-        vec = np.stack(
-            [np.sin(th) * np.cos(X), np.sin(th) * np.sin(X), np.cos(th)], axis=-1
-        ).astype(np.float32)
-        _, _, labels = cluster_beam_pixels(
-            vec, bv, n_clusters=200, tail_fraction=0.05, verbose=False
-        )
-        q0, q2 = tod_calibrate._clustering_shape_error(
-            vec, bv, labels, int(labels.max()) + 1, 3000
-        )
-        assert q2 < q0
-
-
-class TestBeamQuadrupole:
-    """tod_calibrate._beam_quadrupole — the scale added ellipticity is read against."""
-
-    def test_zero_for_a_radial_beam(self):
-        half, sigma = 60, 9 * _ARCMIN
-        g = np.arange(-half, half + 1, 1.0) * _ARCMIN
-        X, Y = np.meshgrid(g, g, indexing="xy")
-        X, Y = X.ravel(), Y.ravel()
-        rho = np.arccos(np.clip(np.cos(Y) * np.cos(X), -1.0, 1.0))
-        bv = np.exp(-0.5 * (rho / sigma) ** 2) * np.cos(Y)
-        bv = (bv / bv.sum()).astype(np.float32)
-        th = np.pi / 2.0 - Y
-        vec = np.stack(
-            [np.sin(th) * np.cos(X), np.sin(th) * np.sin(X), np.cos(th)], axis=-1
-        ).astype(np.float32)
-        q0 = _beam_quadrupole(vec, bv, 2048)
-        vec_e, bv_e = _beam_on_grid(12 * _ARCMIN, 6 * _ARCMIN, half=40)
-        assert q0 < 1e-6 * _beam_quadrupole(vec_e, bv_e, 2048)
+    def test_separates_symmetric_from_elliptical_by_orders(self):
+        v_r, w_r = _beam_on_grid(9 * _ARCMIN, 9 * _ARCMIN, half=40)
+        v_e, w_e = _beam_on_grid(12 * _ARCMIN, 6 * _ARCMIN, half=40)
+        round_m2 = np.abs(tod_calibrate.beam_m2_multipoles(v_r, w_r, self._ELLS)).max()
+        ellip_m2 = np.abs(tod_calibrate.beam_m2_multipoles(v_e, w_e, self._ELLS)).max()
+        assert round_m2 < 1e-4 * ellip_m2
 
     def test_grows_with_beam_ellipticity(self):
         prev = None
         for sy in (11.0, 9.0, 6.0):
             vec, bv = _beam_on_grid(12 * _ARCMIN, sy * _ARCMIN, half=40)
-            q = _beam_quadrupole(vec, bv, 2048)
+            amp = float(
+                np.abs(tod_calibrate.beam_m2_multipoles(vec, bv, self._ELLS)).max()
+            )
             if prev is not None:
-                assert q > prev
-            prev = q
+                assert amp > prev
+            prev = amp
+
+    def test_identity_partition_commits_no_error(self):
+        """Comparing a node set with itself must give exactly zero."""
+        vec, bv = _beam_on_grid(9 * _ARCMIN, 6 * _ARCMIN, half=20)
+        R = tod_calibrate._beam_frame_rotation(vec.astype(np.float64), bv)
+        a = tod_calibrate.beam_m2_multipoles(vec, bv, self._ELLS, rotation=R)
+        b = tod_calibrate.beam_m2_multipoles(vec, bv, self._ELLS, rotation=R)
+        np.testing.assert_array_equal(a, b)
+        assert np.abs(a - b).max() == 0.0
+
+    def test_is_invariant_under_beam_rotation_on_the_sky(self):
+        """The multipoles are a property of the beam, not of where it points."""
+        vec, bv = _beam_on_grid(12 * _ARCMIN, 6 * _ARCMIN, half=30)
+        c, s = np.cos(0.7), np.sin(0.7)
+        rot = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+        a = np.abs(tod_calibrate.beam_m2_multipoles(vec, bv, self._ELLS))
+        b = np.abs(tod_calibrate.beam_m2_multipoles(vec @ rot.T, bv, self._ELLS))
+        np.testing.assert_allclose(a, b, rtol=1e-6)
+
+    def test_merging_nodes_changes_it(self):
+        """A crude clustering must register, or the gate is blind."""
+        vec, bv = _beam_on_grid(9 * _ARCMIN, 9 * _ARCMIN, half=30)
+        R = tod_calibrate._beam_frame_rotation(vec.astype(np.float64), bv)
+        ref = tod_calibrate.beam_m2_multipoles(vec, bv, self._ELLS, rotation=R)
+        v_c, bv_c, _ = cluster_beam_pixels(
+            vec, bv, n_clusters=60, tail_fraction=0.3, verbose=False
+        )
+        got = tod_calibrate.beam_m2_multipoles(v_c, bv_c, self._ELLS, rotation=R)
+        assert np.abs(got - ref).max() > np.abs(ref).max()

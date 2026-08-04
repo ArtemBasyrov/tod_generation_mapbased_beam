@@ -31,17 +31,12 @@ from tod_io import load_scan_data_batch
 from tod_core import precompute_rotation_vector_batch, beam_tod_batch
 from tod_utils import _fmt_time, _get_memory_per_process
 from tod_beam_math import compute_bell
-from beam_cluster import cluster_beam_pixels, _tangent_frame, _log_map, _to_unit
-
-
-def _second_moment(t1, t2, w):
-    """(2, 2) power-weighted second moment of tangent-plane offsets."""
-    return np.array(
-        [
-            [(w * t1 * t1).sum(), (w * t1 * t2).sum()],
-            [(w * t1 * t2).sum(), (w * t2 * t2).sum()],
-        ]
-    )
+from beam_cluster import (
+    cluster_beam_pixels,
+    _tangent_frame,
+    _to_unit,
+    _whitener,
+)
 
 
 def _k_crossover(beam_vals, n_tail):
@@ -91,82 +86,109 @@ def _k_crossover(beam_vals, n_tail):
     return float(np.sqrt(np.clip(tail, 0.0, None)).sum() / np.sqrt(w_cut))
 
 
-def _beam_quadrupole(vec_orig, beam_vals, lmax):
-    """The beam's OWN quadrupole modulation ``q2 = l^2 |M_traceless| / 4``.
+def _whitening_is_inert(beam_data):
+    """True when whitened assignment reproduces the plain partition exactly.
 
-    The scale against which added ellipticity is interpreted: a clustering
-    that adds a small fraction of the asymmetry the beam already has perturbs
-    an existing systematic, where the same absolute amount added to a
-    symmetric beam creates one from nothing.
+    ``_whitener`` declines to build a transform for a beam already round to
+    within its guard, so both settings of ``whiten`` then cluster the same
+    vectors and return the same labels.  Sweeping both would pay twice for one
+    partition.
     """
-    v = _to_unit(vec_orig)
-    w = np.asarray(beam_vals, dtype=np.float64)
-    frame = _tangent_frame(v, w)
-    total = w.sum()
-    if frame is None or total <= 0:
-        return 0.0
-    t1, t2 = _log_map(v, frame)
-    ev = np.linalg.eigvalsh(_second_moment(t1, t2, w) / total)
-    return float(lmax) ** 2 / 4.0 * float(ev[1] - ev[0])
+    for data in beam_data.values():
+        v = _to_unit(data["vec_orig"])
+        w = np.asarray(data["beam_vals"], dtype=np.float64)
+        frame = _tangent_frame(v, w)
+        if frame is not None and _whitener(v, w, frame) is not None:
+            return False
+    return True
 
 
-def _clustering_shape_error(vec_orig, beam_vals, labels, K_out, lmax):
-    """Beam width and ellipticity error committed by a clustering.
+def _beam_frame_rotation(vec, weights):
+    """Rotation taking the power-weighted beam centre onto the north pole."""
+    v = np.asarray(vec, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    c = (w[:, None] * v).sum(axis=0)
+    n = np.linalg.norm(c)
+    if n <= 0:
+        return np.eye(3)
+    c = c / n
+    axis = np.cross(c, np.array([0.0, 0.0, 1.0]))
+    s, co = np.linalg.norm(axis), float(c[2])
+    if s < 1e-15:
+        return np.eye(3) if co > 0 else -np.eye(3)
+    k = np.array(
+        [
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ]
+    )
+    return np.eye(3) + k + k @ k * ((1.0 - co) / s**2)
 
-    Clustering replaces each group of beam nodes by one centroid, and its whole
-    leading effect is a deficit in the beam's second moment, ``Delta M =
-    -Sigma_bar``, with ``Sigma_bar`` the power-weighted within-cluster
-    covariance.  Splitting that deficit is what makes it interpretable:
 
-    * the part proportional to the beam's own second moment ``M`` narrows the
-      beam without reshaping it — it moves ``b_ell`` but leaves the ellipticity
-      alone, so it creates no leakage that was not already there;
-    * the remainder is **added ellipticity**, an ``m = ±2`` change that a
-      symmetric beam manufactures out of nothing.
+def beam_m2_multipoles(vec, weights, ells, rotation=None):
+    """The beam's ``m = ±2`` multipoles ``b_{l,2}``, exactly on the sphere.
 
-    Both are reported as the beam-quadrupole modulation ``q = l^2 |.| / 4`` at
-    the band edge, so they are dimensionless and directly comparable.
+    This is the quantity that leaks temperature into polarisation: the spin-2
+    response couples to the beam's ``m = ±2`` harmonic, and a clustering that
+    changes it has changed the effective beam's ellipticity.
 
-    Moments are formed in geodesic-polar coordinates about the beam centre.
-    The ``(RA, Dec)`` offset chart is not distance preserving and gives a
-    perfectly round beam a traceless second moment of relative size
-    ``sigma^2 / 2``, which a criterion built on it would score as real.
+    Evaluated as ``b_{l,2} = sum_i w_i Pbar_l^2(cos theta_i) exp(-2 i phi_i)``
+    with ``(theta, phi)`` in the beam-centred frame and ``Pbar`` the normalised
+    associated Legendre function, by the standard stable upward recursion.
+
+    Why not the second-moment deficit.  ``Delta M = -Sigma_bar`` is only the
+    ``k^2`` Taylor coefficient of the transfer.  Above ``l ~ 100`` the centroid
+    phases ``exp(-i k . c_k)`` decohere, so the error is a phase-incoherent sum
+    of per-cell covariances and no longer follows its own low-order expansion:
+    a reweighting can drive ``Delta M`` to machine precision while leaving the
+    real ``m = ±2`` untouched.  A criterion built on ``Delta M`` can therefore
+    certify a configuration that leaks.
 
     Args:
-        vec_orig: (S, 3) pre-clustering beam-pixel unit vectors.
-        beam_vals: (S,) pre-clustering beam weights.
-        labels: (S,) output index per original pixel, from
-            :func:`beam_cluster.cluster_beam_pixels`.
-        K_out: number of output pixels.
-        lmax: multipole at which to quote the modulation.
+        vec: (S, 3) beam-node unit vectors.
+        weights: (S,) node weights.
+        ells: multipoles to evaluate.
+        rotation: (3, 3) beam-frame rotation. ``None`` derives it from this
+            node set; pass a shared one to compare two sets in one frame.
 
     Returns:
-        tuple[float, float]: ``(q0, q2)`` — the width term and the added
-        ellipticity, both dimensionless.
+        np.ndarray: complex ``b_{l,2}`` for each requested multipole.
     """
-    v = _to_unit(vec_orig)
-    w = np.asarray(beam_vals, dtype=np.float64)
-    frame = _tangent_frame(v, w)
-    if frame is None:
-        return 0.0, 0.0
-    t1, t2 = _log_map(v, frame)
+    v = _to_unit(vec)
+    w = np.asarray(weights, dtype=np.float64)
+    R = _beam_frame_rotation(v, w) if rotation is None else rotation
+    n = v @ R.T
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    x = np.clip(n[:, 2], -1.0, 1.0)
+    phase = w * np.exp(-2j * np.arctan2(n[:, 1], n[:, 0]))
 
-    mass = np.bincount(labels, weights=w, minlength=K_out)
-    safe = np.where(np.abs(mass) > 0, mass, 1.0)
-    c1 = np.bincount(labels, weights=w * t1, minlength=K_out) / safe
-    c2 = np.bincount(labels, weights=w * t2, minlength=K_out) / safe
+    ells = np.asarray(sorted(int(e) for e in ells), dtype=np.int64)
+    lmax, m = int(ells.max()), 2
+    st = np.sqrt(np.clip(1.0 - x * x, 0.0, None))
+    p = np.full_like(x, np.sqrt(1.0 / (4.0 * np.pi)))
+    for mm in (1, 2):
+        p = -np.sqrt((2.0 * mm + 1.0) / (2.0 * mm)) * st * p
 
-    total = w.sum()
-    if total <= 0:
-        return 0.0, 0.0
-    M = _second_moment(t1, t2, w) / total
-    Sigma = _second_moment(t1 - c1[labels], t2 - c2[labels], w) / total
+    want = {2: p} if 2 in ells else {}
+    prev, cur, lcur = p, np.sqrt(2.0 * m + 3.0) * x * p, 3
+    target = set(int(e) for e in ells)
+    if 3 in target:
+        want[3] = cur
+    while lcur < lmax:
+        ln = lcur + 1
+        a = np.sqrt((4.0 * ln * ln - 1.0) / (ln * ln - m * m))
+        b = np.sqrt(((ln - 1.0) ** 2 - m * m) / (4.0 * (ln - 1.0) ** 2 - 1.0))
+        prev, cur, lcur = cur, a * (x * cur - b * prev), ln
+        if lcur in target:
+            want[lcur] = cur
+    return np.array([(phase * want[int(e)]).sum() for e in ells])
 
-    trM = np.trace(M)
-    shape = Sigma - (np.trace(Sigma) / trM) * M if trM > 0 else Sigma
-    ev = np.linalg.eigvalsh(shape)
-    k2 = float(lmax) ** 2 / 4.0
-    return k2 * float(np.trace(Sigma)), k2 * float(abs(ev[1] - ev[0]))
+
+def _m2_probe_ells(lmax, n=8):
+    """Multipoles the m = ±2 error is scored on: log-spaced over the sky band."""
+    lo = max(2, int(lmax) // 32)
+    return np.unique(np.round(np.geomspace(lo, max(lo + 1, int(lmax)), n)).astype(int))
 
 
 _BYTES_PER_SAMPLE_TRANSIENT = {
@@ -580,12 +602,22 @@ def calibrate_beam_clustering(
         therefore the ``m = 0`` harmonic alone: it constrains the beam *width*.
 
     ``ellipticity_tolerance`` bounds the ellipticity the clustering *adds* to
-        the beam — the part of the second-moment deficit that is not proportional
-        to the beam's own second moment, quoted as ``q2 = l^2 |Sigma_shape| / 4``.
-        ``B_ell`` cannot see this at all: no rearrangement of nodes at fixed radius
-        changes it, so a clustering that reshapes the beam scores identically to
-        one that does not.  It is the harmful term, since an ``m = ±2`` error is
-        what sources T->P leakage.
+        the beam, measured as the RMS over the sky band of
+        ``|b_{l,2}[clustered] - b_{l,2}[exact]|`` — the beam's own ``m = ±2``
+        multipoles, computed exactly on the sphere by
+        :func:`beam_m2_multipoles`.  ``B_ell`` cannot see this at all: no
+        rearrangement of nodes at fixed radius changes it, so a clustering that
+        reshapes the beam scores identically to one that does not.  It is the
+        harmful term, since an ``m = ±2`` error is what sources T->P leakage
+        and, unlike the interpolation kernel, is not in the mapmaker's forward
+        model to be deconvolved.
+
+        This is deliberately *not* the second-moment deficit ``Delta M``.  That
+        is only the ``k^2`` Taylor coefficient of the transfer, and above
+        ``l ~ 100`` the centroid phases decohere so the error stops following
+        it: a reweighting can drive ``Delta M`` to machine precision while the
+        real ``m = ±2`` is untouched, which would let the gate certify a
+        configuration that leaks.
 
         The bound is relative — a factor over the smallest ``q2`` any point in the
         sweep achieves for this beam — because what is achievable depends on the
@@ -636,6 +668,19 @@ def calibrate_beam_clustering(
     whiten_options = tuple(dict.fromkeys(bool(w) for w in whiten_options))
     if not whiten_options:
         raise ValueError("whiten_options must contain at least one value")
+    if len(whiten_options) > 1 and any("c4" in d for d in beam_data.values()):
+        # The quadrant path ignores whitening, so the axis would measure nothing.
+        print(
+            "[clust_calib] Quadrant (C4) clustering is active — whitening does "
+            "not apply; sweeping one."
+        )
+        whiten_options = (False,)
+    elif len(whiten_options) > 1 and _whitening_is_inert(beam_data):
+        print(
+            "[clust_calib] Beam is round to within the whitening guard, so the "
+            "whitened and plain assignments are identical — sweeping one."
+        )
+        whiten_options = (False,)
 
     if bell_lmax is None:
         if mp is not None:
@@ -667,12 +712,24 @@ def calibrate_beam_clustering(
     for bf, data in beam_data.items():
         ref_bells[bf] = _bell_from_vecs(data["vec_orig"], data["beam_vals"])
 
+    # The m = +-2 reference: the unclustered beam's own multipoles, and the
+    # frame they were measured in, so every candidate is scored against the
+    # same beam axes rather than its own.
+    m2_ells = _m2_probe_ells(bell_lmax)
+    m2_frame, m2_ref = {}, {}
+    for bf, data in beam_data.items():
+        R = _beam_frame_rotation(_to_unit(data["vec_orig"]), data["beam_vals"])
+        m2_frame[bf] = R
+        m2_ref[bf] = beam_m2_multipoles(
+            data["vec_orig"], data["beam_vals"], m2_ells, rotation=R
+        )
+
     S_bf = {bf: data["n_sel"] for bf, data in beam_data.items()}
+    # The beam's own m = +-2, the scale added ellipticity is read against. For a
+    # symmetric beam this is a noise floor rather than a signal, so the ratio
+    # column against it is meaningless there.
     q2_beam = max(
-        (
-            _beam_quadrupole(data["vec_orig"], data["beam_vals"], bell_lmax)
-            for data in beam_data.values()
-        ),
+        (float(np.sqrt(np.mean(np.abs(b) ** 2))) for b in m2_ref.values()),
         default=0.0,
     )
 
@@ -755,13 +812,14 @@ def calibrate_beam_clustering(
                         q2s.append(0.0)
                         reduced = False
                         continue
-                    vec_c, bv_c, labels_c = cluster_beam_pixels(
+                    vec_c, bv_c, _ = cluster_beam_pixels(
                         data["vec_orig"],
                         data["beam_vals"],
                         n_clusters=K_req,
                         tail_fraction=tf,
                         verbose=False,
                         whiten=whiten,
+                        c4=data.get("c4"),
                     )
                     K_out_per_bf[bf] = len(bv_c)
                     bell_clust = _bell_from_vecs(vec_c, bv_c)
@@ -771,14 +829,8 @@ def calibrate_beam_clustering(
                         ref_rms + 1e-30
                     )
                     bell_divs.append(bell_div)
-                    _, q2 = _clustering_shape_error(
-                        data["vec_orig"],
-                        data["beam_vals"],
-                        labels_c,
-                        len(bv_c),
-                        bell_lmax,
-                    )
-                    q2s.append(q2)
+                    b2 = beam_m2_multipoles(vec_c, bv_c, m2_ells, rotation=m2_frame[bf])
+                    q2s.append(float(np.sqrt(np.mean(np.abs(b2 - m2_ref[bf]) ** 2))))
 
                 mean_bell_div = float(np.mean(bell_divs))
                 max_q2 = float(np.max(q2s))
