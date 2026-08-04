@@ -299,10 +299,29 @@ fill in ``n_beam_clusters`` and ``beam_cluster_tail_fraction`` by hand.
        between the clustered and reference beam transfer function.  Bounds
        the beam width.  See :doc:`beam_cluster_calibration` for metric
        definition and tier-based recommendations.
+   * - ``beam_cluster_whiten``
+     - ``bool``
+     - ``true``
+     - Group tail pixels in the frame where the beam's second moment is
+       isotropic, so the deficit comes out proportional to the beam's own
+       second moment and narrows it without reshaping it.  Shape-preserving
+       only below the crossover cluster count ``K_x``; the calibration sweeps
+       this axis rather than assuming it.
+   * - ``beam_symmetric``
+     - ``bool``
+     - ``false``
+     - Declare the beam a function of angular distance alone.  Clustering then
+       groups one quadrant and copies the partition onto the other three by
+       90° rotation, so each cell's manufactured ``m = ±2`` is cancelled by its
+       three siblings.  Node count is unchanged.  Only set this for a beam that
+       really is symmetric — the measured 90° asymmetry is printed at load
+       (~1e-4 symmetric, ~1e-2 asymmetric) but is not enforced.  See
+       :doc:`beam_cluster_calibration`.
    * - ``clustering_ellipticity_tolerance``
      - ``float | null``
      - ``1.0``
-     - **m = ±2 bound.**  Maximum tolerated ellipticity *added* to the beam,
+     - **m = ±2 bound.**  Maximum tolerated error in the beam's own
+       ``b_{l,2}`` multipoles, computed exactly on the sphere,
        as a factor over the least the sweep achieves for this beam.  Relative
        rather than absolute because what is achievable depends on the beam,
        the beam-grid spacing and the cluster budget together.  ``1.0`` keeps
@@ -347,5 +366,7 @@ Full Example
 
      n_beam_clusters: null
      beam_cluster_tail_fraction: null
+     beam_cluster_whiten: true
+     beam_symmetric: false
      clustering_calibration_enabled: false
      clustering_error_threshold: 1.0e-5

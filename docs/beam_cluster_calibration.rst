@@ -123,40 +123,50 @@ where:
 Added-Ellipticity Metric
 --------------------------
 
-The shape error is the part of the second-moment deficit that is not a uniform
-rescaling,
+The shape error is measured **exactly on the sphere**, as the change the
+clustering makes to the beam's own :math:`m = \pm2` multipoles:
 
 .. math::
 
-   \bar\Sigma^{\rm shape} \,=\, \bar\Sigma \,-\,
-       \frac{\operatorname{tr}\bar\Sigma}{\operatorname{tr}M}\,M \,,
+   b_{\ell,2} \,=\, \sum_i w_i\,\bar P_\ell^{\,2}(\cos\theta_i)\,e^{-2i\phi_i}\,,
 
-reported as the beam-quadrupole modulation at the band edge,
+with :math:`(\theta, \phi)` in the beam-centred frame and :math:`\bar P` the
+normalised associated Legendre function.  This is the quantity the spin-2
+response couples to, so a clustering that changes it has changed the effective
+beam's ellipticity.  The reported error is the RMS over the sky band of
+:math:`\lvert b_{\ell,2}[\text{clustered}] - b_{\ell,2}[\text{exact}]\rvert`,
+both evaluated in the same frame (``tod_calibrate.beam_m2_multipoles``).
 
-.. math::
+.. warning::
 
-   q_2 \,=\, \frac{\ell_{\max}^2}{4}\,
-             \bigl\lvert \bar\Sigma^{\rm shape} \bigr\rvert \,.
+   The second-moment deficit :math:`\bar\Sigma` is **not** a sufficient
+   criterion, and an earlier version of this gate used it.  :math:`\bar\Sigma`
+   is only the :math:`k^2` Taylor coefficient of the transfer.  Above
+   :math:`\ell \simeq 100` the centroid phases decohere, so the error is a
+   phase-incoherent sum of per-cell covariances and stops following its own
+   low-order expansion.
 
-Both moments are formed in geodesic-polar coordinates about the beam centre,
-never in the ``(RA, Dec)`` offset chart.  That chart is not distance
-preserving — :math:`\cos\rho = \cos(\mathrm{dec})\cos(\mathrm{RA})` gives
-:math:`\rho^2 = x^2 + y^2 - x^2y^2/3` — so it manufactures a traceless second
-moment of relative size :math:`\sigma^2/2` out of a beam that has none.  For
-the 30′ spherical beam that artifact measures 6.87e-06 against a predicted
-:math:`\sigma^2/2 = 6.87\times10^{-6}`; a criterion built on that chart would
-score it as real.
+   Measured: a reweighting of the node weights drives
+   :math:`\lvert\Delta M^{\rm shape}\rvert` from 4.7e-04 to 6.0e-14 — ten
+   orders — while the :math:`m = \pm2` error does not move at any multipole.
+   A gate built on :math:`\bar\Sigma` can therefore certify a configuration
+   that leaks exactly as much as before.  See
+   ``error_analytical/03_clustering.md`` §13.1.
 
-The table also reports :math:`q_2 / q_{2,\rm beam}`, the added ellipticity as
-a fraction of the beam's *own* quadrupole.  That is the number to weigh
-against a leakage budget.
+Because the multipoles are computed in spherical harmonics on the beam-centred
+frame, no tangent-plane chart enters and the :math:`\sigma^2/2` artifact that
+the ``(RA, Dec)`` offset chart manufactures cannot contaminate the metric.
+
+The table also reports the error as a fraction of the beam's *own*
+:math:`m = \pm2`.  That is the number to weigh against a leakage budget.
 
 .. note::
 
-   For a symmetric beam :math:`q_{2,\rm beam} \to 0` and the ratio column is
-   meaningless — correctly so, since a quadrupole created from nothing has no
-   natural scale to be measured against.  Use
-   ``clustering_ellipticity_tolerance: 1.0`` for such beams.
+   For a symmetric beam that denominator is a noise floor rather than a
+   signal, so the ratio column is not meaningful — correctly so, since an
+   ellipticity created from nothing has no natural scale to be measured
+   against.  Use ``clustering_ellipticity_tolerance: 1.0`` for such beams, and
+   see *Symmetric Beams* below for removing the error outright.
 
 Calibration Output Table
 -------------------------
@@ -311,6 +321,72 @@ to +65.5°, against the beam's own axis of +71.8°.
    a beam's residual ellipticity is grid-induced and is not addressed by this
    mechanism.
 
-   Set ``whiten=False`` when calling
-   :func:`beam_cluster.cluster_beam_pixels` directly to recover a plain
-   spherical k-means.
+   Set ``beam_cluster_whiten: false`` (or ``whiten=False`` when calling
+   :func:`beam_cluster.cluster_beam_pixels` directly) to recover a plain
+   spherical k-means.  The calibration sweeps this axis, because whitening is
+   shape-preserving only below the crossover cluster count
+   :math:`K_\times` and whether it pays above that depends on the beam.
+
+Symmetric Beams — ``beam_symmetric``
+--------------------------------------
+
+Merging beam nodes makes each cell a small **anisotropic** smear, so the
+effective beam comes out slightly elliptical even when the real one is round.
+That manufactured :math:`m = \pm2` sources T→P leakage and, unlike the
+interpolation kernel, is **not** in the mapmaker's forward model, so it
+survives into the maps rather than being deconvolved.  On a symmetric beam it
+*dominates* the beam's own :math:`m = \pm2` — measured at 3.5–181× of it.
+
+With ``beam_symmetric: true`` the clustering groups **one quadrant** of the
+beam and copies the partition onto the other three by 90° rotation (the group
+:math:`C_4`).  Every cell then has three siblings at 90°, 180° and 270°.
+Ellipticity is a two-fold pattern — rotating an ellipse by 90° exchanges its
+axes — so the four contributions cancel:
+
+.. math::
+
+   \sum_{n=0}^{3} e^{2i(\phi + n\pi/2)} \,=\, 0 \,.
+
+The cancellation is exact and independent of the cluster count, of
+:math:`K/K_\times`, and of any threshold.  Node count is unchanged, so it is
+free.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 30 30
+
+   * - beam
+     - plain k-means
+     - ``beam_symmetric: true``
+   * - SAT 90 GHz symmetric (real, noisy)
+     - 3.5–181× the beam's own
+     - **0.004–0.71×**
+   * - analytic round Gaussian (:math:`\varepsilon_{\rm eff}`)
+     - 1.67e-04
+     - **1.04e-07** (1610×)
+
+.. warning::
+
+   Only set this for a beam that really is symmetric.  The cancellation needs
+   the beam's own weights to be 90°-invariant; on a genuinely asymmetric beam
+   the construction both fails to help (0.1–10×, no consistent gain) and costs
+   node reduction (5.0× instead of 8×).  The measured C4 asymmetry is printed
+   when the beam loads — roughly 1e-4 for a symmetric beam and 1e-2 for an
+   asymmetric one — but it is reported, not enforced.
+
+   Asymmetric beams need no fix: their clustering :math:`m = \pm2` is
+   1.6e-04 of the beam's own, four orders below the signal.
+
+Two implementation details are load-bearing.  The rotation centre is the
+beam-centre **pixel** (``beam_center_x`` / ``beam_center_y``, default
+``H//2, W//2``), never the peak pixel — detector noise puts the peak a pixel
+off, which inflates the measured asymmetry sixfold and destroys the gain.  And
+beam maps must be **odd-sized** and centred on that pixel, or orbits do not
+close: a 200×200 map loses its edge pixels to singletons and 8 % of the
+reduction, where 201×201 closes every orbit.
+
+Symmetrising the beam map itself is deliberately *not* offered here.  It
+changes the beam values, which is a claim about the instrument rather than a
+numerical choice, and applied to an asymmetric beam it silently deletes the
+asymmetry the pipeline exists to measure.  Do it upstream of the pipeline if
+you want it.
