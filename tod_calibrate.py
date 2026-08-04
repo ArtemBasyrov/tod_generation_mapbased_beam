@@ -596,11 +596,16 @@ def calibrate_beam_clustering(
         which is the number to compare against a leakage budget.
 
         ``whiten_options`` is the third axis.  Whitened assignment is
-        shape-preserving only below the crossover cluster count ``K_x``
-        (:func:`_k_crossover`), and above it it loses on *both* harmonics.
-        Where that boundary falls depends on the beam and the node grid
-        together, so it is swept rather than predicted.  Pass a single-element
-        tuple to pin the choice and halve the sweep.
+        shape-preserving in the continuum-quantizer regime below the crossover
+        cluster count ``K_x`` (:func:`_k_crossover`).  Above ``K_x`` it may
+        lose on both harmonics, but *whether* it does is a property of the
+        beam rather than of ``K_x``: the residual anisotropy the whitening
+        leaves behind saturates near 0.6–0.8, so a beam whose own ellipticity
+        exceeds that keeps winning at every cluster count.  Measured on
+        elliptical Gaussians at ``a = 2'``, ``f = 0.005``: axis ratio 1.5 and 2
+        lose above ``K_x``, while 3 and 4 still win by 1.6–2.9x at
+        ``K/K_x = 4``.  The axis is therefore swept rather than predicted.
+        Pass a single-element tuple to pin the choice and halve the sweep.
 
         Computes reference B_ell (power_cut=1.0) from unclustered beam, then
         sweeps a (tail_fraction × n_clusters × whiten) grid. The point maximising
@@ -717,8 +722,25 @@ def calibrate_beam_clustering(
     )
     results = []
     for tf in tail_fractions:
+        # Above K_x the whitened/plain shape ratio has saturated, because the
+        # residual anisotropy the whitening leaves behind has stopped growing.
+        # One loss there is therefore predictive of every larger K, so the
+        # whitened leg is dropped for the rest of this tail fraction and the
+        # most expensive cells are never run twice.  Whether it ever loses is
+        # a property of the beam and not of K_x: a beam elliptical enough that
+        # its own ellipticity exceeds that residual keeps winning at every K,
+        # and for such a beam this exit simply never fires.  Below K_x nothing
+        # is skipped, since the ratio is still moving fast there and a single
+        # Lloyd local minimum could misread it.
+        whiten_beaten = False
         for K_req in _k_grid(tf):
-            for whiten in whiten_options:
+            active = (
+                tuple(w for w in whiten_options if not w)
+                if whiten_beaten
+                else whiten_options
+            )
+            q2_by_whiten = {}
+            for whiten in active:
                 K_out_per_bf = {}
                 bell_divs = []
                 q2s = []
@@ -764,6 +786,8 @@ def calibrate_beam_clustering(
                     np.mean([S_bf[bf] / K_out_per_bf[bf] for bf in beam_data])
                 )
                 K_out_repr = int(np.mean(list(K_out_per_bf.values())))
+                k_ratio = K_req / k_cross_per_tf[tf] if k_cross_per_tf[tf] > 0 else 0.0
+                q2_by_whiten[whiten] = max_q2
                 results.append(
                     (
                         tf,
@@ -774,8 +798,21 @@ def calibrate_beam_clustering(
                         mean_bell_div,
                         max_q2,
                         reduced,
-                        K_req / k_cross_per_tf[tf] if k_cross_per_tf[tf] > 0 else 0.0,
+                        k_ratio,
                     )
+                )
+
+            if (
+                not whiten_beaten
+                and k_ratio > 1.0
+                and reduced
+                and len(q2_by_whiten) == 2
+                and q2_by_whiten[True] > q2_by_whiten[False]
+            ):
+                whiten_beaten = True
+                print(
+                    f"[clust_calib]   tail={tf:g}: whitening lost at K={K_req} "
+                    f"(K/K_x={k_ratio:.2f}); dropping it for larger K here."
                 )
 
     # The achievable floor is measured, not assumed: it is the least added

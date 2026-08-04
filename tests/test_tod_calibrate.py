@@ -528,6 +528,22 @@ class TestCalibrateBeamClustering:
             False
         }
 
+    def test_whiten_leg_dropped_only_after_losing_above_k_crossover(self):
+        """The early exit must not fire while whitening is still winning.
+
+        The stub clusterer is whiten-agnostic, so both legs score identically
+        and neither ever loses. Every cluster count must therefore still be
+        tried with both settings.
+        """
+        with self._patched() as (m_cluster, _):
+            calibrate_beam_clustering(_fake_beam_data(), ".", 0, _fake_mp())
+        per_k = {}
+        for call in m_cluster.call_args_list:
+            key = (call.kwargs["tail_fraction"], call.kwargs["n_clusters"])
+            per_k.setdefault(key, set()).add(call.kwargs["whiten"])
+        assert per_k, "sweep requested no clustering at all"
+        assert all(v == {False, True} for v in per_k.values())
+
     def test_empty_whiten_options_rejected(self):
         """An empty whiten axis is a configuration error, not a silent default."""
         with pytest.raises(ValueError, match="whiten_options"):
