@@ -232,6 +232,51 @@ class TestPrepareBeamData:
         norms = np.linalg.norm(v.astype(np.float64), axis=1)
         npt.assert_allclose(norms, 1.0, atol=1e-6)
 
+    def _install_underflowing_beam(self, monkeypatch, n=5):
+        """A beam with one pixel that only underflows once normalised.
+
+        ``1e-42`` is representable as a float32 subnormal, so it survives the
+        cast; divided by the beam sum it does not.
+        """
+        ra, dec, _ = _make_gaussian_beam(n=n)
+        pm = np.full((n, n), 1e3)
+        pm[0, 0] = 1e-42
+        self._install_fake_load_beam(monkeypatch, ra, dec, pm)
+
+    def test_weights_underflowing_after_normalisation_are_dropped(self, monkeypatch):
+        self._install_underflowing_beam(monkeypatch)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+            precision_dtype=np.float32,
+        )
+
+        d = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])["b.fits"]
+
+        assert d["n_sel"] == 24
+        assert not d["sel"][0, 0]
+        assert (d["beam_vals"] != 0).all()
+        assert d["vec_orig"].shape[0] == 24
+        npt.assert_allclose(float(d["beam_vals"].sum()), 1.0, rtol=1e-6)
+
+    def test_no_pixel_is_dropped_at_float64(self, monkeypatch):
+        """The same beam underflows nothing at the production precision."""
+        self._install_underflowing_beam(monkeypatch)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+            precision_dtype=np.float64,
+        )
+
+        d = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])["b.fits"]
+
+        assert d["n_sel"] == 25
+        assert (d["beam_vals"] != 0).all()
+
     def test_square_grid_is_accepted_by_beam_symmetric(self, monkeypatch):
         ra, dec, pm = _make_gaussian_beam(n=21)
         self._install_fake_load_beam(monkeypatch, ra, dec, pm)
