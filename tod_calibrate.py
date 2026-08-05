@@ -919,7 +919,12 @@ def calibrate_beam_clustering(
 
     passing = [r for r in ok_m0 if (q2_cap is None) or r[6] <= q2_cap]
     if passing:
-        best = max(passing, key=lambda x: x[4])
+        # Rank on speedup, break ties on the least added ellipticity. A whitened
+        # row and its plain twin cluster the same tail to the same K, so their
+        # speedups are identical and the whiten axis presents nothing but ties;
+        # without the second key every one of them resolves to whichever leg was
+        # swept first, independently of how much shape error it commits.
+        best = max(passing, key=lambda x: (x[4], -x[6]))
         print(
             f"\n[clust_calib] Recommendation: tail_fraction={best[0]}, "
             f"n_clusters={best[1]}, whiten={best[2]}  "
