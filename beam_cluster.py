@@ -287,7 +287,8 @@ def c4_orbits(di: np.ndarray, dj: np.ndarray) -> tuple:
         C4 orbit each node belongs to, ``rot`` is which of the four rotations
         maps the orbit's representative onto that node. Nodes whose orbit is
         not fully present on the grid get a unique orbit of their own and
-        ``rot = 0``, so they are simply left unmerged.
+        ``rot = -1``, which marks them as having no siblings to cancel
+        against; the clusterer gives each of them a cell of its own.
     """
     di = np.asarray(di, dtype=np.int64)
     dj = np.asarray(dj, dtype=np.int64)
@@ -308,7 +309,7 @@ def c4_orbits(di: np.ndarray, dj: np.ndarray) -> tuple:
     orbit[closed] = orbit_closed
     n_closed = int(orbit_closed.max()) + 1 if closed.any() else 0
     orbit[~closed] = n_closed + np.arange(int((~closed).sum()))
-    rot[~closed] = 0
+    rot[~closed] = -1
     return orbit, rot
 
 
@@ -671,9 +672,15 @@ def cluster_beam_pixels(
         orbit_t, rot_t = orbit_all[tail_idx], rot_all[tail_idx]
         rng = np.random.default_rng(random_state)
 
+        # A node whose orbit is not fully present has no siblings to cancel
+        # against, so it is kept in a cell of its own.  Merging it into a cell
+        # instead would give that cell members its three images do not have,
+        # which is exactly the equivariance the cancellation rests on.
+        lone = rot_t < 0
+        n_lone = int(lone.sum())
         fd = rot_t == 0  # the fundamental domain: one representative per orbit
         _, orbit_c = np.unique(orbit_t, return_inverse=True)
-        K_fd = max(1, min(K_tail // 4, int(fd.sum())))
+        K_fd = max(1, min((K_tail - n_lone) // 4, int(fd.sum())))
 
         if K_fd >= int(fd.sum()):
             base_of_orbit = np.empty(orbit_c.max() + 1, dtype=np.int64)
@@ -695,13 +702,19 @@ def cluster_beam_pixels(
             base_of_orbit = np.empty(orbit_c.max() + 1, dtype=np.int64)
             base_of_orbit[orbit_c[fd]] = lab_fd
 
-        tail_labels = base_of_orbit[orbit_c] * 4 + rot_t.astype(np.int64)
+        tail_labels = np.empty(n_tail, dtype=np.int64)
+        tail_labels[~lone] = base_of_orbit[orbit_c[~lone]] * 4 + rot_t[~lone].astype(
+            np.int64
+        )
+        n_merged = int(tail_labels[~lone].max()) + 1 if n_lone < n_tail else 0
+        tail_labels[lone] = n_merged + np.arange(n_lone)
         _, tail_labels = np.unique(tail_labels, return_inverse=True)
         K_tail = int(tail_labels.max()) + 1
         if verbose:
             print(
                 f"    [cluster] C4 tail: {n_tail} → {K_tail} clusters "
-                f"({int(fd.sum())} quadrant nodes → {K_fd} × 4)"
+                f"({int(fd.sum())} quadrant nodes → {K_fd} × 4, "
+                f"{n_lone} unpaired kept apart)"
             )
         centroids_t, cw_t = _centroids_from_labels(vec_t, bv_t, tail_labels, K_tail)
         vec_tail, bv_tail = centroids_t, cw_t

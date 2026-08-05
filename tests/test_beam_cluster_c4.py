@@ -212,6 +212,63 @@ class TestC4Clustering:
                 assert len(np.unique(lab[m])) == 4
 
 
+class TestRaggedNodeSet:
+    """An orbit that does not close has no siblings, so it must stay apart.
+
+    ``prepare_beam_data`` drops zero-weight pixels, and it drops them from a
+    region that is not 90-degree symmetric, so the node set reaching the
+    clusterer can be ragged even on an odd grid.  Merging such a node into a
+    cell gives that cell members its three images do not have, which is the
+    equivariance the cancellation rests on.
+    """
+
+    def _ragged(self, sx=8.0, sy=8.0):
+        """A beam with one asymmetric wedge of nodes removed."""
+        vec, w, di, dj = _beam(sx, sy)
+        keep = ~((di > 15) & (dj > 20))
+        return vec[keep], w[keep] / w[keep].sum(), di[keep], dj[keep]
+
+    def test_broken_orbits_are_marked(self):
+        _, _, di, dj = self._ragged()
+        orbit, rot = c4_orbits(di, dj)
+        lone = rot < 0
+        assert lone.any()
+        counts = np.bincount(orbit)
+        assert (counts[orbit[lone]] == 1).all()
+        assert (counts[orbit[~lone]] != 3).all()
+
+    def test_unpaired_nodes_get_a_cell_of_their_own(self):
+        vec, w, di, dj = self._ragged()
+        orbit, rot = c4_orbits(di, dj)
+        _, w_out, lab = cluster_beam_pixels(
+            vec, w, n_clusters=48, tail_fraction=0.3, verbose=False, c4=(orbit, rot)
+        )
+        sizes = np.bincount(lab, minlength=len(w_out))
+        assert (sizes[lab[rot < 0]] == 1).all()
+
+    def test_closed_orbits_still_land_in_four_cells(self):
+        vec, w, di, dj = self._ragged()
+        orbit, rot = c4_orbits(di, dj)
+        _, _, lab = cluster_beam_pixels(
+            vec, w, n_clusters=48, tail_fraction=0.3, verbose=False, c4=(orbit, rot)
+        )
+        for o in np.unique(orbit[rot > 0]):
+            m = orbit == o
+            assert len(np.unique(lab[m])) == 4
+
+    def test_mass_is_preserved_on_a_ragged_set(self):
+        vec, w, di, dj = self._ragged()
+        _, w_out, _ = cluster_beam_pixels(
+            vec,
+            w,
+            n_clusters=48,
+            tail_fraction=0.3,
+            verbose=False,
+            c4=c4_orbits(di, dj),
+        )
+        assert w_out.sum() == pytest.approx(w.sum(), rel=1e-12)
+
+
 class TestNullTestSymmetricBeam:
     """A round beam has no ellipticity, so clustering must not add one."""
 
