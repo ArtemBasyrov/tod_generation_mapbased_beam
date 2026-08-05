@@ -232,6 +232,50 @@ class TestPrepareBeamData:
         norms = np.linalg.norm(v.astype(np.float64), axis=1)
         npt.assert_allclose(norms, 1.0, atol=1e-6)
 
+    def test_square_grid_is_accepted_by_beam_symmetric(self, monkeypatch):
+        ra, dec, pm = _make_gaussian_beam(n=21)
+        self._install_fake_load_beam(monkeypatch, ra, dec, pm)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+            beam_symmetric=True,
+        )
+
+        beam_data = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])
+        assert "c4" in beam_data["b.fits"]
+
+    def test_rectangular_grid_is_rejected_by_beam_symmetric(self, monkeypatch):
+        """The index rotation is only a sky rotation on a square grid."""
+        ra, dec, pm = _make_gaussian_beam(n=21)
+        self._install_fake_load_beam(monkeypatch, ra, 2.0 * dec, pm)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+            beam_symmetric=True,
+        )
+
+        with pytest.raises(ValueError, match="square beam grid"):
+            pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])
+
+    def test_rectangular_grid_is_allowed_without_beam_symmetric(self, monkeypatch):
+        """The precondition belongs to quadrant clustering, not to loading."""
+        ra, dec, pm = _make_gaussian_beam(n=21)
+        self._install_fake_load_beam(monkeypatch, ra, 2.0 * dec, pm)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+            beam_symmetric=False,
+        )
+
+        beam_data = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])
+        assert "c4" not in beam_data["b.fits"]
+
 
 # ===========================================================================
 # TestApplyBeamClustering

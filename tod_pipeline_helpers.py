@@ -31,6 +31,39 @@ from beam_cluster import (
 )
 
 
+_GRID_SQUARENESS_TOL = 1e-6
+
+
+def _check_square_beam_grid(filename, ra, dec):
+    """Verify the beam grid has equal RA and Dec spacings.
+
+    Quadrant clustering rotates *grid indices*, ``(di, dj) -> (-dj, di)``, which
+    is a 90-degree rotation on the sky only when the two spacings match. On a
+    rectangular grid it is a rotation composed with an anisotropic scaling, and
+    the ``m = +-2`` cancellation the path exists for does not hold at all — so
+    this is a precondition, not a tolerance to be traded.
+
+    Args:
+        filename (str): Beam filename, for the error message.
+        ra: (H, W) RA offset grid [rad]; the column index runs with RA.
+        dec: (H, W) Dec offset grid [rad]; the row index runs with Dec.
+
+    Raises:
+        ValueError: If the two spacings differ by more than a relative 1e-6.
+    """
+    d_dec = float(np.abs(np.diff(dec, axis=0)).mean())
+    d_ra = float(np.abs(np.diff(ra, axis=1)).mean())
+    if abs(d_ra - d_dec) > _GRID_SQUARENESS_TOL * max(d_ra, d_dec):
+        raise ValueError(
+            f"beam_symmetric requires a square beam grid, but {filename} is "
+            f"gridded at {np.degrees(d_ra) * 60:.6f}' in RA and "
+            f"{np.degrees(d_dec) * 60:.6f}' in Dec. Quadrant clustering would "
+            f"rotate the grid into an anisotropic scaling of itself and would "
+            f"not cancel the m = +-2 artifact. Regrid the beam, or set "
+            f"beam_symmetric: false."
+        )
+
+
 def prepare_beam_data(beam_filenames, active_fields=None):
     """Load and preprocess all unique beam files into a beam-data dictionary.
 
@@ -148,6 +181,7 @@ def prepare_beam_data(beam_filenames, active_fields=None):
         }
 
         if config.beam_symmetric:
+            _check_square_beam_grid(bf, ra, dec)
             # Grid offsets from the beam-centre pixel, in the same convention
             # load_beam used to centre the RA/Dec offsets.
             H, W = weighted_map.shape
