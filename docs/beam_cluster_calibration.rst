@@ -327,6 +327,11 @@ to +65.5°, against the beam's own axis of +71.8°.
    shape-preserving only below the crossover cluster count
    :math:`K_\times` and whether it pays above that depends on the beam.
 
+   ``beam_cluster_whiten`` is **ignored entirely** when ``beam_symmetric:
+   true``: the quadrant path described below clusters in the original frame
+   whatever the flag says, and the calibration collapses the ``whiten`` axis
+   to a single leg rather than sweeping one that measures nothing.
+
 Symmetric Beams — ``beam_symmetric``
 --------------------------------------
 
@@ -350,6 +355,14 @@ axes — so the four contributions cancel:
 The cancellation is exact and independent of the cluster count, of
 :math:`K/K_\times`, and of any threshold.  Node count is unchanged, so it is
 free.
+
+The two mechanisms are alternatives on the same axis, not a stack: with
+``beam_symmetric: true`` the quadrant k-means runs in the original frame and
+:ref:`whitened assignment <whitened_assignment>` never engages, whatever
+``beam_cluster_whiten`` is set to.  Whitening re-aims the second-moment
+deficit onto the beam's own axes, which a round beam does not have; the
+:math:`C_4` construction cancels the deficit's :math:`m = \pm2` part outright
+instead.
 
 .. list-table::
    :header-rows: 1

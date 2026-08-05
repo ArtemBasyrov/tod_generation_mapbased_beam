@@ -75,6 +75,8 @@
   # K_x depends on the beam and the grid together, so no fixed value is right
   # for every beam.  The calibration below sweeps this and reports K_x; prefer
   # that to guessing.
+  # Ignored when beam_symmetric: true — the quadrant path below clusters in the
+  # original frame, and its m = ±2 cancellation needs no whitening.
   beam_cluster_whiten: true
   # Declare the beam a function of angular distance alone. Merging beam nodes
   # makes each cell a small anisotropic smear, so the effective beam comes out
