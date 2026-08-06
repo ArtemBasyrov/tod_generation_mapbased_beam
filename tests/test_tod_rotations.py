@@ -120,17 +120,50 @@ class TestRotationParams:
         assert cos_p.shape == (B,)
         assert sin_p.shape == (B,)
 
-    def test_all_working_precision(self):
-        """All returned arrays carry the configured working precision."""
+    def test_always_float64(self):
+        """The rotation scalars are float64 whatever `precision` is set to.
+
+        Storing a 2*pi-magnitude boresight angle at float32 costs an absolute
+        2*pi*u, which the beam-convolved sky amplifies into a 4.6e-5 white
+        floor in Q/U. These arrays are O(batch), so holding them at float64 is
+        free; the guarantee must not be quietly re-tied to `precision`.
+        """
         import tod_config
 
         B = 5
         rot_vecs, phi_b, theta_b, psis_b = self._make_inputs(B)
-        outputs = _rotation_params(rot_vecs, phi_b, theta_b, psis_b)
-        for arr in outputs:
-            assert arr.dtype == tod_config.precision_dtype, (
-                f"Expected {tod_config.precision_dtype}, got {arr.dtype}"
-            )
+        saved = tod_config.precision_dtype
+        try:
+            for dt in (np.float32, np.float64):
+                tod_config.precision_dtype = dt
+                for arr in _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
+                    assert arr.dtype == np.float64, (
+                        f"precision={dt.__name__}: expected float64, got {arr.dtype}"
+                    )
+        finally:
+            tod_config.precision_dtype = saved
+
+    def test_float64_angles_survive_a_float32_precision_setting(self):
+        """`precision: float32` must not round float64 angles before the trig.
+
+        This is the regression the dtype check alone would miss: returning
+        float64 arrays whose values were computed from angles already rounded
+        to float32 looks fixed and costs the full 2*pi*u32 = 3.7e-7 anyway.
+        """
+        import tod_config
+
+        B = 512
+        rot_vecs, phi_b, theta_b, psis_b = self._make_inputs(B)
+        st, ct = np.sin(theta_b), np.cos(theta_b)
+        want = np.stack([st * np.cos(phi_b), st * np.sin(phi_b), ct], axis=-1)
+
+        saved = tod_config.precision_dtype
+        try:
+            tod_config.precision_dtype = np.float32
+            ax_pts = _rotation_params(rot_vecs, phi_b, theta_b, psis_b)[3]
+        finally:
+            tod_config.precision_dtype = saved
+        assert np.max(np.abs(ax_pts - want)) < 1e-14
 
     def test_zero_rot_vecs(self):
         """Zero rot_vecs produce axes=0, cos_a=1, sin_a=0."""

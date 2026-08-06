@@ -216,8 +216,17 @@ def precompute_rotation_vector_batch(ra, dec, phi_batch, theta_batch, center_idx
 def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
     """
     Pre-compute the per-sample scalars needed by _rodrigues_jit from the
-    Rodrigues vectors and pointing angles.  All outputs follow
-    ``tod_config.precision_dtype``.
+    Rodrigues vectors and pointing angles.
+
+    All outputs are ``float64`` regardless of ``tod_config.precision``, and the
+    trigonometry is evaluated before any rounding.  Both halves of that matter.
+    A boresight angle runs up to 2*pi, so rounding it carries an absolute error
+    2*pi*u, where the bounded direction cosine it becomes carries only u; the
+    beam-convolved sky then amplifies the resulting pointing displacement by
+    l_eff/sqrt(2) ~ 265 in polarisation.  At float32 that was a 4.6e-5 white
+    floor in Q/U, the largest single error the pipeline committed at that
+    precision.  These are O(batch) arrays, so holding them at float64 is free
+    against the sky map.
 
     Returns
     -------
@@ -230,7 +239,7 @@ def _rotation_params(rot_vecs, phi_b, theta_b, psis_b):
     cos_p  : (B,)    cos of the Rodrigues-2 angle ``psis_b``.
     sin_p  : (B,)    sin of the Rodrigues-2 angle.
     """
-    dt = config.precision_dtype
+    dt = np.float64
     angles = np.linalg.norm(rot_vecs, axis=-1).astype(dt)  # (B,)
     safe = angles > dt(1e-10)
     axes = (rot_vecs / np.where(safe[:, None], angles[:, None], dt(1.0))).astype(dt)

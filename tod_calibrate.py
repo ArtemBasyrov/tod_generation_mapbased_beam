@@ -235,8 +235,10 @@ def _max_batch_for_memory(mem_per_proc_gb, beam_data, nside, interp_mode):
 
 
 def _make_probe_data(beam_data, folder_scan, probe_day, n_samples):
+    # float64 to match the generator, which holds the pointing at float64
+    # whatever `precision` says (see tod_rotations._rotation_params).
     theta_p, phi_p, psi_p = load_scan_data_batch(
-        folder_scan, probe_day, 0, n_samples, dtype=config.precision_dtype
+        folder_scan, probe_day, 0, n_samples, dtype=np.float64
     )
     n = min(n_samples, len(phi_p))
     return phi_p[:n], theta_p[:n], psi_p[:n]

@@ -150,9 +150,16 @@ def tod_exact_gen_batched(
                 + f"Batch {batch_idx + 1}/{n_batches}  samples {bs}-{be - 1}  ETA {eta_str}"
             )
 
-        theta_b = np.array(theta_mmap[bs:be], dtype=config.precision_dtype)
-        phi_b = np.array(phi_mmap[bs:be], dtype=config.precision_dtype)
-        psi_b = np.array(psi_mmap[bs:be], dtype=config.precision_dtype)
+        # Pointing is always float64, whatever `precision` says.  Boresight
+        # angles run up to 2*pi, so storing them at float32 costs an absolute
+        # 2*pi*u rather than the u a bounded direction cosine costs; the beam-
+        # convolved sky then amplifies that displacement by l_eff/sqrt(2) ~ 265
+        # in polarisation, which at float32 is a 4.6e-5 white floor in Q/U --
+        # the same size as the pipeline's irreducible one.  These are O(batch)
+        # arrays, so the extra memory is negligible.
+        theta_b = np.array(theta_mmap[bs:be], dtype=np.float64)
+        phi_b = np.array(phi_mmap[bs:be], dtype=np.float64)
+        psi_b = np.array(psi_mmap[bs:be], dtype=np.float64)
         rot_vecs, betas = precompute_rotation_vector_batch(
             ra0, dec0, phi_b, theta_b, center_idx=beam_center_idx
         )

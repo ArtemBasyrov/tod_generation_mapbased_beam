@@ -117,12 +117,15 @@
   # the beam's own quadrupole, which is the number to weigh against a leakage
   # budget.
   clustering_ellipticity_tolerance: 1.0
-  # Working precision for the float32-side of the pipeline (sky map, pointings,
-  # beam values, Rodrigues rotation, saved TOD). Float64 surfaces (bilinear
-  # weights, spin-2 cache, accumulators, B_ell) are unchanged either way.
-  # 'float32' (default) matches legacy behaviour; 'float64' is a precision
-  # validation knob — slower and uses more memory but isolates whether
-  # high-ell residuals are precision-limited.
+  # Working precision for the float32-side of the pipeline (sky map, beam
+  # values and vectors, saved TOD). Unaffected either way: the bilinear
+  # weights, the spin-2 cache, the accumulators, B_ell — and the pointing,
+  # which is always float64 because storing 2*pi-magnitude boresight angles at
+  # float32 cost a 4.6e-5 white floor in Q/U, as large as the pipeline's
+  # irreducible one (see tod_rotations._rotation_params).
+  # With the pointing fixed, the remaining float32 cost is the beam node
+  # vectors at 3.8e-6 of the TOD rms. Set 'float64' to remove that too, at
+  # roughly double the sky-map memory.
   precision: 'float32'
   # Half-wave plate (HWP) modulation.
   # When enabled, the TOD generator rotates the per-sample (Q, U) output by
