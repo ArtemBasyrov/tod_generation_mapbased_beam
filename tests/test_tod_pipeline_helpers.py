@@ -598,7 +598,12 @@ class TestApplyHwpModulation:
         assert tod.shape == (3, 0)
 
     def test_QU_norm_is_preserved(self):
-        """An ideal HWP is a rotation in (Q,U) space; Q²+U² is invariant per sample."""
+        """Polarized intensity is invariant per sample.
+
+        Necessary but not sufficient: Q²+U² is preserved by a reflection too, so
+        this cannot pin the operator down — see
+        ``test_matches_ideal_hwp_mueller_after_polarizer`` for that.
+        """
         tod = self._make_batch(B=128, dtype=np.float64)
         norm_before = tod[1] ** 2 + tod[2] ** 2
         pph.apply_hwp_modulation(
@@ -636,6 +641,66 @@ class TestApplyHwpModulation:
         U_expected = -Q0 * s + U0 * c
         npt.assert_allclose(tod[1], Q_expected, rtol=1e-12, atol=1e-12)
         npt.assert_allclose(tod[2], U_expected, rtol=1e-12, atol=1e-12)
+
+    def test_matches_ideal_hwp_mueller_after_polarizer(self):
+        """End-to-end against the ideal-HWP Mueller matrix and a polarizer at psi.
+
+        The rows carry *sky-frame* Stokes: the gather applies only the spin-2
+        transport, and the detector angle psi is applied downstream by the
+        polarizer. The plate is instrument-fixed, so its fast axis sits at
+        ``phi_sky = phi + psi`` in that frame, and the ideal HWP there is the
+        reflection ``diag(1, 1, -1, -1)`` rotated to ``phi_sky`` — not the
+        rotation this function applies. The two agree only after the polarizer
+        projects at psi, which is what makes the in-place rotation the correct
+        operator on sky-frame rows. Both must reduce to
+
+            d = T + Q*cos(4*phi + 2*psi) + U*sin(4*phi + 2*psi).
+
+        A reflection applied directly to the rows fails this at O(signal).
+        """
+        B = 256
+        fsamp, f_hwp, phi0 = 19.0, 1.7, 0.31
+        day_index, sample_start = 2, 7
+        rng = np.random.default_rng(0)
+        T0, Q0, U0 = rng.normal(size=3)
+        psi = rng.uniform(0.0, 2.0 * np.pi, B)
+
+        tod = np.empty((3, B), dtype=np.float64)
+        tod[0], tod[1], tod[2] = T0, Q0, U0
+        pph.apply_hwp_modulation(
+            tod,
+            day_index=day_index,
+            sample_start=sample_start,
+            fsamp=fsamp,
+            f_hwp=f_hwp,
+            phi0=phi0,
+        )
+        d_code = tod[0] + tod[1] * np.cos(2.0 * psi) + tod[2] * np.sin(2.0 * psi)
+
+        dt = 1.0 / fsamp
+        t = day_index * 86400.0 + sample_start * dt + np.arange(B) * dt
+        phi = 2.0 * np.pi * f_hwp * t + phi0
+        phi_sky = phi + psi
+        Q_out = Q0 * np.cos(4.0 * phi_sky) + U0 * np.sin(4.0 * phi_sky)
+        U_out = Q0 * np.sin(4.0 * phi_sky) - U0 * np.cos(4.0 * phi_sky)
+        d_mueller = T0 + Q_out * np.cos(2.0 * psi) + U_out * np.sin(2.0 * psi)
+
+        d_closed = (
+            T0 + Q0 * np.cos(4.0 * phi + 2.0 * psi) + U0 * np.sin(4.0 * phi + 2.0 * psi)
+        )
+
+        # The phase argument reaches ~1e7 rad after two days, so float64 carries
+        # only ~1e-9 absolute accuracy in cos/sin here; the signal is O(1).
+        npt.assert_allclose(d_code, d_mueller, rtol=0.0, atol=1e-8)
+        npt.assert_allclose(d_code, d_closed, rtol=0.0, atol=1e-8)
+
+        # Guard the determinant: swapping the rotation for a reflection on the
+        # sky-frame rows changes the detected signal by O(signal), so this test
+        # discriminates the two where the Q^2+U^2 invariance above cannot.
+        q_refl = Q0 * np.cos(4.0 * phi) + U0 * np.sin(4.0 * phi)
+        u_refl = Q0 * np.sin(4.0 * phi) - U0 * np.cos(4.0 * phi)
+        d_refl = T0 + q_refl * np.cos(2.0 * psi) + u_refl * np.sin(2.0 * psi)
+        assert np.abs(d_refl - d_mueller).max() > 0.5 * d_mueller.std()
 
     def test_phase_continuity_across_days(self):
         """Sample 0 of day_index=1 must continue the phase from end of day 0."""
