@@ -7,6 +7,9 @@ called from within parallel Numba kernels.
 _ring_above_jit         — scalar ring_above helper (nopython, no parallel).
 _ring_info_jit          — scalar ring layout helper: (n_pix, first_pix, phi0, dphi).
 _ring_z_jit             — scalar ring centre z = cos(theta) helper.
+_wrap_ring_phase        — exact branch-based replacement for the fractional
+                          ring position's modulo.
+_build_ring_theta       — per-ring acos table hoisted out of the sample loop.
 _get_interp_weights_jit — parallel (prange over N) replacement for
                           hp.get_interp_weights; mirrors the HEALPix C++
                           get_interpol algorithm exactly.
@@ -111,6 +114,52 @@ def _ring_z_jit(nside, ir):
         return -(1.0 - tmp * tmp / (3.0 * nside * nside))
 
 
+@numba.jit(nopython=True, cache=True, inline="always")
+def _wrap_ring_phase(tw, n_pix):
+    """Reduce a fractional ring position into ``[0, n_pix)``, as ``tw % n_pix``.
+
+    ``tw = (phi - phi0) / dphi`` lies in ``[-0.5, n_pix]``: ``phi0`` is either 0
+    or half a pixel, and ``phi`` reaches exactly 2π when the caller maps a
+    negative ``atan2`` result into ``[0, 2π)``.  A single correction on either
+    side therefore reproduces the modulo exactly, with no ``fmod`` call.
+
+    **Both branches are load-bearing.** Dropping the upper one is silently wrong
+    rather than merely imprecise: on the half of equatorial-belt rings that are
+    unshifted (``phi0 = 0``), ``2π / dphi`` is an exact power-of-two quotient, so
+    ``tw == n_pix`` exactly, and leaving it unreduced selects the *first pixel of
+    the next ring*.  See ``TestWrapRingPhase`` in ``tests/test_numba_healpy.py``.
+    """
+    if tw < 0.0:
+        return tw + n_pix
+    elif tw >= n_pix:
+        return tw - n_pix
+    return tw
+
+
+@numba.jit(nopython=True, cache=True)
+def _build_ring_theta(nside):
+    """Colatitudes of every RING ring centre, indexed by 1-based ring number.
+
+    ``acos`` of a ring centre depends only on the ring, so the bilinear kernels
+    hoist it here instead of recomputing it per sample.  Entry ``ir`` holds
+    exactly ``math.acos(_ring_z_jit(nside, ir))`` — the same call on the same
+    input — so a table lookup is bit-identical to the inline computation, not an
+    approximation.  Slot 0 is unused (rings are 1-based).
+
+    The table must be rebuilt whenever ``nside`` changes; the kernels build it
+    per call, which makes that automatic.
+
+    Returns:
+        numpy.ndarray: ``(4 * nside,)`` float64 ring colatitudes [rad].
+    """
+    n = 4 * nside
+    out = np.empty(n, dtype=np.float64)
+    out[0] = 0.0
+    for ir in range(1, n):
+        out[ir] = math.acos(_ring_z_jit(nside, ir))
+    return out
+
+
 # ── Standalone parallel interp-weights kernel ─────────────────────────────────
 
 
@@ -123,8 +172,10 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
     boundary special cases.  Each of the N iterations is fully independent;
     parallelised with prange.
 
-    Phi interpolation uses float-modulo then floor (equivalent to the
-    jax_healpy reference) so that points with phi < phi0 wrap correctly.
+    Phi interpolation reduces the fractional ring position with
+    :func:`_wrap_ring_phase` then floors it, so points with phi < phi0 wrap
+    correctly.  Ring colatitudes come from a :func:`_build_ring_theta` table
+    built once here rather than an ``acos`` per sample.
 
     Parameters
     ----------
@@ -135,6 +186,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
     wgt_out   : (4, N) float64 written in place
     """
     npix_total = 12 * nside * nside
+    ring_theta = _build_ring_theta(nside)
     N = theta_arr.shape[0]
     for i in numba.prange(N):
         theta = theta_arr[i]
@@ -149,7 +201,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             # Point is north of ring 1.  Use ring 1 for all pixel selection;
             # the "above" pair are the two opposite pixels in ring 1 (shift +2).
             na, fpa, phi0a, dphia = _ring_info_jit(nside, 1, npix_total)
-            tw = ((phi - phi0a) / dphia) % float(na)
+            tw = _wrap_ring_phase((phi - phi0a) / dphia, na)
             ip = int(tw)
             frac = tw - ip
             ip2 = (ip + 1) % na
@@ -161,7 +213,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             p1 = (ip2 + 2) % na
             # theta weight: theta1 = 0 at north pole → w = theta / theta2
             za = _ring_z_jit(nside, 1)
-            ta = math.acos(za)
+            ta = ring_theta[1]
             w_theta = theta / ta
             nf = (1.0 - w_theta) * 0.25  # north_factor (equal spread)
             pix_out[0, i] = p0
@@ -179,7 +231,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             # all pixel selection; the "below" pair are the two opposite pixels.
             ir_last = 4 * nside - 1
             na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_last, npix_total)
-            tw = ((phi - phi0a) / dphia) % float(na)
+            tw = _wrap_ring_phase((phi - phi0a) / dphia, na)
             ip = int(tw)
             frac = tw - ip
             ip2 = (ip + 1) % na
@@ -191,7 +243,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             p3 = (ip2 + 2) % na + fpa
             # theta weight toward south pole
             za = _ring_z_jit(nside, ir_last)
-            ta = math.acos(za)
+            ta = ring_theta[ir_last]
             w_theta_south = (theta - ta) / (math.pi - ta)
             sf = w_theta_south * 0.25  # south_factor
             pix_out[0, i] = p0
@@ -207,14 +259,14 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
             # ── Normal case ───────────────────────────────────────────────────
             za = _ring_z_jit(nside, ir_above)
             zb = _ring_z_jit(nside, ir_below)
-            ta = math.acos(za)
-            tb = math.acos(zb)
+            ta = ring_theta[ir_above]
+            tb = ring_theta[ir_below]
             w_below = (theta - ta) / (tb - ta)
             w_above = 1.0 - w_below
 
             # Ring above → pixels 0, 1
             na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_above, npix_total)
-            tw = ((phi - phi0a) / dphia) % float(na)
+            tw = _wrap_ring_phase((phi - phi0a) / dphia, na)
             iphia = int(tw)
             fphia = tw - iphia
             pix_out[0, i] = fpa + iphia
@@ -224,7 +276,7 @@ def _get_interp_weights_jit(nside, theta_arr, phi_arr, pix_out, wgt_out):
 
             # Ring below → pixels 2, 3
             nb, fpb, phi0b, dphib = _ring_info_jit(nside, ir_below, npix_total)
-            tw = ((phi - phi0b) / dphib) % float(nb)
+            tw = _wrap_ring_phase((phi - phi0b) / dphib, nb)
             iphib = int(tw)
             fphib = tw - iphib
             pix_out[2, i] = fpb + iphib
@@ -254,7 +306,7 @@ def get_interp_weights_numba(nside, theta, phi):
 
 
 @numba.jit(nopython=True, cache=True)
-def _ring_interp_single_jit(nside, z, phi_w, npix_total):
+def _ring_interp_single_jit(nside, z, phi_w, npix_total, ring_theta=None):
     """Bilinear HEALPix RING neighbour lookup for one unit-vector query.
 
     Mirrors the HEALPix C++ ``get_interpol`` algorithm bit-for-bit, including
@@ -268,6 +320,11 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
     z          : float   cos θ of the query point, clamped to [−1, 1]
     phi_w      : float   longitude of the query point in [0, 2π)
     npix_total : int     12 * nside * nside (pre-computed by caller)
+    ring_theta : (4*nside,) float64 or None
+        Optional :func:`_build_ring_theta` table.  When given, ring
+        colatitudes are read from it instead of recomputed with ``acos``;
+        the table stores exactly those ``acos`` values, so results are
+        bit-identical either way.  Hot callers pass it; everyone else omits it.
 
     Returns
     -------
@@ -280,7 +337,7 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
     if ir_above == 0:
         # ── North-pole boundary ───────────────────────────────────────────────
         na, fpa, phi0a, dphia = _ring_info_jit(nside, 1, npix_total)
-        tw = ((phi_w - phi0a) / dphia) % float(na)
+        tw = _wrap_ring_phase((phi_w - phi0a) / dphia, na)
         ip_a = int(tw)
         frac = tw - ip_a
         ip_a2 = (ip_a + 1) % na
@@ -289,7 +346,7 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
         p2 = fpa + ip_a
         p3 = fpa + ip_a2
         za = _ring_z_jit(nside, 1)
-        ta = math.acos(za)
+        ta = math.acos(za) if ring_theta is None else ring_theta[1]
         # Query colatitude θ from clamped z; safe since z in [-1, 1].
         theta = math.acos(z)
         w_theta = theta / ta
@@ -303,7 +360,7 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
         # ── South-pole boundary ───────────────────────────────────────────────
         ir_last = 4 * nside - 1
         na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_last, npix_total)
-        tw = ((phi_w - phi0a) / dphia) % float(na)
+        tw = _wrap_ring_phase((phi_w - phi0a) / dphia, na)
         ip_a = int(tw)
         frac = tw - ip_a
         ip_a2 = (ip_a + 1) % na
@@ -312,7 +369,7 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
         p2 = (ip_a + 2) % na + fpa
         p3 = (ip_a2 + 2) % na + fpa
         za = _ring_z_jit(nside, ir_last)
-        ta = math.acos(za)
+        ta = math.acos(za) if ring_theta is None else ring_theta[ir_last]
         theta = math.acos(z)
         w_theta_south = (theta - ta) / (math.pi - ta)
         sf = w_theta_south * 0.25
@@ -325,14 +382,18 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
         # ── Normal case — exact θ via acos, matches hp.get_interp_weights ────
         za = _ring_z_jit(nside, ir_above)
         zb = _ring_z_jit(nside, ir_below)
-        ta = math.acos(za)
-        tb = math.acos(zb)
+        if ring_theta is None:
+            ta = math.acos(za)
+            tb = math.acos(zb)
+        else:
+            ta = ring_theta[ir_above]
+            tb = ring_theta[ir_below]
         theta = math.acos(z)
         w_below = (theta - ta) / (tb - ta)
         w_above = 1.0 - w_below
 
         na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_above, npix_total)
-        tw = ((phi_w - phi0a) / dphia) % float(na)
+        tw = _wrap_ring_phase((phi_w - phi0a) / dphia, na)
         iphia = int(tw)
         fphia = tw - iphia
         p0 = fpa + iphia
@@ -341,7 +402,7 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
         w1 = w_above * fphia
 
         nb, fpb, phi0b, dphib = _ring_info_jit(nside, ir_below, npix_total)
-        tw = ((phi_w - phi0b) / dphib) % float(nb)
+        tw = _wrap_ring_phase((phi_w - phi0b) / dphib, nb)
         iphib = int(tw)
         fphib = tw - iphib
         p2 = fpb + iphib
@@ -353,7 +414,7 @@ def _ring_interp_single_jit(nside, z, phi_w, npix_total):
 
 
 @numba.jit(nopython=True, cache=True)
-def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
+def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total, ring_theta=None):
     """Bilinear HEALPix RING neighbour lookup, returning neighbour angles too.
 
     Identical math to :func:`_ring_interp_single_jit` but additionally returns
@@ -367,6 +428,11 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
     z          : float   cos θ of the query point, clamped to [−1, 1]
     phi_w      : float   longitude of the query point in [0, 2π)
     npix_total : int     12 * nside * nside (pre-computed by caller)
+    ring_theta : (4*nside,) float64 or None
+        Optional :func:`_build_ring_theta` table.  When given, ring
+        colatitudes are read from it instead of recomputed with ``acos``;
+        the table stores exactly those ``acos`` values, so results are
+        bit-identical either way.  Hot callers pass it; everyone else omits it.
 
     Returns
     -------
@@ -381,7 +447,7 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
     if ir_above == 0:
         # ── North-pole boundary ───────────────────────────────────────────────
         na, fpa, phi0a, dphia = _ring_info_jit(nside, 1, npix_total)
-        tw = ((phi_w - phi0a) / dphia) % float(na)
+        tw = _wrap_ring_phase((phi_w - phi0a) / dphia, na)
         ip_a = int(tw)
         frac = tw - ip_a
         ip_a2 = (ip_a + 1) % na
@@ -390,7 +456,7 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
         p2 = fpa + ip_a
         p3 = fpa + ip_a2
         za = _ring_z_jit(nside, 1)
-        ta = math.acos(za)
+        ta = math.acos(za) if ring_theta is None else ring_theta[1]
         theta = math.acos(z)
         w_theta = theta / ta
         nf = (1.0 - w_theta) * 0.25
@@ -411,7 +477,7 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
         # ── South-pole boundary ───────────────────────────────────────────────
         ir_last = 4 * nside - 1
         na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_last, npix_total)
-        tw = ((phi_w - phi0a) / dphia) % float(na)
+        tw = _wrap_ring_phase((phi_w - phi0a) / dphia, na)
         ip_a = int(tw)
         frac = tw - ip_a
         ip_a2 = (ip_a + 1) % na
@@ -420,7 +486,7 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
         p2 = fpa + (ip_a + 2) % na
         p3 = fpa + (ip_a2 + 2) % na
         za = _ring_z_jit(nside, ir_last)
-        ta = math.acos(za)
+        ta = math.acos(za) if ring_theta is None else ring_theta[ir_last]
         theta = math.acos(z)
         w_theta_south = (theta - ta) / (math.pi - ta)
         sf = w_theta_south * 0.25
@@ -441,14 +507,18 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
         # ── Normal case — exact θ via acos, matches hp.get_interp_weights ────
         za = _ring_z_jit(nside, ir_above)
         zb = _ring_z_jit(nside, ir_below)
-        ta = math.acos(za)
-        tb = math.acos(zb)
+        if ring_theta is None:
+            ta = math.acos(za)
+            tb = math.acos(zb)
+        else:
+            ta = ring_theta[ir_above]
+            tb = ring_theta[ir_below]
         theta = math.acos(z)
         w_below = (theta - ta) / (tb - ta)
         w_above = 1.0 - w_below
 
         na, fpa, phi0a, dphia = _ring_info_jit(nside, ir_above, npix_total)
-        tw = ((phi_w - phi0a) / dphia) % float(na)
+        tw = _wrap_ring_phase((phi_w - phi0a) / dphia, na)
         iphia = int(tw)
         fphia = tw - iphia
         iphia1 = (iphia + 1) % na
@@ -458,7 +528,7 @@ def _ring_interp_with_angles_jit(nside, z, phi_w, npix_total):
         w1 = w_above * fphia
 
         nb, fpb, phi0b, dphib = _ring_info_jit(nside, ir_below, npix_total)
-        tw = ((phi_w - phi0b) / dphib) % float(nb)
+        tw = _wrap_ring_phase((phi_w - phi0b) / dphib, nb)
         iphib = int(tw)
         fphib = tw - iphib
         iphib1 = (iphib + 1) % nb

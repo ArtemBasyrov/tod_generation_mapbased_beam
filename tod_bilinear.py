@@ -12,6 +12,7 @@ import numpy as np
 import numba
 from numba_healpy import (
     _TWO_PI,
+    _build_ring_theta,
     _ring_interp_single_jit,
     _ring_interp_with_angles_jit,
     get_interp_weights_numba,
@@ -151,6 +152,9 @@ def _gather_accum_fused_jit(
     has_qu = c_q >= 0 and c_u >= 0
     npix_total = 12 * nside * nside
 
+    # Ring colatitudes, hoisted out of the (b, s) loop; see _build_ring_theta.
+    ring_theta = _build_ring_theta(nside)
+
     n_other = 0
     _other_ch = np.empty(C, dtype=np.int64)
     for _c in range(C):
@@ -246,7 +250,9 @@ def _gather_accum_fused_jit(
                         phi_n1,
                         phi_n2,
                         phi_n3,
-                    ) = _ring_interp_with_angles_jit(nside, z, phi_w, npix_total)
+                    ) = _ring_interp_with_angles_jit(
+                        nside, z, phi_w, npix_total, ring_theta
+                    )
 
                     c2d0, s2d0 = _spin2_lookup_cached(
                         p0,
@@ -353,7 +359,7 @@ def _gather_accum_fused_jit(
                     bv = float(beam_vals[s])
 
                     p0, p1, p2, p3, w0, w1, w2, w3 = _ring_interp_single_jit(
-                        nside, z, phi_w, npix_total
+                        nside, z, phi_w, npix_total, ring_theta
                     )
 
                     tod[c_q, b] += (
@@ -412,7 +418,7 @@ def _gather_accum_fused_jit(
                 if phi_w < 0.0:
                     phi_w += _TWO_PI
                 p0, p1, p2, p3, w0, w1, w2, w3 = _ring_interp_single_jit(
-                    nside, z, phi_w, npix_total
+                    nside, z, phi_w, npix_total, ring_theta
                 )
                 bv = float(beam_vals[s])
                 for c in range(C):

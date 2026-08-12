@@ -38,9 +38,12 @@ import numpy.testing as npt
 import pytest
 
 from numba_healpy import (
+    _TWO_PI,
     _ring_above_jit,
     _ring_info_jit,
     _ring_z_jit,
+    _wrap_ring_phase,
+    _build_ring_theta,
     _get_interp_weights_jit,
     get_interp_weights_numba,
     _pix2ang_ring_jit,
@@ -611,6 +614,180 @@ class TestRingInterpWithAnglesJit:
                 nside, math.cos(theta), phi, 12 * nside * nside
             )
             npt.assert_allclose(sum(out[4:8]), 1.0, atol=1e-12)
+
+
+# ===========================================================================
+# TestWrapRingPhase
+# ===========================================================================
+
+
+class TestWrapRingPhase:
+    """Tests for _wrap_ring_phase — the branch form of ``tw % n_pix``.
+
+    These exist to pin down the *upper* branch.  ``tw`` reaches exactly
+    ``n_pix`` on unshifted rings, and a version that only corrects the negative
+    side leaves it there, silently selecting the first pixel of the next ring.
+    A reviewer trimming the ``elif`` as dead code must see these fail.
+    """
+
+    @staticmethod
+    def _low_guard_only(tw, n_pix):
+        """The tempting-but-wrong single-branch version, for contrast."""
+        return tw + n_pix if tw < 0.0 else tw
+
+    @pytest.mark.parametrize("n_pix", [4, 12, 1024, 4096, 8192])
+    def test_matches_modulo_on_a_dense_sweep(self, n_pix):
+        """Agrees with ``%`` as a float, across and beyond the valid range."""
+        rng = np.random.default_rng(0)
+        tws = np.concatenate(
+            [
+                np.linspace(-float(n_pix), 2.0 * n_pix, 4001),
+                rng.uniform(-n_pix, 2 * n_pix, 4000),
+                np.array([-0.5, -0.0, 0.0, float(n_pix), n_pix - 1e-12]),
+            ]
+        )
+        for tw in tws:
+            if not (-n_pix <= tw <= n_pix):
+                continue  # a single correction only spans one modulus
+            assert _wrap_ring_phase(float(tw), n_pix) == float(tw) % float(n_pix)
+
+    @pytest.mark.parametrize("n_pix", [4, 12, 1024, 4096])
+    def test_exact_upper_edge_wraps_to_zero(self, n_pix):
+        """tw == n_pix must reduce to exactly 0.0, as ``%`` does."""
+        assert _wrap_ring_phase(float(n_pix), n_pix) == 0.0
+        assert float(n_pix) % float(n_pix) == 0.0
+        # ...and the single-branch version is what we are guarding against.
+        assert self._low_guard_only(float(n_pix), n_pix) == float(n_pix)
+
+    @pytest.mark.parametrize("n_pix", [4, 12, 1024, 4096])
+    def test_lower_edge_wraps(self, n_pix):
+        """tw == -0.5 (the most negative reachable value) matches ``%``."""
+        assert _wrap_ring_phase(-0.5, n_pix) == (-0.5) % float(n_pix)
+
+    @pytest.mark.parametrize("nside", [4, 16, 256, 1024])
+    def test_phi_two_pi_hits_the_upper_edge_on_real_rings(self, nside):
+        """phi == 2π drives tw to exactly n_pix on every unshifted ring.
+
+        This is the reachable input: the gather kernels map a negative
+        ``atan2`` into [0, 2π) by adding 2π, and ``-1e-17 + 2π == 2π``.
+        """
+        npix = 12 * nside * nside
+        seen_upper_edge = 0
+        for ir in range(1, 4 * nside):
+            n_pix, _fp, phi0, dphi = _ring_info_jit(nside, ir, npix)
+            tw = (_TWO_PI - phi0) / dphi
+            assert _wrap_ring_phase(tw, n_pix) == tw % float(n_pix)
+            if tw == n_pix:
+                seen_upper_edge += 1
+                # the guard we are protecting actually fires here
+                assert _wrap_ring_phase(tw, n_pix) == 0.0
+                assert self._low_guard_only(tw, n_pix) != 0.0
+        assert seen_upper_edge > 0, "no ring reached the upper edge — test is vacuous"
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_pixel_index_stays_inside_its_ring(self, nside):
+        """int(wrapped) must never index past the end of its own ring."""
+        npix = 12 * nside * nside
+        phis = [0.0, _TWO_PI, _TWO_PI - 1e-16, 5e-324, math.pi]
+        for ir in range(1, 4 * nside):
+            n_pix, _fp, phi0, dphi = _ring_info_jit(nside, ir, npix)
+            for phi in phis:
+                ip = int(_wrap_ring_phase((phi - phi0) / dphi, n_pix))
+                assert 0 <= ip < n_pix, f"nside={nside} ir={ir} phi={phi!r} ip={ip}"
+
+    def test_phi_two_pi_and_zero_give_the_same_pixels(self):
+        """phi = 0 and phi = 2π are the same point, so the stencils must match.
+
+        The *pixel* indices must be identical — that is the wrap invariant, and
+        it breaks by a whole ring without the upper guard.  The weights differ
+        in the last couple of bits (~3e-14) because ``(0 - phi0) / dphi`` and
+        ``(2π - phi0) / dphi`` do not round alike; that predates the branch form
+        and is unchanged by it.
+        """
+        nside = 64
+        npix = 12 * nside * nside
+        for z in (0.9, 0.5, 0.0, -0.5, -0.9, 0.99999, -0.99999):
+            a = _ring_interp_single_jit(nside, z, 0.0, npix)
+            b = _ring_interp_single_jit(nside, z, _TWO_PI, npix)
+            assert a[:4] == b[:4], f"pixels differ at z={z}"
+            npt.assert_allclose(np.array(a[4:]), np.array(b[4:]), atol=1e-13)
+
+
+# ===========================================================================
+# TestBuildRingTheta
+# ===========================================================================
+
+
+class TestBuildRingTheta:
+    """Tests for _build_ring_theta and the optional ``ring_theta`` fast path.
+
+    The table is memoisation, not approximation: passing it must not change a
+    single bit of any interpolation result.
+    """
+
+    @pytest.mark.parametrize("nside", [1, 4, 16, 256])
+    def test_entries_are_exactly_acos_of_the_ring_centre(self, nside):
+        """Bit-identical to the inline computation it replaces."""
+        rt = _build_ring_theta(nside)
+        assert rt.shape == (4 * nside,)
+        assert rt.dtype == np.float64
+        for ir in range(1, 4 * nside):
+            assert rt[ir] == math.acos(_ring_z_jit(nside, ir))
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_monotonic_from_north_to_south(self, nside):
+        """Colatitude increases with ring index, and stays inside (0, π)."""
+        rt = _build_ring_theta(nside)
+        vals = rt[1:]
+        assert np.all(np.diff(vals) > 0)
+        assert np.all(vals > 0.0) and np.all(vals < math.pi)
+
+    @pytest.mark.parametrize("nside", [4, 16, 64, 256])
+    def test_table_path_is_bit_identical(self, nside):
+        """With and without the table must agree bit-for-bit, both helpers."""
+        npix = 12 * nside * nside
+        rt = _build_ring_theta(nside)
+        rng = np.random.default_rng(1)
+        zs = np.concatenate(
+            [
+                rng.uniform(-1.0, 1.0, 300),
+                # pole boundaries and the cap/belt seam
+                np.array([1.0, -1.0, 2.0 / 3.0, -2.0 / 3.0]),
+                np.array([_ring_z_jit(nside, 1), _ring_z_jit(nside, 4 * nside - 1)]),
+            ]
+        )
+        phis = rng.uniform(0.0, _TWO_PI, zs.size)
+        for z, phi in zip(zs, phis):
+            z = float(np.clip(z, -1.0, 1.0))
+            ref_s = _ring_interp_single_jit(nside, z, float(phi), npix)
+            fast_s = _ring_interp_single_jit(nside, z, float(phi), npix, rt)
+            assert ref_s == fast_s, f"single differs at z={z}, phi={phi}"
+
+            ref_a = _ring_interp_with_angles_jit(nside, z, float(phi), npix)
+            fast_a = _ring_interp_with_angles_jit(nside, z, float(phi), npix, rt)
+            assert ref_a == fast_a, f"with_angles differs at z={z}, phi={phi}"
+
+    def test_wrong_nside_table_is_not_silently_accepted(self):
+        """A table built for another nside changes results — it is not inert.
+
+        Guards the documented precondition that the table is rebuilt whenever
+        nside changes.  If this ever stops differing, the table is not actually
+        being read and the optimisation is dead code.
+        """
+        nside = 64
+        npix = 12 * nside * nside
+        wrong = _build_ring_theta(2 * nside)
+        differs = False
+        rng = np.random.default_rng(2)
+        for _ in range(200):
+            z = float(rng.uniform(-1.0, 1.0))
+            phi = float(rng.uniform(0.0, _TWO_PI))
+            if _ring_interp_single_jit(nside, z, phi, npix) != _ring_interp_single_jit(
+                nside, z, phi, npix, wrong
+            ):
+                differs = True
+                break
+        assert differs
 
 
 # ===========================================================================
