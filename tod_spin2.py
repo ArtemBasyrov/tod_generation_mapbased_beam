@@ -32,15 +32,15 @@ import numpy as np
 import numba
 
 
-# Knuth multiplicative-hash constant for the direct-mapped spin-2 cache.
-# Chosen to break the spatial clustering of consecutive HEALPix pixel indices
-# that would collide on a plain low-bit mask.
-_SPIN2_CACHE_HASH = 2654435769
+# Multiplicative hash for the direct-mapped spin-2 cache.  The slot comes from
+# the high half of the product: low bits of p*K are a bijection of low bits of
+# p, and HEALPix rings are 4·nside apart, so a low-bit slot collapses a whole
+# beam footprint onto a few slots.
+_SPIN2_CACHE_HASH = np.uint64(0x9E3779B97F4A7C15)
+_SPIN2_CACHE_HASH_SHIFT = np.uint64(32)
 
-# Direct-mapped spin-2 cache size (power of 2).  Sized to hold the ~100-300
-# unique HEALPix pixels covered by a 30′ beam disc at nside=1024 with load
-# ≪ 0.1, so collision misses are negligible.  The three backing arrays total
-# ~24 KiB, fitting comfortably in L1.
+# Direct-mapped spin-2 cache size (power of 2); the three backing arrays total
+# ~24 KiB, fitting comfortably in L1.  See _spin2_lookup_cached for the sizing.
 _SPIN2_CACHE_SIZE = 1024
 _SPIN2_CACHE_MASK = _SPIN2_CACHE_SIZE - 1
 
@@ -128,17 +128,22 @@ def _spin2_lookup_cached(
 ):
     """Probe the direct-mapped spin-2 cache for pixel ``p``; compute+store on miss.
 
-    Cache slot is selected by Knuth's multiplicative hash so consecutive RING
-    pixel indices on the same ring don't collide.  A slot whose stored pixel
-    index equals ``p`` is a hit (returns the cached pair); any other value —
-    including the initial sentinel ``-1`` — is a miss, in which case the spin-2
-    rotation is computed via :func:`_spin2_cos2d_sin2d_jit` and written into
-    the slot, evicting any previous occupant.  The pair is passed through
-    unchanged, so it carries that function's conjugate convention.
+    A slot whose stored pixel index equals ``p`` is a hit (returns the cached
+    pair); any other value — including the initial sentinel ``-1`` — is a miss,
+    in which case the spin-2 rotation is computed via
+    :func:`_spin2_cos2d_sin2d_jit` and written into the slot, evicting any
+    previous occupant.  The pair is passed through unchanged, so it carries
+    that function's conjugate convention.
 
     The cache is boresight-scoped: its contents are valid only for the
     ``(z_pts, sth_pts, phi_pts)`` passed in.  Callers must reset the cache
     (``cache_pix[:] = -1``) whenever they move to a new boresight.
+
+    Sizing.  A table of ``_SPIN2_CACHE_SIZE = 1024`` slots holds the ~650
+    distinct HEALPix pixels a 30′ beam disc covers at nside=1024 with a miss
+    rate near the compulsory floor.  The footprint grows as nside², so above
+    nside=1024 the table no longer holds it, but enlarging it does not pay: the
+    added L1/L2 pressure cancels the lower miss rate.
 
     Parameters
     ----------
@@ -156,7 +161,10 @@ def _spin2_lookup_cached(
         boresight transport, in the conjugate convention of
         :func:`_spin2_cos2d_sin2d_jit`.
     """
-    slot = (p * _SPIN2_CACHE_HASH) & cmask
+    slot = (
+        numba.int64((numba.uint64(p) * _SPIN2_CACHE_HASH) >> _SPIN2_CACHE_HASH_SHIFT)
+        & cmask
+    )
     if cache_pix[slot] == p:
         return cache_c2d[slot], cache_s2d[slot]
     sth_n = math.sqrt(max(0.0, 1.0 - z_n * z_n))

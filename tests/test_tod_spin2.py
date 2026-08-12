@@ -32,11 +32,18 @@ import numpy.testing as npt
 import pytest
 
 from tod_spin2 import (
+    _SPIN2_CACHE_HASH,
+    _SPIN2_CACHE_HASH_SHIFT,
     _spin2_cos2d_sin2d_jit,
     _spin2_lookup_cached,
     compute_spin2_skip_z_threshold,
     _max_two_delta_at_boresight,
 )
+
+
+def _slot_of(p, cmask):
+    """Slot ``_spin2_lookup_cached`` assigns to pixel ``p``, mirroring its hash."""
+    return int((np.uint64(p) * _SPIN2_CACHE_HASH) >> _SPIN2_CACHE_HASH_SHIFT) & cmask
 
 
 # ===========================================================================
@@ -232,7 +239,7 @@ class TestSpin2LookupCached:
             cache_s2d,
             self.CMASK,
         )
-        slot = (p * 2654435769) & self.CMASK
+        slot = _slot_of(p, self.CMASK)
         assert cache_pix[slot] == p
         npt.assert_allclose(cache_c2d[slot], c2d, atol=0.0)
         npt.assert_allclose(cache_s2d[slot], s2d, atol=0.0)
@@ -260,7 +267,7 @@ class TestSpin2LookupCached:
             cache_s2d,
             self.CMASK,
         )
-        slot = (p * 2654435769) & self.CMASK
+        slot = _slot_of(p, self.CMASK)
         # Overwrite stored values with a sentinel.
         cache_c2d[slot] = -123.456
         cache_s2d[slot] = 789.012
@@ -287,10 +294,10 @@ class TestSpin2LookupCached:
 
         # Find two distinct pixels that collide.
         p_a = 13
-        slot_a = (p_a * 2654435769) & self.CMASK
+        slot_a = _slot_of(p_a, self.CMASK)
         p_b = None
         for candidate in range(p_a + 1, p_a + 200_000):
-            if ((candidate * 2654435769) & self.CMASK) == slot_a:
+            if _slot_of(candidate, self.CMASK) == slot_a:
                 p_b = candidate
                 break
         assert p_b is not None, "Could not find a collision within search range"
@@ -365,7 +372,7 @@ class TestSpin2LookupCached:
             cache_s2d,
             self.CMASK,
         )
-        slot = (p * 2654435769) & self.CMASK
+        slot = _slot_of(p, self.CMASK)
         # Poison with bad stored values AND reset the sentinel:
         cache_pix[slot] = -1
         cache_c2d[slot] = -999.0
