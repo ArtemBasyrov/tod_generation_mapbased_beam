@@ -851,6 +851,130 @@ class TestGatherAccumNearestJit:
 # ===========================================================================
 
 
+class TestNearestPixelSearchExactness:
+    """Pins the two shortcuts inside the nearest-pixel ring search.
+
+    The search picks the on-ring candidate by ``|Δφ|`` instead of evaluating
+    ``cos_d`` for both, and reduces the ring index with a conditional subtract
+    instead of a modulo.  Both are exact only under conditions that are easy to
+    break while "tidying":
+
+    - the winner's ``cos_d`` must be evaluated on the *unwrapped* offset,
+      because ``cos(x)`` and ``cos(x − 2π)`` differ in the last bits;
+    - a query exactly on a pole makes both candidates equidistant, and the
+      tie-break must still land on the first one;
+    - ``phi_w`` reaches exactly 2π, so the raw ring index reaches ``n_pix``.
+
+    Every test here compares against :func:`_kernel_nearest_pix`, the Python
+    mirror of the original four-candidate search.
+    """
+
+    @staticmethod
+    def _chosen_pixel(nside, vecs):
+        """Run the kernel on one beam node per boresight; return chosen pixels.
+
+        The T map is ``arange(npix)`` and the beam weight is 1, so the T output
+        of each boresight is exactly the index of the pixel the search picked.
+        """
+        B = vecs.shape[0]
+        npix = 12 * nside * nside
+        mp = np.arange(npix, dtype=np.float64)[None, :].copy()
+        beam_vals = np.ones(1, dtype=np.float64)
+        out = np.empty(B, dtype=np.int64)
+        for b in range(B):
+            vec_orig = vecs[b : b + 1].astype(np.float64)
+            axes, cos_a, sin_a, _ax, cos_p, sin_p = _identity_rot_params(1)
+            ax_pts = np.array([[0.0, 0.0, 1.0]], dtype=np.float64)
+            tod = np.zeros((1, 1), dtype=np.float64)
+            _gather_accum_nearest_jit(
+                vec_orig,
+                axes.astype(np.float64),
+                cos_a.astype(np.float64),
+                sin_a.astype(np.float64),
+                ax_pts,
+                cos_p.astype(np.float64),
+                sin_p.astype(np.float64),
+                nside,
+                mp,
+                beam_vals,
+                1,
+                1,
+                tod,
+                -1,
+                -1,
+            )
+            out[b] = int(round(tod[0, 0]))
+        return out
+
+    @staticmethod
+    def _reference_pixel(nside, vecs):
+        ref = np.empty(vecs.shape[0], dtype=np.int64)
+        for b, v in enumerate(vecs):
+            z = float(v[2])
+            phi = math.atan2(float(v[1]), float(v[0]))
+            if phi < 0.0:
+                phi += _TWO_PI
+            ref[b], _zc, _pc = _kernel_nearest_pix(nside, z, phi)
+        return ref
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_matches_four_candidate_search_on_random_directions(self, nside):
+        rng = np.random.default_rng(5)
+        vecs = _random_unit_vec((400, 3), rng).astype(np.float64)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        npt.assert_array_equal(
+            self._chosen_pixel(nside, vecs), self._reference_pixel(nside, vecs)
+        )
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_exact_poles(self, nside):
+        """sin_th == 0 makes both on-ring candidates equidistant."""
+        vecs = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float64)
+        npt.assert_array_equal(
+            self._chosen_pixel(nside, vecs), self._reference_pixel(nside, vecs)
+        )
+
+    @pytest.mark.parametrize("nside", [4, 16, 64])
+    def test_phi_wraps_to_exactly_two_pi(self, nside):
+        """vy just below zero sends phi_w to exactly 2π after the atan2 fix-up."""
+        vecs = []
+        for z in (0.9, 0.5, 0.0, -0.5, -0.9):
+            st = math.sqrt(1.0 - z * z)
+            for vy in (-1e-17, -5e-324, 0.0, 1e-17):
+                vecs.append([st, vy, z])
+        vecs = np.array(vecs, dtype=np.float64)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        phis = np.array(
+            [
+                math.atan2(v[1], v[0])
+                + (_TWO_PI if math.atan2(v[1], v[0]) < 0 else 0.0)
+                for v in vecs
+            ]
+        )
+        assert np.any(phis == _TWO_PI), "no case reached phi == 2π — test is vacuous"
+        npt.assert_array_equal(
+            self._chosen_pixel(nside, vecs), self._reference_pixel(nside, vecs)
+        )
+
+    @pytest.mark.parametrize("nside", [8, 32])
+    def test_on_pixel_centres_and_boundaries(self, nside):
+        """Ties and near-ties between the two on-ring candidates."""
+        npix = 12 * nside * nside
+        vecs = []
+        for ir in range(1, 4 * nside):
+            n_pix, _fp, phi0, dphi = _ring_info_jit(nside, ir, npix)
+            z = _ring_z_jit(nside, ir)
+            st = math.sqrt(max(0.0, 1.0 - z * z))
+            for frac in (0.0, 0.5, 1.0, 0.4999999999, 0.5000000001):
+                phi = phi0 + frac * dphi
+                vecs.append([st * math.cos(phi), st * math.sin(phi), z])
+        vecs = np.array(vecs, dtype=np.float64)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        npt.assert_array_equal(
+            self._chosen_pixel(nside, vecs), self._reference_pixel(nside, vecs)
+        )
+
+
 class TestNearestSpin2Skip:
     """Tests for the spin-2 skip optimisation in _gather_accum_nearest_jit."""
 

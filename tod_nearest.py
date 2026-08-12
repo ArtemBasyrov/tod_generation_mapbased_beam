@@ -15,7 +15,11 @@ from numba_healpy import (
     _ring_z_jit,
 )
 from tod_rotations import _rodrigues_apply_one_jit
-from tod_spin2 import _spin2_cos2d_sin2d_jit
+from tod_spin2 import (
+    _SPIN2_CACHE_SIZE,
+    _SPIN2_CACHE_MASK,
+    _spin2_lookup_cached,
+)
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
@@ -74,6 +78,12 @@ def _gather_accum_nearest_jit(
     npix_total = 12 * nside * nside
     has_qu = c_q >= 0 and c_u >= 0
 
+    # Dummy buffers for the branches that never touch the spin-2 cache —
+    # hoisted so those b's don't pay three zero-size allocs each.
+    _empty_pix = np.empty(0, dtype=np.int64)
+    _empty_c2d = np.empty(0, dtype=np.float64)
+    _empty_s2d = np.empty(0, dtype=np.float64)
+
     for b in numba.prange(B):
         kx = float(axes[b, 0])
         ky = float(axes[b, 1])
@@ -98,6 +108,21 @@ def _gather_accum_nearest_jit(
         # disables the optimisation (always apply correction).
         bz_abs = bz if bz >= 0.0 else -bz
         apply_spin2 = bz_abs > z_skip_threshold
+
+        # Per-b spin-2 cache: the footprint revisits far fewer distinct pixels
+        # than it has beam nodes, so each transport is computed once and reused.
+        # Boresight-scoped, hence allocated and cleared per b.
+        use_cache = has_qu and apply_spin2
+        if use_cache:
+            cache_pix = np.empty(_SPIN2_CACHE_SIZE, dtype=np.int64)
+            for _i in range(_SPIN2_CACHE_SIZE):
+                cache_pix[_i] = -1
+            cache_c2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
+            cache_s2d = np.empty(_SPIN2_CACHE_SIZE, dtype=np.float64)
+        else:
+            cache_pix = _empty_pix
+            cache_c2d = _empty_c2d
+            cache_s2d = _empty_s2d
 
         for s in range(S):
             vx, vy, vz = _rodrigues_apply_one_jit(
@@ -141,8 +166,23 @@ def _gather_accum_nearest_jit(
                 n_pix, first_pix, phi0, dphi_r = _ring_info_jit(nside, ir_g, npix_total)
                 z_c = _ring_z_jit(nside, ir_g)
                 sin_z_c = math.sqrt(max(0.0, 1.0 - z_c * z_c))
-                ip_base = int(phi_w * n_pix / _TWO_PI) % n_pix
-                for ip_try in (ip_base, (ip_base + 1) % n_pix):
+
+                # phi_w reaches 2π, so the ring index reaches n_pix; one
+                # conditional subtract reduces it, as the modulo did.
+                ip_base = int(phi_w * n_pix / _TWO_PI)
+                if ip_base >= n_pix:
+                    ip_base -= n_pix
+                ip_next = ip_base + 1
+                if ip_next >= n_pix:
+                    ip_next -= n_pix
+
+                # Both candidates are scored.  Picking the on-ring winner by
+                # |Δφ| alone would save a cos, but it is not equivalent: when
+                # the two centres are equidistant, cos_d ties to the last bit
+                # while |Δφ| does not, so the two rules disagree on which pixel
+                # wins.  Ties are reachable — a query on a ring centre sits
+                # exactly midway between two centres of the adjacent ring.
+                for ip_try in (ip_base, ip_next):
                     phi_c = phi0 + ip_try * dphi_r
                     cos_d = sin_th * sin_z_c * math.cos(phi_w - phi_c) + z * z_c
                     if cos_d > best_cos:
@@ -156,9 +196,17 @@ def _gather_accum_nearest_jit(
                 for c in range(C):
                     tod[c, b] += mp_stacked[c, best_pix] * bv
             elif apply_spin2:
-                sth_n = math.sqrt(max(0.0, 1.0 - best_z_c * best_z_c))
-                c2d, s2d = _spin2_cos2d_sin2d_jit(
-                    best_z_c, sth_n, best_phi_c, bz_pts, bsth_pts, bphi_pts
+                c2d, s2d = _spin2_lookup_cached(
+                    best_pix,
+                    best_z_c,
+                    best_phi_c,
+                    bz_pts,
+                    bsth_pts,
+                    bphi_pts,
+                    cache_pix,
+                    cache_c2d,
+                    cache_s2d,
+                    _SPIN2_CACHE_MASK,
                 )
                 q_val = float(mp_stacked[c_q, best_pix])
                 u_val = float(mp_stacked[c_u, best_pix])
