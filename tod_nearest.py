@@ -48,19 +48,23 @@ def _gather_accum_nearest_jit(
 
     Parameters
     ----------
-    vec_orig   : (S, 3)       float32   beam-frame unit vectors (un-rotated)
-    axes       : (B, 3)       float32   Rodrigues-1 rotation axes
-    cos_a      : (B,)         float32   cos of Rodrigues-1 angle
-    sin_a      : (B,)         float32   sin of Rodrigues-1 angle
-    ax_pts     : (B, 3)       float32   boresight unit vectors (Rodrigues-2
-                                        axis, also used as the spin-2
-                                        query direction for Q/U frame
-                                        correction).
-    cos_p      : (B,)         float32   cos of Rodrigues-2 angle (ψ_b − β)
-    sin_p      : (B,)         float32   sin of Rodrigues-2 angle
+    The six rotation parameters are float64 at any ``precision`` setting; see
+    :func:`~tod_rotations._rotation_params` for why the pointing is never
+    rounded to the pipeline precision.
+
+    vec_orig   : (S, 3)       precision  beam-frame unit vectors (un-rotated)
+    axes       : (B, 3)       float64    Rodrigues-1 rotation axes
+    cos_a      : (B,)         float64    cos of Rodrigues-1 angle
+    sin_a      : (B,)         float64    sin of Rodrigues-1 angle
+    ax_pts     : (B, 3)       float64    boresight unit vectors (Rodrigues-2
+                                         axis, also used as the spin-2
+                                         query direction for Q/U frame
+                                         correction).
+    cos_p      : (B,)         float64    cos of Rodrigues-2 angle (ψ_b − β)
+    sin_p      : (B,)         float64    sin of Rodrigues-2 angle
     nside      : int
-    mp_stacked : (C, N_hp)    float32   stacked sky-map components
-    beam_vals  : (S,)         float32   beam weights
+    mp_stacked : (C, N_hp)    precision  stacked sky-map components
+    beam_vals  : (S,)         precision  beam weights
     B, S       : int
     tod        : (C, B)       float64   accumulated in place
     c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)

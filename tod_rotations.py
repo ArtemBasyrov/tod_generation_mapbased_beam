@@ -31,8 +31,10 @@ def _rodrigues_jit(vec_orig, axes, cos_a, sin_a, ax_pts, cos_p, sin_p, out):
     """
     Fused double-Rodrigues rotation (recenter + polarisation roll).
 
-    All input/output arrays are float32.  Computes each output element in a
-    single (b, s) pass with no temporaries beyond a handful of scalars.
+    ``vec_orig`` and ``out`` carry the pipeline precision; the six rotation
+    parameters are float64 at any precision setting (see
+    :func:`_rotation_params`).  Computes each output element in a single
+    (b, s) pass with no temporaries beyond a handful of scalars.
 
     Parameters
     ----------
@@ -274,7 +276,7 @@ def _recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
 
     Args:
         vec_orig (numpy.ndarray): Beam-pixel unit vectors in the beam frame,
-            shape ``(S, 3)``, dtype ``float32``.
+            shape ``(S, 3)``; cast to ``tod_config.precision_dtype``.
         rot_vecs (numpy.ndarray): Rodrigues rotation vectors (axis × angle)
             from :func:`precompute_rotation_vector_batch`, shape ``(B, 3)``.
         phi_pix (numpy.ndarray): Boresight longitude [rad], shape ``(B,)``.
@@ -284,7 +286,7 @@ def _recenter_and_rotate(vec_orig, rot_vecs, phi_pix, theta_pix, psis):
 
     Returns:
         numpy.ndarray: Rotated beam-pixel unit vectors in sky-frame coordinates,
-            shape ``(B, S, 3)``, dtype ``float32``.
+            shape ``(B, S, 3)``, dtype ``tod_config.precision_dtype``.
     """
     B = rot_vecs.shape[0]
     S = vec_orig.shape[0]
