@@ -122,51 +122,28 @@ def _call_nearest(
     )
 
 
-from numba_healpy import _ring_above_jit, _ring_info_jit, _ring_z_jit, _TWO_PI
+from numba_healpy import _ring_info_jit, _ring_z_jit, _TWO_PI
 
 
 def _kernel_nearest_pix(nside, z, phi_w):
-    """Python mirror of the kernel's 4-candidate nearest-pixel search.
+    """Containing pixel and its centre, from healpy.
 
-    Returns (best_pix, best_z_c, best_phi_c) using exactly the same ring +
-    slot selection as _gather_accum_nearest_jit, so tests can build a
-    reference that agrees with the kernel rather than with hp.ang2pix (which
-    searches more candidates).
+    Returns ``(pix, z_c, phi_c)``.  healpy is used as an independent oracle
+    rather than mirroring the kernel's own arithmetic, so these references
+    would catch a defect in the kernel instead of reproducing it.  The centre
+    healpy reports and the one the kernel rebuilds from its ring / in-ring
+    index agree to ~2e-15 rad, well inside the tolerances used here.
+
+    ``vec2pix`` rather than ``ang2pix``: the kernel receives ``z`` directly,
+    and routing it through ``theta = acos(z)`` would hand healpy ``cos(acos(z))``
+    instead, which differs in the last bits.  That is invisible except for a
+    query sitting exactly on a pixel edge, where it flips the truncation and
+    selects the neighbour.
     """
-    _TWO_PI_f = 2.0 * math.pi
-    npix_total = 12 * nside * nside
-    theta = math.acos(max(-1.0, min(1.0, z)))
-    sin_th = math.sin(theta)
-
-    ir_above = _ring_above_jit(nside, z)
-    if ir_above < 1:
-        ir_above = 1
-    elif ir_above > 4 * nside - 2:
-        ir_above = 4 * nside - 2
-    ir_below = ir_above + 1
-
-    best_pix = 0
-    best_cos = -2.0
-    best_z_c = 0.0
-    best_phi_c = 0.0
-
-    for ir_g in (ir_above, ir_below):
-        if ir_g < 1 or ir_g > 4 * nside - 1:
-            continue
-        n_pix, first_pix, phi0, dphi_r = _ring_info_jit(nside, ir_g, npix_total)
-        z_c = _ring_z_jit(nside, ir_g)
-        sin_z_c = math.sqrt(max(0.0, 1.0 - z_c * z_c))
-        ip_base = int(phi_w * n_pix / _TWO_PI_f) % n_pix
-        for ip_try in (ip_base, (ip_base + 1) % n_pix):
-            phi_c = phi0 + ip_try * dphi_r
-            cos_d = sin_th * sin_z_c * math.cos(phi_w - phi_c) + z * z_c
-            if cos_d > best_cos:
-                best_cos = cos_d
-                best_pix = first_pix + ip_try
-                best_z_c = z_c
-                best_phi_c = phi_c
-
-    return best_pix, best_z_c, best_phi_c
+    sin_th = math.sqrt(max(0.0, 1.0 - z * z))
+    pix = int(hp.vec2pix(nside, sin_th * math.cos(phi_w), sin_th * math.sin(phi_w), z))
+    theta_c, phi_c = hp.pix2ang(nside, pix)
+    return pix, math.cos(float(theta_c)), float(phi_c)
 
 
 def _nearest_reference_t(vec_rot, nside, mp_stacked, beam_vals, B, S):
@@ -865,8 +842,12 @@ class TestNearestPixelSearchExactness:
       tie-break must still land on the first one;
     - ``phi_w`` reaches exactly 2π, so the raw ring index reaches ``n_pix``.
 
-    Every test here compares against :func:`_kernel_nearest_pix`, the Python
-    mirror of the original four-candidate search.
+    Every test here compares against healpy, which is the definition the
+    kernel implements.  Queries constructed to sit exactly on a pixel edge are
+    held only to the "query lies inside its pixel" invariant: the side an edge
+    query falls on is settled by last-bit rounding, and healpy itself is not
+    self-consistent there (``vec2pix`` renormalises the direction, moving ``z``
+    by an ulp, and can then disagree with ``ang2pix`` on the same point).
     """
 
     @staticmethod
@@ -908,17 +889,51 @@ class TestNearestPixelSearchExactness:
 
     @staticmethod
     def _reference_pixel(nside, vecs):
-        ref = np.empty(vecs.shape[0], dtype=np.int64)
-        for b, v in enumerate(vecs):
-            z = float(v[2])
-            phi = math.atan2(float(v[1]), float(v[0]))
-            if phi < 0.0:
-                phi += _TWO_PI
-            ref[b], _zc, _pc = _kernel_nearest_pix(nside, z, phi)
-        return ref
+        """healpy's containing pixel for each direction, straight from the vector."""
+        return np.asarray(
+            hp.vec2pix(nside, vecs[:, 0], vecs[:, 1], vecs[:, 2]), dtype=np.int64
+        )
+
+    @staticmethod
+    def _unambiguous(nside, vecs):
+        """Directions further than rounding from any pixel edge.
+
+        Which side of an edge a query falls on is decided by the last bits of
+        the edge-line arithmetic, so it is not a property any implementation
+        can be held to: healpy itself answers differently depending on whether
+        the vector was renormalised first, because that shifts ``z`` by an ulp.
+        Points that unstable are found by nudging the direction a few ulp along
+        each axis and watching the pixel move.
+        """
+        base = np.asarray(hp.vec2pix(nside, vecs[:, 0], vecs[:, 1], vecs[:, 2]))
+        ok = np.ones(vecs.shape[0], dtype=bool)
+        for axis in range(3):
+            for towards in (-np.inf, np.inf):
+                w = vecs.copy()
+                for _ in range(4):
+                    w[:, axis] = np.nextafter(w[:, axis], towards)
+                ok &= np.asarray(hp.vec2pix(nside, w[:, 0], w[:, 1], w[:, 2])) == base
+        return ok
+
+    @staticmethod
+    def _assert_query_inside_pixel(nside, vecs, pix):
+        """Every query lies within its selected pixel.
+
+        Holds at edges too, where the exact index is ambiguous: whichever side
+        is chosen, the query cannot be further from that centre than the
+        largest pixel radius.  A wrapping or ring-indexing defect would land
+        the query far outside and is caught here.
+        """
+        centres = np.stack(hp.pix2vec(nside, pix), axis=1)
+        cosd = np.clip(np.einsum("ij,ij->i", vecs, centres), -1.0, 1.0)
+        assert np.all(np.arccos(cosd) <= hp.max_pixrad(nside) + 1e-12), (
+            f"nside={nside}: query further from its pixel centre than "
+            f"max_pixrad={hp.max_pixrad(nside):.6e} rad"
+        )
 
     @pytest.mark.parametrize("nside", [4, 16, 64])
-    def test_matches_four_candidate_search_on_random_directions(self, nside):
+    def test_matches_healpy_ang2pix_on_random_directions(self, nside):
+        """The kernel selects the pixel hp.ang2pix does, for every direction."""
         rng = np.random.default_rng(5)
         vecs = _random_unit_vec((400, 3), rng).astype(np.float64)
         vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
@@ -928,7 +943,7 @@ class TestNearestPixelSearchExactness:
 
     @pytest.mark.parametrize("nside", [4, 16, 64])
     def test_exact_poles(self, nside):
-        """sin_th == 0 makes both on-ring candidates equidistant."""
+        """The pole directions, where the cap branch degenerates to ring 1."""
         vecs = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float64)
         npt.assert_array_equal(
             self._chosen_pixel(nside, vecs), self._reference_pixel(nside, vecs)
@@ -952,13 +967,14 @@ class TestNearestPixelSearchExactness:
             ]
         )
         assert np.any(phis == _TWO_PI), "no case reached phi == 2π — test is vacuous"
-        npt.assert_array_equal(
-            self._chosen_pixel(nside, vecs), self._reference_pixel(nside, vecs)
-        )
+        got = self._chosen_pixel(nside, vecs)
+        self._assert_query_inside_pixel(nside, vecs, got)
+        ok = self._unambiguous(nside, vecs)
+        npt.assert_array_equal(got[ok], self._reference_pixel(nside, vecs)[ok])
 
     @pytest.mark.parametrize("nside", [8, 32])
     def test_on_pixel_centres_and_boundaries(self, nside):
-        """Ties and near-ties between the two on-ring candidates."""
+        """Queries sitting exactly on, and either side of, a pixel edge."""
         npix = 12 * nside * nside
         vecs = []
         for ir in range(1, 4 * nside):
@@ -970,9 +986,11 @@ class TestNearestPixelSearchExactness:
                 vecs.append([st * math.cos(phi), st * math.sin(phi), z])
         vecs = np.array(vecs, dtype=np.float64)
         vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
-        npt.assert_array_equal(
-            self._chosen_pixel(nside, vecs), self._reference_pixel(nside, vecs)
-        )
+        got = self._chosen_pixel(nside, vecs)
+        self._assert_query_inside_pixel(nside, vecs, got)
+        ok = self._unambiguous(nside, vecs)
+        assert ok.sum() > 0.5 * ok.size, "too few unambiguous points — test is weak"
+        npt.assert_array_equal(got[ok], self._reference_pixel(nside, vecs)[ok])
 
 
 class TestNearestSpin2Skip:

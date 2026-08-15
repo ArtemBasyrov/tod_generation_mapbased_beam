@@ -3,6 +3,16 @@ Nearest-pixel interpolation kernel for TOD generation.
 
 _gather_accum_nearest_jit — fully fused Rodrigues + HEALPix nearest-pixel
                             lookup + spin-2 Q/U transport + accumulation.
+
+The lookup selects the pixel whose *area contains* the direction, which is
+what ``healpy.ang2pix`` returns and what the map value represents: a HEALPix
+map stores the sky averaged over each pixel's area, so a direction inside
+pixel p is estimated by ``map[p]``.  This is not the same as the pixel whose
+*centre* is nearest — HEALPix pixels are equal-area but not round, so their
+boundaries are not the bisectors between centres, and the two rules disagree
+in a shell around every pixel edge (9.5% of directions at nside 1024).
+Selecting by nearest centre would attribute the sample to a pixel whose area
+excludes it.
 """
 
 import math
@@ -10,7 +20,7 @@ import numpy as np
 import numba
 from numba_healpy import (
     _TWO_PI,
-    _ring_above_jit,
+    _TWO_THIRDS,
     _ring_info_jit,
     _ring_z_jit,
 )
@@ -45,8 +55,8 @@ def _gather_accum_nearest_jit(
     Fully fused Rodrigues + HEALPix nearest-pixel lookup + beam accumulation.
 
     For each ``(b, s)`` pair the beam-frame vector is rotated into the sky
-    frame in registers via :func:`_rodrigues_apply_one_jit`, the nearest
-    RING-scheme pixel is found via the inlined ang2pix algorithm, and its
+    frame in registers via :func:`_rodrigues_apply_one_jit`, the containing
+    RING-scheme pixel is found via the inlined closed-form ang2pix, and its
     sky-map value is accumulated with the beam weight.  Parallelised over B.
     No intermediate ``(B, S, 3)`` buffer is materialised.
 
@@ -76,6 +86,7 @@ def _gather_accum_nearest_jit(
     """
     C = mp_stacked.shape[0]
     npix_total = 12 * nside * nside
+    ncap = 2 * nside * (nside - 1)  # pixels in the north polar cap
     has_qu = c_q >= 0 and c_u >= 0
 
     # Dummy buffers for the branches that never touch the spin-2 cache —
@@ -146,60 +157,52 @@ def _gather_accum_nearest_jit(
                 phi_w += _TWO_PI
 
             z = vz
-            sin_th = math.sqrt(max(0.0, vx * vx + vy * vy))
+            za = z if z >= 0.0 else -z
+            tt = phi_w * (2.0 / math.pi)  # in [0, 4)
 
-            ir_above = _ring_above_jit(nside, z)
-            if ir_above < 1:
-                ir_above = 1
-            elif ir_above > 4 * nside - 2:
-                ir_above = 4 * nside - 2
-            ir_below = ir_above + 1
-
-            best_pix = 0
-            best_cos = -2.0
-            best_z_c = 0.0
-            best_phi_c = 0.0
-
-            for ir_g in (ir_above, ir_below):
-                if ir_g < 1 or ir_g > 4 * nside - 1:
-                    continue
-                n_pix, first_pix, phi0, dphi_r = _ring_info_jit(nside, ir_g, npix_total)
-                z_c = _ring_z_jit(nside, ir_g)
-                sin_z_c = math.sqrt(max(0.0, 1.0 - z_c * z_c))
-
-                # phi_w reaches 2π, so the ring index reaches n_pix; one
-                # conditional subtract reduces it, as the modulo did.
-                ip_base = int(phi_w * n_pix / _TWO_PI)
-                if ip_base >= n_pix:
-                    ip_base -= n_pix
-                ip_next = ip_base + 1
-                if ip_next >= n_pix:
-                    ip_next -= n_pix
-
-                # Both candidates are scored.  Picking the on-ring winner by
-                # |Δφ| alone would save a cos, but it is not equivalent: when
-                # the two centres are equidistant, cos_d ties to the last bit
-                # while |Δφ| does not, so the two rules disagree on which pixel
-                # wins.  Ties are reachable — a query on a ring centre sits
-                # exactly midway between two centres of the adjacent ring.
-                for ip_try in (ip_base, ip_next):
-                    phi_c = phi0 + ip_try * dphi_r
-                    cos_d = sin_th * sin_z_c * math.cos(phi_w - phi_c) + z * z_c
-                    if cos_d > best_cos:
-                        best_cos = cos_d
-                        best_pix = first_pix + ip_try
-                        best_z_c = z_c
-                        best_phi_c = phi_c
+            # HEALPix ang2pix_z_phi.  The ring index and the index within that
+            # ring are intermediates of the pixel number, so the pixel centre
+            # needed by the spin-2 transport costs no second lookup.
+            if za <= _TWO_THIRDS:  # equatorial belt
+                temp1 = nside * (0.5 + tt)
+                temp2 = nside * z * 0.75
+                jp = int(temp1 - temp2)  # ascending edge-line index
+                jm = int(temp1 + temp2)  # descending edge-line index
+                ir_eq = nside + 1 + jp - jm
+                kshift = 1 - (ir_eq & 1)
+                ip = (jp + jm - nside + kshift + 1) // 2
+                n_pix = 4 * nside
+                if ip >= n_pix:
+                    ip -= n_pix
+                best_pix = ncap + (ir_eq - 1) * n_pix + ip
+                ring = nside + ir_eq - 1
+            else:  # polar caps
+                tp = tt - int(tt)
+                tmp = nside * math.sqrt(3.0 * (1.0 - za))
+                jp = int(tp * tmp)
+                jm = int((1.0 - tp) * tmp)
+                ir_cap = jp + jm + 1
+                ip = int(tt * ir_cap)
+                n_pix = 4 * ir_cap
+                if ip >= n_pix:
+                    ip -= n_pix
+                if z > 0.0:
+                    best_pix = 2 * ir_cap * (ir_cap - 1) + ip
+                    ring = ir_cap
+                else:
+                    best_pix = npix_total - 2 * ir_cap * (ir_cap + 1) + ip
+                    ring = 4 * nside - ir_cap
 
             bv = float(beam_vals[s])
             if not has_qu:
                 for c in range(C):
                     tod[c, b] += mp_stacked[c, best_pix] * bv
             elif apply_spin2:
+                _, _, phi0, dphi_r = _ring_info_jit(nside, ring, npix_total)
                 c2d, s2d = _spin2_lookup_cached(
                     best_pix,
-                    best_z_c,
-                    best_phi_c,
+                    _ring_z_jit(nside, ring),
+                    phi0 + ip * dphi_r,
                     bz_pts,
                     bsth_pts,
                     bphi_pts,

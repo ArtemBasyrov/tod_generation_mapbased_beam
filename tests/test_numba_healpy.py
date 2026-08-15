@@ -1236,6 +1236,35 @@ class TestAng2PixRingJit:
             f"nside={nside}: {mismatches} polar pixel-centre mismatches with healpy"
         )
 
+    # ── agreement with healpy away from pixel centres ────────────────────────
+
+    @pytest.mark.parametrize("nside", [4, 16, 64, 256])
+    def test_random_points_match_healpy(self, nside):
+        """
+        Uniformly random directions agree exactly with hp.ang2pix.
+
+        The pixel-centre tests above cannot see the distinction between the
+        containing pixel and the nearest-centre pixel, because at a centre
+        both rules trivially return that pixel.  The rules differ in a shell
+        around every pixel edge, which only off-centre queries reach — at
+        nside 1024 that is ~9.5% of directions.
+        """
+        rng = np.random.default_rng(20260815 + nside)
+        n = 20000
+        z = rng.uniform(-1.0, 1.0, size=n)
+        theta = np.arccos(z)
+        phi = rng.uniform(0.0, 2.0 * math.pi, size=n)
+
+        p_ref = hp.ang2pix(nside, theta, phi, nest=False)
+        p_mine = np.array(
+            [_ang2pix_ring_jit(nside, float(t), float(p)) for t, p in zip(theta, phi)],
+            dtype=np.int64,
+        )
+        n_bad = int(np.count_nonzero(p_mine != p_ref))
+        assert n_bad == 0, (
+            f"nside={nside}: {n_bad}/{n} random-point mismatches with hp.ang2pix"
+        )
+
     # ── round-trip with _pix2ang_ring_jit ────────────────────────────────────
 
     @pytest.mark.parametrize("nside", [4, 16, 64])

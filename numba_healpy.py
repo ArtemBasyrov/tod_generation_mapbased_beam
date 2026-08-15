@@ -646,56 +646,56 @@ def pix2ang_numba(nside, pix, nest=False):
 @numba.jit(nopython=True, cache=True)
 def _ang2pix_ring_jit(nside, theta, phi):
     """
-    Nearest RING-scheme pixel index for (theta, phi) [rad].
+    RING-scheme pixel index containing the direction (theta, phi) [rad].
 
-    Returns the pixel whose centre is geometrically closest to (theta, phi).
-    Matches hp.ang2pix(nside, theta, phi, nest=False) for scalar inputs.
+    Returns the pixel whose *area* contains the direction, matching
+    ``hp.ang2pix(nside, theta, phi, nest=False)`` exactly for scalar inputs.
+    This is not the pixel whose centre is nearest: HEALPix pixels are
+    equal-area but not round, so their boundaries are not the bisectors
+    between centres and the two rules disagree near every pixel edge.
 
     Algorithm
     ---------
-    1. Use _ring_above_jit to identify two candidate rings (ir_above and
-       ir_above+1) that bracket the query latitude.
-    2. For each candidate ring the nearest pixel in phi is found via
-       ip = int(phi * n_pix / (2π)) % n_pix — the Voronoi boundary between
-       pixel k and k+1 falls at k*dphi regardless of phi0 (shift).
-    3. Check both ip and ip+1 for each ring (4 candidates total) and return
-       the one with the maximum cos(angular distance).
+    ``ang2pix_z_phi`` from healpix_base.cc.  In the equatorial belt the two
+    families of pixel edges are straight lines in (phi, z); the indices of the
+    ascending and descending edge lines through the query point give the ring
+    and the position within it directly.  In the polar caps the same holds in
+    the (tt, sqrt(1-|z|)) chart.  No candidate search and no transcendentals
+    beyond the cap sqrt.
     """
     npix_total = 12 * nside * nside
+    ncap = 2 * nside * (nside - 1)
     z = math.cos(theta)
+    za = abs(z)
     phi_w = phi % _TWO_PI  # wrap to [0, 2π)
+    tt = phi_w * (2.0 / math.pi)  # in [0, 4)
 
-    # ── Two candidate global rings bracketing z ───────────────────────────────
-    ir_above = _ring_above_jit(nside, z)
-    # Clamp so ir_above and ir_below are both valid ring indices.
-    if ir_above < 1:
-        ir_above = 1
-    elif ir_above > 4 * nside - 2:
-        ir_above = 4 * nside - 2
-    ir_below = ir_above + 1
+    if za <= _TWO_THIRDS:  # equatorial belt
+        temp1 = nside * (0.5 + tt)
+        temp2 = nside * z * 0.75
+        jp = int(temp1 - temp2)  # ascending edge-line index
+        jm = int(temp1 + temp2)  # descending edge-line index
+        ir = nside + 1 + jp - jm
+        kshift = 1 - (ir & 1)
+        ip = (jp + jm - nside + kshift + 1) // 2
+        n_pix = 4 * nside
+        if ip >= n_pix:
+            ip -= n_pix
+        return ncap + (ir - 1) * n_pix + ip
 
-    # ── For each candidate ring find the best-phi pixel ───────────────────────
-    best_pix = -1
-    best_cos = -2.0  # maximise cos(angular_dist) ≡ minimise distance
-    sin_th = math.sin(theta)
-    cos_th = z
-
-    for ir_g in (ir_above, ir_below):
-        if ir_g < 1 or ir_g > 4 * nside - 1:
-            continue
-        n_pix, first_pix, phi0, dphi = _ring_info_jit(nside, ir_g, npix_total)
-        z_c = _ring_z_jit(nside, ir_g)
-        sin_z_c = math.sqrt(max(0.0, 1.0 - z_c * z_c))
-        # Nearest pixel in phi: Voronoi boundary at multiples of dphi.
-        ip_base = int(phi_w * n_pix / _TWO_PI) % n_pix
-        for ip_try in (ip_base, (ip_base + 1) % n_pix):
-            phi_c = phi0 + ip_try * dphi
-            cos_d = sin_th * sin_z_c * math.cos(phi_w - phi_c) + cos_th * z_c
-            if cos_d > best_cos:
-                best_cos = cos_d
-                best_pix = first_pix + ip_try
-
-    return best_pix
+    # polar caps
+    tp = tt - int(tt)
+    tmp = nside * math.sqrt(3.0 * (1.0 - za))
+    jp = int(tp * tmp)
+    jm = int((1.0 - tp) * tmp)
+    ir = jp + jm + 1
+    ip = int(tt * ir)
+    n_pix = 4 * ir
+    if ip >= n_pix:
+        ip -= n_pix
+    if z > 0.0:
+        return 2 * ir * (ir - 1) + ip
+    return npix_total - 2 * ir * (ir + 1) + ip
 
 
 # ── HEALPix query_disc (RING scheme) ─────────────────────────────────────────
