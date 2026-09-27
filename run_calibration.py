@@ -29,6 +29,7 @@ from tod_utils import _get_ncpus
 from tod_pipeline_helpers import (
     prepare_beam_data,
     apply_beam_clustering,
+    merge_beam_entries,
     save_runtime_calibration,
     save_clustering_calibration,
 )
@@ -112,6 +113,7 @@ def main():
             whiten=whiten,
         )
 
+    beam_data = merge_beam_entries(beam_data)
     for data in beam_data.values():
         data["mp_stacked"] = np.ascontiguousarray(
             np.stack([MP[c] for c in data["comp_indices"]])

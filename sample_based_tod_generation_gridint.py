@@ -15,6 +15,7 @@ from tod_utils import _get_ncpus, _fmt_time, _should_print_batch
 from tod_pipeline_helpers import (
     prepare_beam_data,
     apply_beam_clustering,
+    merge_beam_entries,
     apply_hwp_modulation,
     resolve_spin2_skip_threshold,
     save_runtime_calibration,
@@ -299,16 +300,22 @@ def main(n_cpu_ceiling):
             whiten=config.beam_cluster_whiten,
         )
 
-    # Stack sky-map components per beam entry into a contiguous (C, N) array
-    # in the active precision.  The Numba gather kernel requires this layout.
+    # The skip band depends only on each source's own beam geometry, so it is
+    # derived before the sources are merged.
+    z_skip_threshold = resolve_spin2_skip_threshold(
+        beam_data, config.spin2_skip_tolerance
+    )
+
+    # One entry for all Stokes components, so Q and U always share a kernel
+    # call and the spin-2 transport is never dropped.
+    beam_data = merge_beam_entries(beam_data)
+
+    # Contiguous (C, N) sky-map block in the active precision, as the Numba
+    # gather kernel requires.
     for data in beam_data.values():
         data["mp_stacked"] = np.ascontiguousarray(
             np.stack([MP[c] for c in data["comp_indices"]])  # (C, N_hp)
         )
-
-    z_skip_threshold = resolve_spin2_skip_threshold(
-        beam_data, config.spin2_skip_tolerance
-    )
 
     use_cached = not config.calibration_enabled
     if use_cached:

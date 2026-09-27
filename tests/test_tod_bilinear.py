@@ -42,6 +42,13 @@ from tod_bilinear import (
 from tod_rotations import _rodrigues_jit
 
 
+def _per_component(beam_vals, mp_stacked):
+    """Replicate a shared (S,) beam row across the C map components."""
+    return np.ascontiguousarray(
+        np.broadcast_to(beam_vals, (mp_stacked.shape[0], beam_vals.shape[-1]))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers shared by the fused-kernel tests.
 #
@@ -258,7 +265,7 @@ class TestGatherAccumFusedJit:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            _per_component(beam_vals, mp_stacked),
             B,
             S,
             tod,
@@ -864,7 +871,7 @@ class TestSpin2SkipOptimisation:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            _per_component(beam_vals, mp_stacked),
             B,
             S,
             tod,
@@ -898,7 +905,7 @@ class TestSpin2SkipOptimisation:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            _per_component(beam_vals, mp_stacked),
             B,
             S,
             tod_default,

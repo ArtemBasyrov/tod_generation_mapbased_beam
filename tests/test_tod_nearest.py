@@ -34,6 +34,13 @@ from tod_spin2 import _spin2_cos2d_sin2d_jit
 from tod_rotations import _rodrigues_jit
 
 
+def _per_component(beam_vals, mp_stacked):
+    """Replicate a shared (S,) beam row across the C map components."""
+    return np.ascontiguousarray(
+        np.broadcast_to(beam_vals, (mp_stacked.shape[0], beam_vals.shape[-1]))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -113,7 +120,7 @@ def _call_nearest(
         sin_p,
         nside,
         mp_stacked,
-        beam_vals,
+        _per_component(beam_vals, mp_stacked),
         B,
         S,
         tod,
@@ -877,7 +884,7 @@ class TestNearestPixelSearchExactness:
                 sin_p.astype(np.float64),
                 nside,
                 mp,
-                beam_vals,
+                _per_component(beam_vals, mp),
                 1,
                 1,
                 tod,
@@ -1025,7 +1032,7 @@ class TestNearestSpin2Skip:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            _per_component(beam_vals, mp_stacked),
             B,
             S,
             tod,
@@ -1058,7 +1065,7 @@ class TestNearestSpin2Skip:
             sin_p,
             nside,
             mp_stacked,
-            beam_vals,
+            _per_component(beam_vals, mp_stacked),
             B,
             S,
             tod_default,

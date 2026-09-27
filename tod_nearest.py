@@ -78,7 +78,10 @@ def _gather_accum_nearest_jit(
     sin_p      : (B,)         float64    sin of Rodrigues-2 angle
     nside      : int
     mp_stacked : (C, N_hp)    precision  stacked sky-map components
-    beam_vals  : (S,)         precision  beam weights
+    beam_vals  : (C, S)       precision  per-component beam weights; row i
+                                         weights component ``comp_indices[i]``
+                                         and is zero on nodes outside that
+                                         component's beam
     B, S       : int
     tod        : (C, B)       float64   accumulated in place
     c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)
@@ -193,10 +196,9 @@ def _gather_accum_nearest_jit(
                     best_pix = npix_total - 2 * ir_cap * (ir_cap + 1) + ip
                     ring = 4 * nside - ir_cap
 
-            bv = float(beam_vals[s])
             if not has_qu:
                 for c in range(C):
-                    tod[c, b] += mp_stacked[c, best_pix] * bv
+                    tod[c, b] += mp_stacked[c, best_pix] * float(beam_vals[c, s])
             elif apply_spin2:
                 _, _, phi0, dphi_r = _ring_info_jit(nside, ring, npix_total)
                 c2d, s2d = _spin2_lookup_cached(
@@ -213,12 +215,12 @@ def _gather_accum_nearest_jit(
                 )
                 q_val = float(mp_stacked[c_q, best_pix])
                 u_val = float(mp_stacked[c_u, best_pix])
-                tod[c_q, b] += (q_val * c2d + u_val * s2d) * bv
-                tod[c_u, b] += (-q_val * s2d + u_val * c2d) * bv
+                tod[c_q, b] += (q_val * c2d + u_val * s2d) * float(beam_vals[c_q, s])
+                tod[c_u, b] += (-q_val * s2d + u_val * c2d) * float(beam_vals[c_u, s])
                 for c in range(C):
                     if c != c_q and c != c_u:
-                        tod[c, b] += mp_stacked[c, best_pix] * bv
+                        tod[c, b] += mp_stacked[c, best_pix] * float(beam_vals[c, s])
             else:
                 # Equatorial boresight: skip spin-2 rotation; scalar Q/U.
                 for c in range(C):
-                    tod[c, b] += mp_stacked[c, best_pix] * bv
+                    tod[c, b] += mp_stacked[c, best_pix] * float(beam_vals[c, s])

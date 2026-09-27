@@ -142,11 +142,17 @@ def _gather_accum_fused_jit(
     sin_p      : (B,)         float64    sin of Rodrigues-2 angle
     nside      : int
     mp_stacked : (C, N_hp)    precision  stacked sky-map components
-    beam_vals  : (S,)         precision  beam weights
+    beam_vals  : (C, S)       precision  per-component beam weights; row i
+                                         weights component ``comp_indices[i]``
+                                         and is zero on nodes outside that
+                                         component's beam
     B, S       : int
     tod        : (C, B)       float64   accumulated in place
     c_q        : int          index of Q in C-dim of mp_stacked (−1 = absent)
     c_u        : int          index of U in C-dim of mp_stacked (−1 = absent)
+
+    Q and U always share one call, so the spin-2 transport is applied even when
+    their beams come from different maps.
     """
     C = mp_stacked.shape[0]
     has_qu = c_q >= 0 and c_u >= 0
@@ -231,7 +237,8 @@ def _gather_accum_fused_jit(
                     phi_w = math.atan2(vy, vx)
                     if phi_w < 0.0:
                         phi_w += _TWO_PI
-                    bv = float(beam_vals[s])
+                    bvq = float(beam_vals[c_q, s])
+                    bvu = float(beam_vals[c_u, s])
 
                     (
                         p0,
@@ -317,13 +324,13 @@ def _gather_accum_fused_jit(
                         + w1 * (q1 * c2d1 + u1 * s2d1)
                         + w2 * (q2 * c2d2 + u2 * s2d2)
                         + w3 * (q3 * c2d3 + u3 * s2d3)
-                    ) * bv
+                    ) * bvq
                     tod[c_u, b] += (
                         w0 * (-q0 * s2d0 + u0 * c2d0)
                         + w1 * (-q1 * s2d1 + u1 * c2d1)
                         + w2 * (-q2 * s2d2 + u2 * c2d2)
                         + w3 * (-q3 * s2d3 + u3 * c2d3)
-                    ) * bv
+                    ) * bvu
 
                     for _oi in range(n_other):
                         c = _other_ch[_oi]
@@ -332,7 +339,7 @@ def _gather_accum_fused_jit(
                             + w1 * float(mp_stacked[c, p1])
                             + w2 * float(mp_stacked[c, p2])
                             + w3 * float(mp_stacked[c, p3])
-                        ) * bv
+                        ) * float(beam_vals[c, s])
             else:
                 # Equatorial boresight: skip spin-2 rotation.  Q/U accumulate
                 # as scalars, identical to I in the bilinear gather.
@@ -356,8 +363,6 @@ def _gather_accum_fused_jit(
                     phi_w = math.atan2(vy, vx)
                     if phi_w < 0.0:
                         phi_w += _TWO_PI
-                    bv = float(beam_vals[s])
-
                     p0, p1, p2, p3, w0, w1, w2, w3 = _ring_interp_single_jit(
                         nside, z, phi_w, npix_total, ring_theta
                     )
@@ -367,13 +372,13 @@ def _gather_accum_fused_jit(
                         + w1 * float(mp_stacked[c_q, p1])
                         + w2 * float(mp_stacked[c_q, p2])
                         + w3 * float(mp_stacked[c_q, p3])
-                    ) * bv
+                    ) * float(beam_vals[c_q, s])
                     tod[c_u, b] += (
                         w0 * float(mp_stacked[c_u, p0])
                         + w1 * float(mp_stacked[c_u, p1])
                         + w2 * float(mp_stacked[c_u, p2])
                         + w3 * float(mp_stacked[c_u, p3])
-                    ) * bv
+                    ) * float(beam_vals[c_u, s])
 
                     for _oi in range(n_other):
                         c = _other_ch[_oi]
@@ -382,7 +387,7 @@ def _gather_accum_fused_jit(
                             + w1 * float(mp_stacked[c, p1])
                             + w2 * float(mp_stacked[c, p2])
                             + w3 * float(mp_stacked[c, p3])
-                        ) * bv
+                        ) * float(beam_vals[c, s])
     else:
         # ── No Q/U: no spin-2 to amortise; skip the cache and go direct.
         for b in numba.prange(B):
@@ -420,11 +425,10 @@ def _gather_accum_fused_jit(
                 p0, p1, p2, p3, w0, w1, w2, w3 = _ring_interp_single_jit(
                     nside, z, phi_w, npix_total, ring_theta
                 )
-                bv = float(beam_vals[s])
                 for c in range(C):
                     tod[c, b] += (
                         w0 * float(mp_stacked[c, p0])
                         + w1 * float(mp_stacked[c, p1])
                         + w2 * float(mp_stacked[c, p2])
                         + w3 * float(mp_stacked[c, p3])
-                    ) * bv
+                    ) * float(beam_vals[c, s])

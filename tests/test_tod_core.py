@@ -287,6 +287,98 @@ class TestBeamTodBatch:
                 err_msg=f"Fused path disagrees with numpy fallback on random map, comp={comp}",
             )
 
+    def test_per_component_weights_independent(self):
+        """A (C, S) beam_vals weights each component by its own row, on both the
+        fused and numpy-fallback paths."""
+        nside = 32
+        B = 6
+        mp = self._constant_maps(nside)
+        data_base = self._build_data(S=30)
+        phi_b, theta_b, psis_b, rot_vecs = self._build_scan(B)
+        comp_indices = data_base["comp_indices"]
+        C = len(comp_indices)
+
+        base = data_base["beam_vals"].astype(np.float32)
+        bv_2d = np.stack([base * (i + 1) for i in range(C)]).astype(np.float32)
+        mp_stacked = np.stack([mp[c] for c in comp_indices]).astype(np.float32)
+
+        def run(bv, stacked):
+            d = dict(data_base)
+            d["beam_vals"] = bv
+            d["mp_stacked"] = stacked
+            return beam_tod_batch(nside, mp, d, rot_vecs, phi_b, theta_b, psis_b)
+
+        tod = run(bv_2d, mp_stacked)
+        tod_single = run(base, mp_stacked)
+        for i, comp in enumerate(comp_indices):
+            npt.assert_allclose(tod[comp], tod_single[comp] * (i + 1), rtol=1e-5)
+
+        bv_scaled_q = bv_2d.copy()
+        bv_scaled_q[1] *= 2.0
+        tod_q = run(bv_scaled_q, mp_stacked)
+        npt.assert_allclose(tod_q["I"], tod["I"], rtol=1e-6)
+        npt.assert_allclose(tod_q["U"], tod["U"], rtol=1e-6)
+        npt.assert_allclose(tod_q["Q"], tod["Q"] * 2.0, rtol=1e-5)
+
+        tod_fallback = run(bv_2d, None)
+        for comp in comp_indices:
+            npt.assert_allclose(tod[comp], tod_fallback[comp], atol=1e-4)
+
+    def test_separate_qu_sources_keep_transport(self):
+        """Q and U read from separate beam files must still receive the spin-2
+        transport once merged: the TOD equals a single shared Q/U source, and
+        differs from gathering the two sources in separate calls."""
+        from tod_pipeline_helpers import merge_beam_entries
+
+        nside = 32
+        B = 6
+        rng = np.random.default_rng(11)
+        npix = hp.nside2npix(nside)
+        mp = {c: rng.uniform(-1.0, 1.0, npix).astype(np.float64) for c in (1, 2)}
+        base = self._build_data(S=30)
+        grid = np.zeros((3, 3))
+
+        def entry(comps):
+            return {
+                "ra": grid,
+                "dec": grid,
+                "vec_orig": base["vec_orig"],
+                "beam_vals": base["beam_vals"],
+                "comp_indices": list(comps),
+            }
+
+        # High-latitude boresights, where the transport angle is large.
+        N = 201
+        phi_b = rng.uniform(0.0, 2 * np.pi, B)
+        theta_b = rng.uniform(0.1, 0.3, B)
+        rot_vecs, betas = precompute_rotation_vector_batch(
+            np.zeros((N, N)),
+            np.zeros((N, N)),
+            phi_b,
+            theta_b,
+            center_idx=(N // 2, N // 2),
+        )
+        psis_b = -betas
+
+        def gather(beam_data):
+            out = {1: np.zeros(B), 2: np.zeros(B)}
+            for d in beam_data.values():
+                d["mp_stacked"] = np.stack([mp[c] for c in d["comp_indices"]])
+                for c, v in beam_tod_batch(
+                    nside, mp, d, rot_vecs, phi_b, theta_b, psis_b
+                ).items():
+                    out[c] += v
+            return out
+
+        shared = gather({"qu": entry([1, 2])})
+        split = {"q": entry([1]), "u": entry([2])}
+        merged = gather(merge_beam_entries(split))
+        unmerged = gather({k: entry(v["comp_indices"]) for k, v in split.items()})
+
+        for c in (1, 2):
+            npt.assert_allclose(merged[c], shared[c], rtol=1e-5, atol=1e-7)
+        assert np.max(np.abs(unmerged[1] - shared[1])) > 1e-3
+
 
 # ---------------------------------------------------------------------------
 # Standalone entry point
