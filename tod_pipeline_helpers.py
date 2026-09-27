@@ -70,16 +70,17 @@ def _check_square_beam_grid(filename, ra, dec):
 def prepare_beam_data(beam_filenames, active_fields=None):
     """Load and preprocess all unique beam files into a beam-data dictionary.
 
-    For each unique beam filename, loads the FITS map, applies the ``cos(dec)``
-    solid-angle Jacobian, selects pixels by power threshold (read from
-    ``config.power_threshold_{I,Q,U}``), normalises beam weights, and
-    precomputes unit vectors.
+    For each unique ``(filename, threshold)`` pair, loads the FITS map, applies
+    the ``cos(dec)`` solid-angle Jacobian, selects pixels by power threshold
+    (read from ``config.power_threshold_{I,Q,U}``), normalises beam weights, and
+    precomputes unit vectors. Each file is read from disk once.
 
     Args:
         beam_filenames (list[str]): List of beam filenames (one per Stokes
-            component, in the order ``[I, Q, U]``). Duplicate filenames are
-            de-duplicated; the corresponding ``comp_indices`` lists which Stokes
-            components share a given beam file.
+            component, in the order ``[I, Q, U]``). Components sharing both a
+            file and a threshold share one entry, whose ``comp_indices`` lists
+            them; components sharing a file with different thresholds get
+            separate entries, since they select different pixels.
         active_fields (tuple[int, ...] | None): Which Stokes component indices
             (0=T, 1=Q, 2=U) are present in the loaded sky map. Beam entries
             whose comp_indices fall entirely outside this set are dropped, and
@@ -87,8 +88,9 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             ``None`` → use ``config.map_fields``.
 
     Returns:
-        dict[str, dict]: Beam-data dictionary keyed by beam filename. Each
-            value is a dict with the following entries:
+        dict[str, dict]: Beam-data dictionary keyed by beam filename, or by
+            ``"<filename>@<threshold>"`` for a file used at more than one
+            threshold. Each value is a dict with the following entries:
 
             - ``'ra'`` – RA offset grid [rad]
             - ``'dec'`` – Dec offset grid [rad]
@@ -110,8 +112,7 @@ def prepare_beam_data(beam_filenames, active_fields=None):
         config.power_threshold_Q,
         config.power_threshold_U,
     )
-    beam_threshold_map = {}
-    beam_groups = {}
+    beam_groups = {}  # (filename, threshold) -> component indices
     for i, bf in enumerate(beam_filenames):
         if i not in active_set:
             continue
@@ -120,17 +121,24 @@ def prepare_beam_data(beam_filenames, active_fields=None):
                 f"beam_filenames[{i}] is None but component {i} is active "
                 f"(map_fields={sorted(active_set)})"
             )
-        beam_groups.setdefault(bf, []).append(i)
-        beam_threshold_map[bf] = _per_idx_threshold[i]
+        beam_groups.setdefault((bf, _per_idx_threshold[i]), []).append(i)
 
+    n_thresholds = {}
+    for bf, _ in beam_groups:
+        n_thresholds[bf] = n_thresholds.get(bf, 0) + 1
+
+    loaded = {}  # filename -> (ra, dec, pixel_map)
     beam_data = {}
-    for bf, comp_indices in beam_groups.items():
-        ra, dec, pixel_map = load_beam(
-            config.FOLDER_BEAM,
-            bf,
-            center_x=config.beam_center_x,
-            center_y=config.beam_center_y,
-        )
+    for (bf, threshold), comp_indices in beam_groups.items():
+        if bf not in loaded:
+            loaded[bf] = load_beam(
+                config.FOLDER_BEAM,
+                bf,
+                center_x=config.beam_center_x,
+                center_y=config.beam_center_y,
+            )
+        ra, dec, pixel_map = loaded[bf]
+        key = bf if n_thresholds[bf] == 1 else f"{bf}@{threshold}"
 
         # The beam file stores point samples, while the convolution integrates
         # against dOmega = cos(dec) dRA dDec; cos(dec) is what turns the samples
@@ -141,7 +149,6 @@ def prepare_beam_data(beam_filenames, active_fields=None):
         # the cell area cancels in the normalisation below.
         weighted_map = pixel_map * np.cos(dec)
 
-        threshold = beam_threshold_map[bf]
         if threshold >= 1.0:
             # Every pixel contributes; skip the O(N log N) ranking entirely.
             sel = np.ones(weighted_map.shape, dtype=bool)
@@ -178,7 +185,7 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             axis=-1,
         )[sel].astype(config.precision_dtype)
 
-        beam_data[bf] = {
+        beam_data[key] = {
             "ra": ra,
             "dec": dec,
             "beam_vals": beam_vals,
@@ -197,17 +204,17 @@ def prepare_beam_data(beam_filenames, active_fields=None):
             cj = config.beam_center_y if config.beam_center_y is not None else W // 2
             gi, gj = np.divmod(np.arange(weighted_map.size)[sel.ravel()], W)
             orbit, rot = c4_orbits(gi - ci, gj - cj)
-            beam_data[bf]["c4"] = (orbit, rot)
+            beam_data[key]["c4"] = (orbit, rot)
             # Reported, not enforced. The cancellation degrades smoothly as the
             # beam departs from 90-degree symmetry, so this is the number that
             # says whether the path was worth taking: ~1e-4 for a symmetric
             # beam, ~1e-2 for a genuinely asymmetric one, where the
             # construction also costs node reduction.
             print(
-                f"  Beam {bf}: quadrant clustering on, C4 asymmetry "
+                f"  Beam {key}: quadrant clustering on, C4 asymmetry "
                 f"{c4_asymmetry(beam_vals, orbit, rot):.2e}"
             )
-        print(f"  Beam {bf}: {sel.sum()} selected pixels")
+        print(f"  Beam {key}: {sel.sum()} selected pixels")
 
     return beam_data
 

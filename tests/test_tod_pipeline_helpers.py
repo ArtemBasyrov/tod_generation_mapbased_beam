@@ -134,6 +134,31 @@ class TestPrepareBeamData:
         assert beam_data["Q.fits"]["comp_indices"] == [1]
         assert beam_data["U.fits"]["comp_indices"] == [2]
 
+    def test_shared_file_different_thresholds(self, monkeypatch):
+        """Q and U share a file at different thresholds → separate entries, each
+        selected at its own threshold, with the file read from disk once."""
+        ra, dec, pm = _make_gaussian_beam(n=21)
+        calls = self._install_fake_load_beam(monkeypatch, ra, dec, pm)
+        _patch_tod_config(
+            monkeypatch,
+            beam_file_I="b.fits",
+            beam_file_Q="b.fits",
+            beam_file_U="b.fits",
+            power_threshold_I=1.0,
+            power_threshold_Q=1.0,
+            power_threshold_U=0.9,
+        )
+
+        beam_data = pph.prepare_beam_data(["b.fits", "b.fits", "b.fits"])
+
+        assert len(calls) == 1
+        assert set(beam_data) == {"b.fits@1.0", "b.fits@0.9"}
+        full, cut = beam_data["b.fits@1.0"], beam_data["b.fits@0.9"]
+        assert full["comp_indices"] == [0, 1]
+        assert cut["comp_indices"] == [2]
+        assert full["n_sel"] == pm.size
+        assert 0 < cut["n_sel"] < full["n_sel"]
+
     def test_beam_vals_normalised_to_one(self, monkeypatch):
         ra, dec, pm = _make_gaussian_beam(n=21)
         self._install_fake_load_beam(monkeypatch, ra, dec, pm)
