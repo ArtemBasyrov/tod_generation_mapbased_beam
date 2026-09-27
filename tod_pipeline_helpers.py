@@ -430,6 +430,17 @@ def save_runtime_calibration(n_processes, n_threads, batch_size):
     )
 
 
+def _hwp_angle(day_index, sample_start, n, fsamp, f_hwp, phi0):
+    """HWP angle φ(t) = 2π·f_hwp·t + phi0 [rad] for ``n`` samples of a batch.
+
+    ``t`` is seconds since the start of day 0, continuous across days.
+    """
+    dt = 1.0 / float(fsamp)
+    t0 = day_index * 86400.0 + sample_start * dt
+    t = t0 + np.arange(n, dtype=np.float64) * dt
+    return 2.0 * np.pi * float(f_hwp) * t + float(phi0)
+
+
 def apply_hwp_modulation(tod_batch, day_index, sample_start, fsamp, f_hwp, phi0):
     """Rotate the Q/U rows of a TOD batch in place to model an ideal HWP.
 
@@ -452,10 +463,7 @@ def apply_hwp_modulation(tod_batch, day_index, sample_start, fsamp, f_hwp, phi0)
     B = tod_batch.shape[1]
     if B == 0:
         return
-    dt = 1.0 / float(fsamp)
-    t0 = day_index * 86400.0 + sample_start * dt
-    t = t0 + np.arange(B, dtype=np.float64) * dt
-    phi = 2.0 * np.pi * float(f_hwp) * t + float(phi0)
+    phi = _hwp_angle(day_index, sample_start, B, fsamp, f_hwp, phi0)
     c = np.cos(4.0 * phi).astype(tod_batch.dtype, copy=False)
     s = np.sin(4.0 * phi).astype(tod_batch.dtype, copy=False)
     Q = tod_batch[1].copy()

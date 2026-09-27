@@ -17,6 +17,7 @@ from tod_pipeline_helpers import (
     apply_beam_clustering,
     merge_beam_entries,
     apply_hwp_modulation,
+    _hwp_angle,
     resolve_spin2_skip_threshold,
     save_runtime_calibration,
     save_clustering_calibration,
@@ -166,6 +167,20 @@ def tod_exact_gen_batched(
         )
         psis_b = -betas + psi_b
 
+        # Detector polarisation angle: the chi of the downstream I + Q cos 2chi
+        # + U sin 2chi, which the HWP advances by 2 phi.  Unequal Q/U beams are
+        # applied in this basis.
+        chi_b = psi_b
+        if config.hwp_enabled:
+            chi_b = psi_b + 2.0 * _hwp_angle(
+                day_index,
+                bs,
+                be - bs,
+                fsamp,
+                config.hwp_rotation_frequency_hz,
+                config.hwp_initial_phase_rad,
+            )
+
         tod_batch = np.zeros((3, be - bs), dtype=config.precision_dtype)
         for data in beam_data.values():
             contrib = beam_tod_batch(
@@ -178,6 +193,7 @@ def tod_exact_gen_batched(
                 psis_b,
                 interp_mode=interp_mode,
                 z_skip_threshold=z_skip_threshold,
+                chi_b=chi_b,
             )
             for comp, vals in contrib.items():
                 tod_batch[comp] += vals

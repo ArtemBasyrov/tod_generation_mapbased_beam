@@ -89,6 +89,8 @@ def _gather_accum_fused_jit(
     c_q=-1,
     c_u=-1,
     z_skip_threshold=-1.0,
+    cos_4chi=None,
+    sin_4chi=None,
 ):
     """Fully fused Rodrigues + HEALPix bilinear gather + spin-2 + accumulation.
 
@@ -151,8 +153,20 @@ def _gather_accum_fused_jit(
     c_q        : int          index of Q in C-dim of mp_stacked (−1 = absent)
     c_u        : int          index of U in C-dim of mp_stacked (−1 = absent)
 
+    cos_4chi   : (B,) float64 or None   cos 4χ, χ the detector polarisation
+                                         angle (ψ, plus 2φ_HWP with a HWP)
+    sin_4chi   : (B,) float64 or None   sin 4χ
+
     Q and U always share one call, so the spin-2 transport is applied even when
     their beams come from different maps.
+
+    Unequal Q and U beams are applied in the detector basis, where they are
+    defined: with ``b̄ = (b_Q + b_U)/2`` and ``Δ = (b_Q − b_U)/2``, weighting
+    ``P e^{−2iχ}`` component-wise and rotating back gives
+    ``P_out = Σ b̄ P + e^{4iχ} Σ Δ P̄``, so the output stays in the boresight
+    meridian basis the downstream ``cos 2ψ / sin 2ψ`` combination expects.
+    Pass ``cos_4chi = sin_4chi = None`` when the Q and U rows are equal: Δ
+    vanishes and that path compiles without the second accumulator.
     """
     C = mp_stacked.shape[0]
     has_qu = c_q >= 0 and c_u >= 0
@@ -215,6 +229,10 @@ def _gather_accum_fused_jit(
             if phi_pts < 0.0:
                 phi_pts += _TWO_PI
 
+            # Σ Δ P̄ over the footprint; used only for unequal Q/U beams.
+            dq = 0.0
+            du = 0.0
+
             if apply_spin2:
                 for s in range(S):
                     # Rodrigues in registers — no (B, S, 3) intermediate.
@@ -239,6 +257,11 @@ def _gather_accum_fused_jit(
                         phi_w += _TWO_PI
                     bvq = float(beam_vals[c_q, s])
                     bvu = float(beam_vals[c_u, s])
+                    bd = 0.0
+                    if cos_4chi is not None:
+                        bd = 0.5 * (bvq - bvu)
+                        bvq = 0.5 * (bvq + bvu)
+                        bvu = bvq
 
                     (
                         p0,
@@ -319,18 +342,23 @@ def _gather_accum_fused_jit(
                     q3 = float(mp_stacked[c_q, p3])
                     u3 = float(mp_stacked[c_u, p3])
 
-                    tod[c_q, b] += (
+                    tq = (
                         w0 * (q0 * c2d0 + u0 * s2d0)
                         + w1 * (q1 * c2d1 + u1 * s2d1)
                         + w2 * (q2 * c2d2 + u2 * s2d2)
                         + w3 * (q3 * c2d3 + u3 * s2d3)
-                    ) * bvq
-                    tod[c_u, b] += (
+                    )
+                    tu = (
                         w0 * (-q0 * s2d0 + u0 * c2d0)
                         + w1 * (-q1 * s2d1 + u1 * c2d1)
                         + w2 * (-q2 * s2d2 + u2 * c2d2)
                         + w3 * (-q3 * s2d3 + u3 * c2d3)
-                    ) * bvu
+                    )
+                    tod[c_q, b] += tq * bvq
+                    tod[c_u, b] += tu * bvu
+                    if cos_4chi is not None:
+                        dq += tq * bd
+                        du -= tu * bd
 
                     for _oi in range(n_other):
                         c = _other_ch[_oi]
@@ -367,18 +395,30 @@ def _gather_accum_fused_jit(
                         nside, z, phi_w, npix_total, ring_theta
                     )
 
-                    tod[c_q, b] += (
+                    bvq = float(beam_vals[c_q, s])
+                    bvu = float(beam_vals[c_u, s])
+                    bd = 0.0
+                    if cos_4chi is not None:
+                        bd = 0.5 * (bvq - bvu)
+                        bvq = 0.5 * (bvq + bvu)
+                        bvu = bvq
+                    tq = (
                         w0 * float(mp_stacked[c_q, p0])
                         + w1 * float(mp_stacked[c_q, p1])
                         + w2 * float(mp_stacked[c_q, p2])
                         + w3 * float(mp_stacked[c_q, p3])
-                    ) * float(beam_vals[c_q, s])
-                    tod[c_u, b] += (
+                    )
+                    tu = (
                         w0 * float(mp_stacked[c_u, p0])
                         + w1 * float(mp_stacked[c_u, p1])
                         + w2 * float(mp_stacked[c_u, p2])
                         + w3 * float(mp_stacked[c_u, p3])
-                    ) * float(beam_vals[c_u, s])
+                    )
+                    tod[c_q, b] += tq * bvq
+                    tod[c_u, b] += tu * bvu
+                    if cos_4chi is not None:
+                        dq += tq * bd
+                        du -= tu * bd
 
                     for _oi in range(n_other):
                         c = _other_ch[_oi]
@@ -388,6 +428,12 @@ def _gather_accum_fused_jit(
                             + w2 * float(mp_stacked[c, p2])
                             + w3 * float(mp_stacked[c, p3])
                         ) * float(beam_vals[c, s])
+
+            if cos_4chi is not None:
+                c4 = float(cos_4chi[b])
+                s4 = float(sin_4chi[b])
+                tod[c_q, b] += c4 * dq - s4 * du
+                tod[c_u, b] += s4 * dq + c4 * du
     else:
         # ── No Q/U: no spin-2 to amortise; skip the cache and go direct.
         for b in numba.prange(B):

@@ -50,6 +50,8 @@ def _gather_accum_nearest_jit(
     c_q=-1,
     c_u=-1,
     z_skip_threshold=-1.0,
+    cos_4chi=None,
+    sin_4chi=None,
 ):
     """
     Fully fused Rodrigues + HEALPix nearest-pixel lookup + beam accumulation.
@@ -86,6 +88,13 @@ def _gather_accum_nearest_jit(
     tod        : (C, B)       float64   accumulated in place
     c_q        : int          index of Q within C-dim of mp_stacked (−1 = absent)
     c_u        : int          index of U within C-dim of mp_stacked (−1 = absent)
+    cos_4chi   : (B,) float64 or None   cos 4χ, χ the detector polarisation
+                                         angle (ψ, plus 2φ_HWP with a HWP)
+    sin_4chi   : (B,) float64 or None   sin 4χ
+
+    Unequal Q and U beams are applied in the detector basis; see
+    :func:`tod_bilinear._gather_accum_fused_jit` for the ``b̄ P + e^{4iχ} Δ P̄``
+    form.  Pass ``None`` for both when the Q and U rows are equal.
     """
     C = mp_stacked.shape[0]
     npix_total = 12 * nside * nside
@@ -137,6 +146,10 @@ def _gather_accum_nearest_jit(
             cache_pix = _empty_pix
             cache_c2d = _empty_c2d
             cache_s2d = _empty_s2d
+
+        # Σ Δ P̄ over the footprint; used only for unequal Q/U beams.
+        dq = 0.0
+        du = 0.0
 
         for s in range(S):
             vx, vy, vz = _rodrigues_apply_one_jit(
@@ -215,12 +228,39 @@ def _gather_accum_nearest_jit(
                 )
                 q_val = float(mp_stacked[c_q, best_pix])
                 u_val = float(mp_stacked[c_u, best_pix])
-                tod[c_q, b] += (q_val * c2d + u_val * s2d) * float(beam_vals[c_q, s])
-                tod[c_u, b] += (-q_val * s2d + u_val * c2d) * float(beam_vals[c_u, s])
+                bvq = float(beam_vals[c_q, s])
+                bvu = float(beam_vals[c_u, s])
+                if cos_4chi is not None:
+                    bd = 0.5 * (bvq - bvu)
+                    bvq = 0.5 * (bvq + bvu)
+                    bvu = bvq
+                    dq += (q_val * c2d + u_val * s2d) * bd
+                    du -= (-q_val * s2d + u_val * c2d) * bd
+                tod[c_q, b] += (q_val * c2d + u_val * s2d) * bvq
+                tod[c_u, b] += (-q_val * s2d + u_val * c2d) * bvu
                 for c in range(C):
                     if c != c_q and c != c_u:
                         tod[c, b] += mp_stacked[c, best_pix] * float(beam_vals[c, s])
             else:
                 # Equatorial boresight: skip spin-2 rotation; scalar Q/U.
-                for c in range(C):
-                    tod[c, b] += mp_stacked[c, best_pix] * float(beam_vals[c, s])
+                if cos_4chi is not None:
+                    bd = 0.5 * (float(beam_vals[c_q, s]) - float(beam_vals[c_u, s]))
+                    dq += float(mp_stacked[c_q, best_pix]) * bd
+                    du -= float(mp_stacked[c_u, best_pix]) * bd
+                    bm = 0.5 * (float(beam_vals[c_q, s]) + float(beam_vals[c_u, s]))
+                    tod[c_q, b] += mp_stacked[c_q, best_pix] * bm
+                    tod[c_u, b] += mp_stacked[c_u, best_pix] * bm
+                    for c in range(C):
+                        if c != c_q and c != c_u:
+                            tod[c, b] += mp_stacked[c, best_pix] * float(
+                                beam_vals[c, s]
+                            )
+                else:
+                    for c in range(C):
+                        tod[c, b] += mp_stacked[c, best_pix] * float(beam_vals[c, s])
+
+        if has_qu and cos_4chi is not None:
+            c4 = float(cos_4chi[b])
+            s4 = float(sin_4chi[b])
+            tod[c_q, b] += c4 * dq - s4 * du
+            tod[c_u, b] += s4 * dq + c4 * du

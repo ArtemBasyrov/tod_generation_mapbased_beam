@@ -280,6 +280,7 @@ def _run_one(
                 psis_b,
                 interp_mode=interp_mode,
                 z_skip_threshold=z_skip_threshold,
+                chi_b=psi_b,
             )
     return time.perf_counter() - t0
 

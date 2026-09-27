@@ -59,6 +59,7 @@ def beam_tod_batch(
     psis_b,
     interp_mode="bilinear",
     z_skip_threshold=-1.0,
+    chi_b=None,
 ):
     """Accumulate the TOD contribution of one beam entry for a batch of samples.
 
@@ -100,11 +101,21 @@ def beam_tod_batch(
             spin-2 is always applied, bit-identical to the un-optimised path.
             Pass the value returned by
             :func:`tod_bilinear.compute_spin2_skip_z_threshold` to enable.
+        chi_b (numpy.ndarray | None): Detector polarisation angle χ [rad],
+            shape ``(B,)``: the angle the downstream combination
+            ``I + Q cos 2χ + U sin 2χ`` uses (the scan ψ, plus ``2 φ_HWP``
+            when a HWP modulates the TOD). Required only when the Q and U
+            beam rows differ, since those weights are defined in the detector
+            basis; ignored otherwise.
 
     Returns:
         dict[int, numpy.ndarray]: Mapping from Stokes component index to a
             ``(B,)`` ``float32`` array containing the beam-weighted sky-map
-            accumulation for that component over the batch.
+            accumulation for that component over the batch. Q/U are in the
+            boresight meridian basis.
+
+    Raises:
+        ValueError: If the Q and U beam rows differ and ``chi_b`` is None.
     """
     B = phi_b.shape[0]
     vec_orig = data["vec_orig"]  # (S, 3)
@@ -120,6 +131,19 @@ def beam_tod_batch(
 
     c_q = comp_indices.index(1) if 1 in comp_indices else -1
     c_u = comp_indices.index(2) if 2 in comp_indices else -1
+
+    # Unequal Q/U beams act in the detector basis and need the angle χ; equal
+    # ones commute with it, so the phase pair stays None and the kernel skips it.
+    cos_4chi = sin_4chi = None
+    if c_q >= 0 and c_u >= 0 and not np.array_equal(beam_vals[c_q], beam_vals[c_u]):
+        if chi_b is None:
+            raise ValueError(
+                "Q and U beams differ, so chi_b (the detector polarisation "
+                "angle) is required to apply them in the detector basis"
+            )
+        chi = np.asarray(chi_b, dtype=np.float64)
+        cos_4chi = np.ascontiguousarray(np.cos(4.0 * chi))
+        sin_4chi = np.ascontiguousarray(np.sin(4.0 * chi))
 
     use_nearest = interp_mode == "nearest"
     if interp_mode not in ("nearest", "bilinear"):
@@ -155,6 +179,8 @@ def beam_tod_batch(
                 c_q,
                 c_u,
                 float(z_skip_threshold),
+                cos_4chi,
+                sin_4chi,
             )
         else:
             _gather_accum_fused_jit(
@@ -174,6 +200,8 @@ def beam_tod_batch(
                 c_q,
                 c_u,
                 float(z_skip_threshold),
+                cos_4chi,
+                sin_4chi,
             )
         return {comp: tod_arr[i].astype(_dt) for i, comp in enumerate(comp_indices)}
 
@@ -185,5 +213,16 @@ def beam_tod_batch(
     pixels, weights = get_interp_weights_numba(nside, theta_flat, phi_flat)
     mp_gathered = np.stack([mp[c][pixels] for c in comp_indices])
     mp_flat = np.einsum("ckn,kn->cn", mp_gathered, weights)
-    tod_chunk = np.einsum("cbs,cs->cb", mp_flat.reshape(C, B, S), beam_vals_f32)
+    mp_flat = mp_flat.reshape(C, B, S)
+    if cos_4chi is None:
+        tod_chunk = np.einsum("cbs,cs->cb", mp_flat, beam_vals_f32)
+    else:
+        # No transport on this path; the detector-basis weighting still holds.
+        tod_chunk = np.einsum("cbs,cs->cb", mp_flat, beam_vals_f32).astype(np.float64)
+        b_mean = 0.5 * (beam_vals_f32[c_q] + beam_vals_f32[c_u])
+        b_diff = 0.5 * (beam_vals_f32[c_q] - beam_vals_f32[c_u])
+        dq = mp_flat[c_q] @ b_diff
+        du = -(mp_flat[c_u] @ b_diff)
+        tod_chunk[c_q] = mp_flat[c_q] @ b_mean + cos_4chi * dq - sin_4chi * du
+        tod_chunk[c_u] = mp_flat[c_u] @ b_mean + sin_4chi * dq + cos_4chi * du
     return {comp: tod_chunk[i].astype(_dt) for i, comp in enumerate(comp_indices)}

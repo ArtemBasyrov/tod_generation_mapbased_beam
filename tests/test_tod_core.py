@@ -359,13 +359,14 @@ class TestBeamTodBatch:
             center_idx=(N // 2, N // 2),
         )
         psis_b = -betas
+        chi_b = rng.uniform(0.0, 2 * np.pi, B)
 
         def gather(beam_data):
             out = {1: np.zeros(B), 2: np.zeros(B)}
             for d in beam_data.values():
                 d["mp_stacked"] = np.stack([mp[c] for c in d["comp_indices"]])
                 for c, v in beam_tod_batch(
-                    nside, mp, d, rot_vecs, phi_b, theta_b, psis_b
+                    nside, mp, d, rot_vecs, phi_b, theta_b, psis_b, chi_b=chi_b
                 ).items():
                     out[c] += v
             return out
@@ -378,6 +379,117 @@ class TestBeamTodBatch:
         for c in (1, 2):
             npt.assert_allclose(merged[c], shared[c], rtol=1e-5, atol=1e-7)
         assert np.max(np.abs(unmerged[1] - shared[1])) > 1e-3
+
+
+# ===========================================================================
+# Unequal Q/U beams act in the detector basis
+# ===========================================================================
+
+
+class TestDetectorBasisBeams:
+    """Per-component Q/U beams are defined in the detector basis, so with
+    ``b_Q != b_U`` the TOD must equal weighting ``P e^{-2i chi}`` component-wise.
+    The reference is built from two equal-beam runs (weights ``b_Q`` and ``b_U``),
+    which do not depend on chi."""
+
+    nside = 32
+    B = 12
+    N = 201
+
+    @staticmethod
+    def _rtol():
+        import tod_config
+
+        return 1e-10 if np.dtype(tod_config.precision_dtype) == np.float64 else 1e-6
+
+    def _setup(self, S, seed):
+        rng = np.random.default_rng(seed)
+        npix = hp.nside2npix(self.nside)
+        mp = {c: rng.uniform(-1.0, 1.0, npix) for c in (0, 1, 2)}
+        th = rng.uniform(0.0, 0.03, S)
+        ph = rng.uniform(0.0, 2 * np.pi, S)
+        vec = np.stack(
+            [np.cos(th), np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph)], axis=-1
+        )
+        phi_b = rng.uniform(0.0, 2 * np.pi, self.B)
+        # Polar and equatorial boresights, so the transport and the skip band both run.
+        theta_b = np.concatenate(
+            [rng.uniform(0.1, 0.4, self.B // 2), rng.uniform(1.5, 1.64, self.B // 2)]
+        )
+        psi_b = rng.uniform(0.0, 2 * np.pi, self.B)
+        chi_b = rng.uniform(0.0, 2 * np.pi, self.B)
+        g = np.zeros((self.N, self.N))
+        rot_vecs, betas = precompute_rotation_vector_batch(
+            g, g, phi_b, theta_b, center_idx=(self.N // 2, self.N // 2)
+        )
+        return rng, mp, vec, (rot_vecs, phi_b, theta_b, psi_b - betas), chi_b
+
+    def _run(self, mp, vec, bv, scan, chi_b, mode, stacked, z_skip=-1.0):
+        data = {"vec_orig": vec, "beam_vals": bv, "comp_indices": [0, 1, 2]}
+        data["mp_stacked"] = np.stack([mp[c] for c in (0, 1, 2)]) if stacked else None
+        rot_vecs, phi_b, theta_b, psis_b = scan
+        out = beam_tod_batch(
+            self.nside,
+            mp,
+            data,
+            rot_vecs,
+            phi_b,
+            theta_b,
+            psis_b,
+            interp_mode=mode,
+            z_skip_threshold=z_skip,
+            chi_b=chi_b,
+        )
+        return out[0], out[1] + 1j * out[2]
+
+    @pytest.mark.parametrize(
+        "mode,stacked,z_skip",
+        [
+            ("bilinear", True, -1.0),
+            ("bilinear", True, 0.3),
+            ("nearest", True, -1.0),
+            ("nearest", True, 0.3),
+            ("bilinear", False, -1.0),
+        ],
+    )
+    def test_matches_detector_basis_reference(self, mode, stacked, z_skip):
+        S = 40
+        rng, mp, vec, scan, chi_b = self._setup(S, seed=5)
+        b_i = rng.uniform(0.5, 1.5, S)
+        b_q = rng.uniform(0.5, 1.5, S)
+        b_u = rng.uniform(0.5, 1.5, S)
+        bv = np.stack([b_i, b_q, b_u])
+
+        t_out, p_out = self._run(mp, vec, bv, scan, chi_b, mode, stacked, z_skip)
+        _, p_q = self._run(mp, vec, b_q, scan, None, mode, stacked, z_skip)
+        _, p_u = self._run(mp, vec, b_u, scan, None, mode, stacked, z_skip)
+        t_ref, _ = self._run(mp, vec, b_i, scan, None, mode, stacked, z_skip)
+
+        rot = np.exp(-2j * chi_b)
+        det = p_out * rot
+        atol = self._rtol() * np.abs(p_q).max()
+        npt.assert_allclose(det.real, (p_q * rot).real, rtol=self._rtol(), atol=atol)
+        npt.assert_allclose(det.imag, (p_u * rot).imag, rtol=self._rtol(), atol=atol)
+        npt.assert_array_equal(t_out, t_ref)
+
+    @pytest.mark.parametrize("mode", ["bilinear", "nearest"])
+    def test_pencil_beam_zero_u_weight(self, mode):
+        """One node with U weight 0: the detector-frame U output vanishes at
+        every chi, while Q keeps the full weight."""
+        _, mp, vec, scan, chi_b = self._setup(1, seed=9)
+        bv = np.array([[1.0], [1.0], [0.0]])
+        _, p_out = self._run(mp, vec, bv, scan, chi_b, mode, True)
+        _, p_full = self._run(mp, vec, np.ones(1), scan, None, mode, True)
+        det = p_out * np.exp(-2j * chi_b)
+        atol = 10 * self._rtol() * np.abs(p_full).max()
+        npt.assert_allclose(det.imag, 0.0, atol=atol)
+        npt.assert_allclose(det.real, (p_full * np.exp(-2j * chi_b)).real, atol=atol)
+
+    def test_unequal_beams_require_chi(self):
+        _, mp, vec, scan, _ = self._setup(4, seed=1)
+        bv = np.stack([np.ones(4), np.ones(4), 0.5 * np.ones(4)])
+        with pytest.raises(ValueError, match="chi_b"):
+            self._run(mp, vec, bv, scan, None, "bilinear", True)
 
 
 # ---------------------------------------------------------------------------
