@@ -1,4 +1,6 @@
 import os
+from datetime import datetime as _datetime
+
 import numpy as np
 import yaml
 
@@ -209,6 +211,23 @@ if hwp_enabled and not (1 in map_fields and 2 in map_fields):
         f"U (2); got map_fields={list(map_fields)}. HWP modulation rotates "
         "Q and U into each other and is meaningless without both."
     )
+
+# Output format.
+# true (default): the generator writes one TOAST HDF5 observation per day,
+#   obs_day_{N}.h5, into FOLDER_TOD_OUTPUT for furax (see tod_to_furax.py);
+#   no tod_day_{N}.npy is written. Needs toast, imported only when enabled.
+# false: the generator writes the raw (3, n) tod_day_{N}.npy per day.
+# The stored signal dtype follows `precision`, which must then match furax's
+# double_precision.
+furax_export = bool(_cfg.get("furax_export", True))
+# ISO-8601 UTC time of sample 0 of day 0: the exported timestream origin.
+furax_export_t0 = str(_cfg.get("furax_export_t0", "2030-01-01T00:00:00+00:00"))
+try:
+    _datetime.fromisoformat(furax_export_t0)
+except ValueError as _exc:
+    raise ValueError(
+        f"furax_export_t0 must be an ISO-8601 timestamp; got {furax_export_t0!r}"
+    ) from _exc
 
 # Multiprocessing start method ('spawn' or 'fork').
 # 'spawn' (default): safe on all platforms; re-triggers Numba JIT in each worker.

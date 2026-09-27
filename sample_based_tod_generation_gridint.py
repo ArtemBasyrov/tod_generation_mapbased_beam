@@ -17,6 +17,7 @@ from tod_pipeline_helpers import (
     apply_beam_clustering,
     merge_beam_entries,
     apply_hwp_modulation,
+    _combine_iqu_to_signal,
     _hwp_angle,
     resolve_spin2_skip_threshold,
     save_runtime_calibration,
@@ -218,11 +219,56 @@ def tod_exact_gen_batched(
     return tod_day
 
 
+def _day_output(day_index, tod_day, prefix=""):
+    """Turn a day's ``(3, n)`` TOD into what the run keeps.
+
+    With ``furax_export`` the TOD is combined into the detector signal and
+    returned, for the main process to write as HDF5. Otherwise it is saved as
+    ``tod_day_<N>.npy`` and ``None`` is returned.
+    """
+    if config.furax_export:
+        psi = open_scan_day(folder_scan, day_index)[2]
+        return _combine_iqu_to_signal(tod_day, psi)
+    output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
+    np.save(output_file, tod_day)
+    print(prefix + f"Saved {output_file}")
+    return None
+
+
+def _write_observation(writer, day_index, signal, fsamp, t0_unix):
+    """Write one day's detector signal as ``obs_day_<N>.h5`` (main process only).
+
+    The main process is the sole HDF5 writer: SaveHDF5 updates a shared SQLite
+    index that concurrent writers would race on.
+    """
+    theta, phi, psi = (
+        np.asarray(a, dtype=np.float64) for a in open_scan_day(folder_scan, day_index)
+    )
+    writer.write_day_observation(
+        day_index,
+        signal,
+        theta,
+        phi,
+        psi,
+        folder_tod_output,
+        fsamp,
+        t0_unix,
+        config.hwp_enabled,
+        config.hwp_rotation_frequency_hz,
+        config.hwp_initial_phase_rad,
+        signal_dtype=config.precision_dtype,
+    )
+    print(f"Wrote obs_day_{day_index}.h5")
+
+
 def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0, fsamp=None):
     """
     Worker entry point.  beam_data and mp are *not* passed as arguments —
     they live in the module-level globals populated by _worker_init, so no
     pickling / copying of the large sky-map arrays occurs per task.
+
+    Returns ``(day_index, ok, error, signal)``; ``signal`` is the ``(n,)``
+    detector timestream with ``furax_export`` and ``None`` otherwise.
     """
     process_name = multiprocessing.current_process().name
     print(f"[{process_name}] Processing day {day_index + 1}/{Nb}")
@@ -236,13 +282,15 @@ def _process_day(day_index, batch_size, Nb, z_skip_threshold=-1.0, fsamp=None):
             z_skip_threshold=z_skip_threshold,
             fsamp=fsamp,
         )
-        output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
-        np.save(output_file, tod_day)
-        print(f"[{process_name}] Saved {output_file}")
-        return day_index, True, None
+        return (
+            day_index,
+            True,
+            None,
+            _day_output(day_index, tod_day, prefix=f"[{process_name}] "),
+        )
     except Exception as e:
         print(f"[{process_name}] Error on day {day_index}: {e}")
-        return day_index, False, str(e)
+        return day_index, False, str(e), None
 
 
 def main(n_cpu_ceiling):
@@ -251,8 +299,9 @@ def main(n_cpu_ceiling):
     Loads the sky map and beams, optionally runs clustering and runtime
     calibration, then processes each day either in-process (``ncpus == 1``)
     or via a multiprocessing pool with the sky-map components stored in
-    POSIX shared memory. Per-day TOD arrays are written to
-    ``config.FOLDER_TOD_OUTPUT`` as ``tod_day_{i}.npy``.
+    POSIX shared memory. Each day is written to ``config.FOLDER_TOD_OUTPUT``
+    as ``obs_day_{i}.h5`` for furax (``furax_export: true``, the default) or as
+    the raw ``tod_day_{i}.npy``.
 
     Args:
         n_cpu_ceiling (int): Hard upper bound on worker processes, typically
@@ -266,6 +315,16 @@ def main(n_cpu_ceiling):
     days = range(start, end)
 
     os.makedirs(folder_tod_output, exist_ok=True)
+
+    # Imported up front so a missing toast fails before hours of generation.
+    writer = t0_unix = None
+    if config.furax_export:
+        from datetime import datetime
+
+        import tod_to_furax as writer
+
+        t0_unix = datetime.fromisoformat(config.furax_export_t0).timestamp()
+        print(f"furax export: obs_day_{{N}}.h5 → {folder_tod_output}")
 
     # Load the sky map here (inside main / under __name__ guard) so that
     # spawned worker processes — which re-import this module — never execute
@@ -399,7 +458,16 @@ def main(n_cpu_ceiling):
                 initializer=_worker_init,
                 initargs=(beam_data_static, nside, beam_shm_descs, n_threads),
             ) as pool:
-                results = pool.map(worker, days)
+                # Days are written as they finish, so no day's signal is held
+                # longer than its own export.
+                results = []
+                for day, ok, err, signal in pool.imap_unordered(worker, days):
+                    if ok and signal is not None:
+                        try:
+                            _write_observation(writer, day, signal, fsamp, t0_unix)
+                        except Exception as e:
+                            ok, err = False, f"HDF5 export: {e}"
+                    results.append((day, ok, err))
         finally:
             # Release shared memory only after all workers have finished.
             for shm in beam_shms.values():
@@ -425,8 +493,9 @@ def main(n_cpu_ceiling):
                 z_skip_threshold=z_skip_threshold,
                 fsamp=fsamp,
             )
-            output_file = os.path.join(folder_tod_output, f"tod_day_{day_index}.npy")
-            np.save(output_file, tod_day)
+            signal = _day_output(day_index, tod_day)
+            if signal is not None:
+                _write_observation(writer, day_index, signal, fsamp, t0_unix)
 
     print(f"\nTotal run time: {(time.time() - t0) / 60:.2f}m")
 

@@ -27,7 +27,7 @@ direction and applies the polarisation roll angle.
 
 ```bash
 # 1. Install dependencies
-pip install numpy healpy pixell numba pyyaml psutil
+pip install numpy healpy pixell numba pyyaml psutil toast astropy h5py
 
 # 2. Copy and edit the config
 cp config.yaml config_local.yaml
@@ -53,7 +53,7 @@ precedence when present). Both files use YAML syntax.
 | Key | Type | Description |
 |---|---|---|
 | `FOLDER_SCAN` | `str` | Directory containing scan files (`theta_N.npy`, `phi_N.npy`, `psi_N.npy`). Must end with `/`. |
-| `FOLDER_TOD_OUTPUT` | `str` | Output directory for TOD files (`tod_day_N.npy`). Created automatically if absent. |
+| `FOLDER_TOD_OUTPUT` | `str` | Output directory: `obs_day_N.h5` with `furax_export: true`, `tod_day_N.npy` otherwise. Created automatically if absent. |
 | `path_to_map` | `str` | Path to the HEALPix sky map FITS file containing I, Q, U fields. |
 | `FOLDER_BEAM` | `str` | Directory containing beam FITS files. |
 | `beam_file_I` | `str` | Filename of the intensity (I) beam map inside `FOLDER_BEAM`. |
@@ -274,14 +274,29 @@ file in the scan folder. The sample rate is estimated as
 
 #### TOD files (`FOLDER_TOD_OUTPUT`)
 
-One `.npy` file per processing batch:
+The format is set by `furax_export`.
 
+With `furax_export: true` (the default), each day is one TOAST HDF5 observation for furax:
+
+```text
+obs_day_{day_index}.h5    # one boresight detector, signal (1, n_samples)
+index.sqlite              # SaveHDF5's observation index
 ```
-tod_day_{day_index}.npy   # shape (3, n_samples), dtype float32
+
+The stored signal is `I + Q cos 2ψ + U sin 2ψ`, at the pipeline `precision`.
+That dtype must match furax's `double_precision`.
+`furax_export_t0` sets the UTC time of sample 0 of day 0.
+
+With `furax_export: false`, each day is the raw TOD:
+
+```text
+tod_day_{day_index}.npy   # shape (3, n_samples), dtype = precision
 ```
 
 Axis 0 indexes the Stokes component: `[I, Q, U]`.
 Axis 1 indexes the detector sample.
+`python tod_to_furax.py` re-exports these files to HDF5 afterwards.
+It takes `--output`, `--start-day`, `--end-day`, `--t0`, `--split-per-day` and `--precision`.
 
 ---
 
@@ -368,11 +383,12 @@ pointing to the correct branch.
 | `pixell` | enmap beam file loading |
 | `pyyaml` | Config file parsing |
 | `psutil` | CPU/memory auto-detection (optional but recommended) |
+| `toast`, `astropy`, `h5py` | TOAST HDF5 export for furax (`furax_export: true`, the default) |
 
 Install with:
 
 ```bash
-pip install numpy healpy pixell numba pyyaml psutil
+pip install numpy healpy pixell numba pyyaml psutil toast astropy h5py
 ```
 
 ---

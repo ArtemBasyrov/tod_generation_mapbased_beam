@@ -141,6 +141,15 @@
   hwp_enabled: false
   hwp_rotation_frequency_hz: 0.0     # physical HWP rotation rate f_HWP [Hz]
   hwp_initial_phase_rad: 0.0         # φ₀ at t = 0 (start of day 0) [rad]
+  # Output format.
+  # true  → one TOAST HDF5 observation per day, obs_day_{N}.h5, in
+  #         FOLDER_TOD_OUTPUT, ready for furax. No tod_day_{N}.npy is written.
+  #         Needs toast. The signal is stored at `precision`, which must match
+  #         furax's double_precision.
+  # false → the raw (3, n_samples) tod_day_{N}.npy per day. tod_to_furax.py
+  #         re-exports those to HDF5 afterwards.
+  furax_export: true
+  furax_export_t0: '2030-01-01T00:00:00+00:00'  # UTC time of sample 0 of day 0
   # Multiprocessing start method: 'spawn' (safe, default) or 'fork' (faster on Linux).
   # 'fork' avoids re-running Numba JIT compilation in each worker but may deadlock
   # on macOS. Only change this if you have verified it is safe on your platform.

@@ -13,6 +13,8 @@ resolve_spin2_skip_threshold — derive the equatorial-band cos(θ) cutoff for
                                the spin-2 Q/U rotation skip optimisation.
 apply_hwp_modulation         — rotate Q/U rows of a TOD batch in place to
                                model an ideal continuously rotating HWP.
+_combine_iqu_to_signal       — combine an (I, Q, U) TOD into the scalar
+                               detector timestream at polarisation angle ψ.
 save_runtime_calibration     — persist (n_processes, numba_threads, batch_size)
                                back into the active config YAML.
 save_clustering_calibration  — persist (n_clusters, tail_fraction, whiten)
@@ -470,6 +472,26 @@ def apply_hwp_modulation(tod_batch, day_index, sample_start, fsamp, f_hwp, phi0)
     U = tod_batch[2].copy()
     tod_batch[1] = Q * c + U * s
     tod_batch[2] = -Q * s + U * c
+
+
+def _combine_iqu_to_signal(iqu, psi):
+    """Combine an ``(3, n)`` [I, Q, U] TOD into the detector timestream.
+
+    ``d = I + Q cos 2ψ + U sin 2ψ``, with Q/U in the boresight meridian basis
+    (after any HWP modulation). This is the TOAST temperature convention without
+    the ideal polariser's factor 1/2: furax applies that factor itself when it
+    reads the HDF5, so including it here would solve to m/2.
+
+    Args:
+        iqu (numpy.ndarray): ``(3, n)`` TOD.
+        psi (numpy.ndarray): ``(n,)`` polarisation angle ψ [rad].
+
+    Returns:
+        numpy.ndarray: ``(n,)`` float64 signal.
+    """
+    I, Q, U = np.asarray(iqu, dtype=np.float64)
+    psi = np.asarray(psi, dtype=np.float64)
+    return I + Q * np.cos(2.0 * psi) + U * np.sin(2.0 * psi)
 
 
 def save_clustering_calibration(tail_fraction, n_clusters, whiten=None):
