@@ -272,12 +272,10 @@ def write_day_observation(
 
     hwp_angles = None
     if hwp_enabled:
-        # Wrapped to [0, 2pi): furax casts this column to its run dtype without
-        # re-anchoring it, and an unwrapped phase of ~1e8 rad collapses to a few
-        # float32 values per day. Only cos/sin(4 phi) enter, so wrapping is exact.
-        hwp_angles = np.mod(
-            _hwp_angle(day_index, 0, n_samples, fsamp, f_hwp, phi0_hwp), 2.0 * np.pi
-        )
+        # Bit-identical to the angle the generator modulated with. It is already
+        # wrapped to [0, 2pi), which furax needs: it casts this column to its run
+        # dtype, and an unwrapped ~1e8 rad phase collapses to a few float32 values.
+        hwp_angles = _hwp_angle(day_index, 0, n_samples, fsamp, f_hwp, phi0_hwp)
 
     boresight_quats = _angles_to_boresight_radec_quats(theta, phi, psi)
     _check_finite(

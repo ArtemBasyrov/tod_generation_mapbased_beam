@@ -585,7 +585,7 @@ class TestApplyHwpModulation:
     """Tests for apply_hwp_modulation — in-place 4·φ_HWP rotation of (Q, U).
 
     Reference formula (matching the helper's implementation):
-        φ(t)  = 2π·f_hwp·t + φ₀,  t = day_index·86400 + sample_start·dt + i·dt
+        φ(t)  = (2π·f_hwp·t + φ₀) mod 2π,  t = day_index·86400 + (sample_start + i)·dt
         Q'_i =  Q_i·cos(4φ_i) + U_i·sin(4φ_i)
         U'_i = −Q_i·sin(4φ_i) + U_i·cos(4φ_i)
     T (row 0) must never be modified.
@@ -658,8 +658,8 @@ class TestApplyHwpModulation:
         )
 
         dt = 1.0 / fsamp
-        t = day_index * 86400.0 + sample_start * dt + np.arange(B) * dt
-        phi = 2.0 * np.pi * f_hwp * t + phi0
+        t = day_index * 86400.0 + (sample_start + np.arange(B)) * dt
+        phi = np.mod(2.0 * np.pi * f_hwp * t + phi0, 2.0 * np.pi)
         c = np.cos(4.0 * phi)
         s = np.sin(4.0 * phi)
         Q_expected = Q0 * c + U0 * s
@@ -703,8 +703,8 @@ class TestApplyHwpModulation:
         d_code = tod[0] + tod[1] * np.cos(2.0 * psi) + tod[2] * np.sin(2.0 * psi)
 
         dt = 1.0 / fsamp
-        t = day_index * 86400.0 + sample_start * dt + np.arange(B) * dt
-        phi = 2.0 * np.pi * f_hwp * t + phi0
+        t = day_index * 86400.0 + (sample_start + np.arange(B)) * dt
+        phi = np.mod(2.0 * np.pi * f_hwp * t + phi0, 2.0 * np.pi)
         phi_sky = phi + psi
         Q_out = Q0 * np.cos(4.0 * phi_sky) + U0 * np.sin(4.0 * phi_sky)
         U_out = Q0 * np.sin(4.0 * phi_sky) - U0 * np.cos(4.0 * phi_sky)
@@ -726,6 +726,20 @@ class TestApplyHwpModulation:
         u_refl = Q0 * np.sin(4.0 * phi) - U0 * np.cos(4.0 * phi)
         d_refl = T0 + q_refl * np.cos(2.0 * psi) + u_refl * np.sin(2.0 * psi)
         assert np.abs(d_refl - d_mueller).max() > 0.5 * d_mueller.std()
+
+    def test_batches_bit_identical_to_whole_day(self):
+        """Batch-wise angles equal the whole-day angle the furax export stores."""
+        fsamp, f_hwp, phi0, n, batch = 19.0, 0.8, 0.3, 100_003, 8192
+        for day in (0, 57, 500):
+            whole = pph._hwp_angle(day, 0, n, fsamp, f_hwp, phi0)
+            batched = np.concatenate(
+                [
+                    pph._hwp_angle(day, bs, min(batch, n - bs), fsamp, f_hwp, phi0)
+                    for bs in range(0, n, batch)
+                ]
+            )
+            npt.assert_array_equal(batched, whole)
+            assert np.all((whole >= 0.0) & (whole < 2.0 * np.pi))
 
     def test_phase_continuity_across_days(self):
         """Sample 0 of day_index=1 must continue the phase from end of day 0."""

@@ -103,17 +103,18 @@ def test_convert_day_roundtrip(tmp_path):
 
 
 def test_hwp_angle_is_wrapped_generator_phase(tmp_path):
-    """The stored HWP angle is the generator's phase, wrapped to [0, 2 pi)."""
+    """The stored HWP angle is bit-identical to the generator's wrapped phase."""
     day, f_hwp, phi0 = 3, 1.3, 0.4
     scan, tod, *_ = _write_inputs(tmp_path, day=day)
     out = _read(
         _convert(tmp_path, scan, tod, day=day, hwp=True, f_hwp=f_hwp, phi0=phi0)[0]
     )
-    raw = _hwp_angle(day, 0, out["hwp"].size, _FSAMP, f_hwp, phi0)
-    assert raw.min() > 2 * np.pi  # the test exercises the wrap
+    n = out["hwp"].size
+    unwrapped = 2 * np.pi * f_hwp * (day * 86400.0 + np.arange(n) / _FSAMP) + phi0
+    assert unwrapped.min() > 2 * np.pi  # the test exercises the wrap
     assert np.all((out["hwp"] >= 0.0) & (out["hwp"] < 2 * np.pi))
-    npt.assert_allclose(np.cos(4 * out["hwp"]), np.cos(4 * raw), atol=1e-9)
-    npt.assert_allclose(np.sin(4 * out["hwp"]), np.sin(4 * raw), atol=1e-9)
+    npt.assert_array_equal(out["hwp"], _hwp_angle(day, 0, n, _FSAMP, f_hwp, phi0))
+    npt.assert_allclose(np.cos(4 * out["hwp"]), np.cos(4 * unwrapped), atol=1e-9)
 
 
 def test_split_per_day_covers_all_samples(tmp_path):

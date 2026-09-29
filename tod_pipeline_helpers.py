@@ -433,14 +433,28 @@ def save_runtime_calibration(n_processes, n_threads, batch_size):
 
 
 def _hwp_angle(day_index, sample_start, n, fsamp, f_hwp, phi0):
-    """HWP angle φ(t) = 2π·f_hwp·t + phi0 [rad] for ``n`` samples of a batch.
+    """HWP angle φ(t) = 2π·f_hwp·t + phi0 [rad], wrapped to [0, 2π).
 
-    ``t`` is seconds since the start of day 0, continuous across days.
+    ``t`` is seconds since the start of day 0, continuous across days. Each
+    element depends only on its sample index within the day, so any batch is
+    bit-identical to the same slice of a whole-day call: the angle that
+    modulates the TOD is exactly the one the furax export stores.
+
+    Args:
+        day_index (int): Zero-based observation-day index.
+        sample_start (int): Index of the first sample within the day.
+        n (int): Number of samples.
+        fsamp (float): Sample rate [samples/s].
+        f_hwp (float): HWP physical rotation frequency [Hz].
+        phi0 (float): Initial HWP phase at t=0 [rad].
+
+    Returns:
+        numpy.ndarray: ``(n,)`` float64 angle in [0, 2π).
     """
     dt = 1.0 / float(fsamp)
-    t0 = day_index * 86400.0 + sample_start * dt
-    t = t0 + np.arange(n, dtype=np.float64) * dt
-    return 2.0 * np.pi * float(f_hwp) * t + float(phi0)
+    i = (sample_start + np.arange(n, dtype=np.int64)).astype(np.float64)
+    t = day_index * 86400.0 + i * dt
+    return np.mod(2.0 * np.pi * float(f_hwp) * t + float(phi0), 2.0 * np.pi)
 
 
 def apply_hwp_modulation(tod_batch, day_index, sample_start, fsamp, f_hwp, phi0):
