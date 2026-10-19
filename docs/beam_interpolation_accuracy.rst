@@ -1,8 +1,11 @@
 Beam Interpolation Accuracy
 ===========================
 
-This page documents the interpolation accuracy of the three methods available
-via ``beam_interp_method``.  The measurements set the effective noise floor of
+This page documents the interpolation accuracy of three sky-map lookup
+methods.  ``'nearest'`` and ``'bilinear'`` are the two values
+``beam_interp_method`` accepts.  The Gaussian kernel (GK) lived on the
+retired ``gaussian`` branch; it is kept here only as a comparison point and
+is not available in the pipeline.  The measurements set the effective noise floor of
 the sky-map lookup step; they are independent of beam pixel clustering (see
 :doc:`beam_cluster_calibration` for clustering quality metrics).
 
@@ -38,16 +41,17 @@ Three interpolation strategies are compared:
      - Description
    * - ``'nearest'``
      - NP — Nearest Pixel
-     - Single nearest-pixel lookup.  No blending; the raw pixel that is closest
-       to the query direction is returned directly.
+     - Single-pixel lookup.  No blending; the HEALPix pixel whose area
+       *contains* the query direction is returned directly (``hp.ang2pix``,
+       in closed form).
    * - ``'bilinear'``
      - BI — Bilinear Interpolation
      - Weighted average of the 4 HEALPix neighbours returned by
        ``healpy.get_interp_weights``.  Implemented as a fused Numba kernel.
-   * - ``'gaussian'``
+   * - *(retired)*
      - GK — Gaussian Kernel
-     - Isotropic Gaussian-weighted average over all pixels within
-       ``beam_interp_radius_deg``.
+     - Isotropic Gaussian-weighted average over all pixels within a fixed
+       radius.  Not available on ``main``.
 
 
 Metrics
@@ -263,8 +267,8 @@ for polarisation analysis.
 
 **GK is the most rotationally stable** method but the least accurate: its
 explicit smoothing suppresses boundary-crossing artefacts at the cost of
-blurring the true beam value.  It is not recommended as a general-purpose
-choice; the method is still under development.
+blurring the true beam value.  It was slower than bilinear, produced
+artefacts in TT, and has been retired.
 
 **BI is the best overall compromise** — smooth (no discrete jumps, good
 rotational stability) and accurate (below 0.1 % at nside = 2048 for all beam

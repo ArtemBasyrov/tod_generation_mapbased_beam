@@ -145,12 +145,12 @@ Example: Elliptical Gaussian Beam
    fwhm_arcmin = 30.0
    beam = anisotropic_gaussian_2d(ra, dec, fwhm_x=fwhm_arcmin, fwhm_y=fwhm_arcmin)
 
-   # Assign the same beam pattern to all three Stokes components.
-   # For an experiment with distinct polarised beam shapes, use separate
-   # arrays for imap[1] (Q) and imap[2] (U).
-   imap[0] = beam   # Stokes I beam
-   imap[1] = beam   # Stokes Q beam
-   imap[2] = beam   # Stokes U beam
+   # The pipeline reads only the first component of a beam file.  Fill all
+   # three for completeness; for distinct Q/U beams write separate files and
+   # point beam_file_Q / beam_file_U at them.
+   imap[0] = beam   # Stokes I beam (the component the pipeline reads)
+   imap[1] = beam
+   imap[2] = beam
 
    # Save to a FITS file.  The WCS header written by enmap ensures that the
    # pipeline can recover the pixel coordinates and correctly identify the
@@ -161,23 +161,29 @@ Example: Elliptical Gaussian Beam
 Notes on beam centring
 ----------------------
 
-The pipeline locates the beam axis by reading RA / Dec offsets from the WCS
-header and finding the pixel closest to ``(RA, Dec) = (0, 0)``.  As long as
-``create_coord_with_resol`` (or any equivalent procedure) sets the grid centre
-to zero offset, the centring will be correct.  For a grid of shape
-``(H, W)`` this corresponds to pixel index ``(H // 2, W // 2)``.
+The pipeline takes the beam axis to be pixel ``(H // 2, W // 2)`` of a grid
+of shape ``(H, W)``, or the pixel set by ``beam_center_x`` /
+``beam_center_y``.  RA / Dec from the WCS header are expressed as offsets from
+that pixel.  The beam peak must therefore sit on it.  Use the centre
+*pixel* rather than the peak of a noisy measured beam: noise can put the peak
+one pixel off.
+
+Use an odd number of pixels along each axis, as above, so the centre pixel is
+unambiguous.  ``beam_symmetric: true`` additionally needs equal RA and Dec
+spacing; a 200 × 200 grid leaves its edge pixels without 90° partners.
 
 Notes on normalisation
 -----------------------
 
-The pipeline selects beam pixels that together carry a fraction
-``power_fraction_threshold`` of the total beam power, then re-normalises those
-weights to sum to one.  This means:
+The pipeline multiplies each pixel by its ``cos(dec)`` solid-angle Jacobian,
+selects the pixels that together carry a fraction ``power_fraction_threshold``
+of the integrated beam power, then re-normalises those weights to sum to one.
+This means:
 
 * You do **not** need to normalise the beam before saving.
 * Changing the peak amplitude of the beam file has no effect on the TOD.
 * Raising ``power_fraction_threshold`` toward ``1.0`` retains more pixels
-  (slower but more accurate); lowering it toward ``0.9`` aggressively prunes
-  faint sidelobes.
+  (slower but more accurate); lowering it prunes faint sidelobes.  Beam pixel
+  clustering (:doc:`beam_cluster_calibration`) makes ``1.0`` affordable.
 
 See :doc:`data_formats` for the full specification of the beam file format.

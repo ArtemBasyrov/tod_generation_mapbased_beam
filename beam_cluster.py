@@ -139,8 +139,8 @@ def _to_unit(vec: np.ndarray) -> np.ndarray:
 # threshold must clear the anisotropy a round beam only *appears* to have from
 # finite-precision storage: a float32-stored 30' symmetric beam measures
 # |W - I| ~ 1e-9, so a 1e-9 guard is decided by rounding rather than by the
-# beam.  1e-6 sits three orders above that floor and four below the roundest
-# real beam measured here (SAT 90 GHz, |W - I| = 9.6e-3).  It is a shape
+# beam.  1e-6 sits three orders above that floor and well below the anisotropy
+# of any real measured beam.  It is a shape
 # threshold, not an accuracy one: an unwhitened run on a beam this round adds
 # an ellipticity of eps_beam * tr(Sigma_bar), which 1e-6 makes negligible.
 _WHITEN_MIN_ANISOTROPY = 1e-6

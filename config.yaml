@@ -85,12 +85,9 @@
   # mapmaker's forward model, so it reaches the maps. With this set, clustering
   # groups one quadrant and copies the partition onto the other three by 90°
   # rotation; each cell then has three siblings whose m = ±2 cancels it, since
-  # rotating an ellipse by 90° swaps its axes. Measured on the SAT 90 GHz
-  # symmetric beam: manufactured ellipticity 5.2× → 0.035× of the beam's own
-  # residual, at unchanged node count.
+  # rotating an ellipse by 90° swaps its axes. Node count is unchanged.
   # Only set this for a beam that really is symmetric. The measured 90°
-  # asymmetry is printed when the beam loads (~1e-4 symmetric, ~1e-2
-  # asymmetric); it is reported, not enforced.
+  # asymmetry is printed when the beam loads; it is reported, not enforced.
   beam_symmetric: false
   clustering_calibration_enabled: false
   # --- error bounds: the two harmonics behave differently ------------------

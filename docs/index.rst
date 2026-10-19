@@ -3,7 +3,8 @@ TOD Generation from Beam Convolution
 
 Sample-based Time-Ordered Data (TOD) generation for CMB experiments.
 Convolves polarised sky maps (I, Q, U) with pixelated beam patterns over a
-boresight scan trajectory, producing one TOD file per observation day.
+boresight scan trajectory, producing one output per observation day: a TOAST
+HDF5 observation for the furax mapmaker (default) or a raw ``.npy`` TOD.
 
 .. toctree::
    :maxdepth: 2

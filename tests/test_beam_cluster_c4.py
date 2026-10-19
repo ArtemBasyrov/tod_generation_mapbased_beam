@@ -282,8 +282,8 @@ class TestNullTestSymmetricBeam:
         """The effective ellipticity handed to a round beam must be tiny.
 
         Quoted as ``eps = |Sigma_shape| / tr M``, the same measure used for a
-        beam's own ellipticity, so it is directly comparable: a real SAT 90 GHz
-        beam sits at 1.9e-2. C4 measures ~1e-7 here, five orders below that.
+        beam's own ellipticity, so it is directly comparable. C4 measures ~1e-7
+        here, far below the ellipticity of any real measured beam.
         """
         vec, w, (v_c4, w_c4, _), _ = TestC4Clustering()._run(8.0, 8.0)
         tr_m = 2.0 * (8.0 / R2A) ** 2

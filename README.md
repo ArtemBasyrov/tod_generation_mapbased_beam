@@ -2,24 +2,29 @@
 
 [![Documentation](https://img.shields.io/badge/docs-readthedocs-blue)](https://tod-generation-mapbased-beam.readthedocs.io/en/latest/index.html)
 
-Sample-based Time-Ordered Data (TOD) generation for CMB experiments. Convolves
-polarised sky maps (I, Q, U) with pixelated beam patterns over a boresight
-scan trajectory, producing one TOD file per processing batch (days are used as
-the default batching unit, but any convenient grouping can be used).
+Sample-based Time-Ordered Data (TOD) generation for CMB experiments.
+The pipeline convolves polarised HEALPix sky maps (I, Q, U) with pixelated beam patterns along a boresight scan trajectory.
+It writes one output file per processing batch.
+The batch is called a *day* throughout, but any convenient grouping works.
+
+By default each day is written as a TOAST HDF5 observation, ready for the [furax](https://github.com/CMBSciPol/furax) mapmaker.
 
 ---
 
 ## Overview
 
-The pipeline projects a HEALPix sky map through an instrumental beam for each
-pointing sample in the scan. The core operation is:
+For each pointing sample the pipeline evaluates
 
-```
+```text
 tod[t] = Σ_s  beam_val[s] × skymap[ R(theta_t, phi_t, psi_t) · beam_pixel[s] ]
 ```
 
-where `R` is a compound rotation that recenters the beam on the boresight
-direction and applies the polarisation roll angle. 
+`R` is a compound rotation.
+It recentres the beam on the boresight direction and applies the polarisation roll angle.
+The sky map is read at each rotated beam node by bilinear (default) or nearest-pixel HEALPix interpolation.
+
+`beam_val[s]` is the beam amplitude times the `cos(dec)` solid-angle Jacobian of its CAR cell, normalised to sum to one.
+The Q/U contributions are parallel-transported into the boresight frame (spin-2 transport) before they are summed.
 
 ---
 
@@ -31,189 +36,219 @@ pip install numpy healpy pixell numba pyyaml psutil toast astropy h5py
 
 # 2. Copy and edit the config
 cp config.yaml config_local.yaml
-$EDITOR config_local.yaml   # set FOLDER_SCAN, FOLDER_TOD_OUTPUT, path_to_map, etc.
+$EDITOR config_local.yaml   # set FOLDER_SCAN, FOLDER_TOD_OUTPUT, path_to_map, FOLDER_BEAM, beam_file_*
 
-# 4. Run the pipeline
+# 3. Run the pipeline
 python sample_based_tod_generation_gridint.py
 ```
 
-The script auto-detects available CPUs and memory, calibrates the optimal batch
-size and process count on first run, saves the result to `config_local.yaml`,
-and skips calibration on subsequent runs.
+The first run detects the available CPUs and memory.
+It then calibrates the process count, Numba threads per worker and batch size, and writes them to the active config.
+Later runs reuse those values and skip the calibration.
+
+`python run_calibration.py` runs the calibration on its own, without generating TODs.
 
 ---
 
 ## Configuration
 
-All settings live in `config.yaml` (or `config_local.yaml`, which takes
-precedence when present). Both files use YAML syntax.
+All settings live in `config.yaml`.
+If `config_local.yaml` exists it is read instead, so machine-specific paths stay out of the tracked file.
+The calibration steps write their results back into whichever file is active.
 
-### Paths
+### Paths and input maps
 
-| Key | Type | Description |
-|---|---|---|
-| `FOLDER_SCAN` | `str` | Directory containing scan files (`theta_N.npy`, `phi_N.npy`, `psi_N.npy`). Must end with `/`. |
-| `FOLDER_TOD_OUTPUT` | `str` | Output directory: `obs_day_N.h5` with `furax_export: true`, `tod_day_N.npy` otherwise. Created automatically if absent. |
-| `path_to_map` | `str` | Path to the HEALPix sky map FITS file containing I, Q, U fields. |
-| `FOLDER_BEAM` | `str` | Directory containing beam FITS files. |
-| `beam_file_I` | `str` | Filename of the intensity (I) beam map inside `FOLDER_BEAM`. |
-| `beam_file_Q` | `str` | Filename of the Q-polarisation beam map inside `FOLDER_BEAM`. |
-| `beam_file_U` | `str` | Filename of the U-polarisation beam map inside `FOLDER_BEAM`. |
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `FOLDER_SCAN` | `str` | required | Directory with the scan files `theta_N.npy`, `phi_N.npy`, `psi_N.npy`. Must end with `/`. |
+| `FOLDER_TOD_OUTPUT` | `str` | required | Output directory. Created if absent. |
+| `path_to_map` | `str` | required | HEALPix FITS sky map (RING ordering). |
+| `map_fields` | `list[int]` | `[0, 1, 2]` | Stokes components to read from the map: `0` = T, `1` = Q, `2` = U. Any non-empty subset is valid. See [Partial-Stokes maps](#partial-stokes-maps). |
+| `FOLDER_BEAM` | `str` | required | Directory with the beam FITS files. Must end with `/`. |
+| `beam_file_I` | `str` | — | I beam file inside `FOLDER_BEAM`. Required when `0` is in `map_fields`. |
+| `beam_file_Q` | `str` | — | Q beam file. Required when `1` is in `map_fields`. |
+| `beam_file_U` | `str` | — | U beam file. Required when `2` is in `map_fields`. |
+| `beam_center_x` | `int \| null` | `null` | Row (Dec-axis) index of the beam-centre pixel. `null` uses `H // 2`. |
+| `beam_center_y` | `int \| null` | `null` | Column (RA-axis) index of the beam-centre pixel. `null` uses `W // 2`. |
+
+Components may share one beam file.
+Q and U may also use different beams.
+A Q/U weight difference is applied in the detector polarisation basis, so the TOD stays independent of ψ and of the sky coordinate system.
 
 ### Beam pixel selection
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `power_fraction_threshold_I` | `float` | `0.99` | Fraction of total beam power to retain for the I beam. Pixels below the implied dB cut are discarded, reducing computation while keeping 99 % of the signal. |
-| `power_fraction_threshold_Q` | `float` | `0.99` | Same for the Q beam. |
-| `power_fraction_threshold_U` | `float` | `0.99` | Same for the U beam. |
+| `power_fraction_threshold_I` | `float` | — | Fraction of the integrated I beam power to keep. Required when `0` is in `map_fields`. |
+| `power_fraction_threshold_Q` | `float` | — | Same for the Q beam. |
+| `power_fraction_threshold_U` | `float` | — | Same for the U beam. |
 
-Increase toward `1.0` for higher fidelity (more beam pixels, slower). Decrease
-toward `0.9` to aggressively prune faint sidelobes.
+Pixels are ranked by `B cos(dec)`, so the threshold is a fraction of integrated power rather than of peak amplitude.
+The template uses `1.00`, which keeps every non-zero pixel.
+Lower values drop the faintest pixels and run faster.
+With clustering enabled, `1.00` is affordable; see [Beam pixel clustering](#beam-pixel-clustering).
 
 ### Batch range
 
-The pipeline uses the term *day* for the scan file index suffix, but this can
-represent any batching unit you choose — an observation session, a CES, an
-hour of data, etc.
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `start_day` | `int` | required | First day to process (inclusive). |
+| `end_day` | `int \| null` | required | Last day to process (exclusive). `null` processes every day found in `FOLDER_SCAN`. |
+
+### Multiprocessing and runtime calibration
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `start_day` | `int` | `0` | First batch index to process (inclusive). |
-| `end_day` | `int` | total batches | Last batch index to process (exclusive). Set to `null` to process all batches. |
+| `n_processes` | `int` | required | Upper bound on worker processes. On a cluster the scheduler allocation takes precedence and this is only a cap. |
+| `mp_start_method` | `str` | `'spawn'` | `'spawn'` is safe everywhere. `'fork'` starts workers faster on Linux but may deadlock on macOS. |
+| `calibration_enabled` | `bool` | `true` | Run the runtime calibration on this invocation. Reset to `false` once it finishes. |
+| `calibration_n_processes` | `int \| null` | `null` | Calibrated process count. Written automatically. |
+| `calibration_numba_threads` | `int \| null` | `null` | Calibrated Numba threads per worker. Written automatically. |
+| `calibration_batch_size` | `int \| null` | `null` | Calibrated samples per batch. Written automatically. |
 
-### Multiprocessing
+To force a re-calibration, set `calibration_enabled: true`.
+To override the result, edit the three cached values and keep `calibration_enabled: false`.
 
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `n_processes` | `int` | — | Maximum worker processes on a local machine. On a cluster the scheduler allocation takes precedence and this value is used only as a cap. Required on local machines. |
-| `max_memory_per_process` | `float` | — | Per-process memory budget in GB. Used as a fallback when `psutil` is unavailable. |
+The per-process memory budget comes from `psutil`, which is required.
+Locally the pipeline budgets 75% of available RAM.
+On a detected cluster (SLURM, PBS, LSF, SGE) it budgets all of it.
 
-### Calibration cache
-
-The first run measures sustained throughput at several batch sizes and process
-counts, then writes the optimal values back into the active config file.
-`calibration_enabled` is automatically reset to `false` after calibration
-completes so subsequent runs reuse the cached values without re-measuring.
-
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `calibration_enabled` | `bool` | `true` | Run calibration on this invocation. Automatically set to `false` after calibration completes. |
-| `calibration_n_processes` | `int \| null` | `null` | Cached optimal process count (written automatically). |
-| `calibration_batch_size` | `int \| null` | `null` | Cached optimal batch size (written automatically). |
-
-
-### Beam interpolation
+### Numerics
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `beam_interp_method` | `str` | `'bilinear'` | Interpolation strategy. Available values depend on the active git branch (see table below). |
-| `beam_interp_sigma_deg` | `float \| null` | `null` | **`gaussian` branch only.** Gaussian kernel width in degrees. Defaults to one HEALPix pixel resolution. |
-| `beam_interp_radius_deg` | `float \| null` | `null` | **`gaussian` branch only.** Neighbour search radius in degrees. Defaults to `3 × sigma`. |
+| `beam_interp_method` | `str` | `'bilinear'` | `'bilinear'` or `'nearest'`. See the table below. |
+| `precision` | `str` | `'float32'` | `'float32'` or `'float64'`. Sets the dtype of the sky map, beam weights and node vectors, and the stored TOD. |
+| `spin2_skip_tolerance` | `float \| null` | `null` | Skip the spin-2 transport for boresights in an equatorial band, where the rotation it applies stays below this tolerance in `\|2δ\|` [rad]. `null` or `0` always applies it. |
 
-**Interpolation methods:**
+| Value | Description |
+|---|---|
+| `'bilinear'` | 4-pixel HEALPix bilinear interpolation. Smooth under rotation. **Recommended.** |
+| `'nearest'` | Uses the HEALPix pixel that contains each beam node. Faster (7,684 against 4,272 samples/s/core on an M4 Pro), but jumps when nodes cross pixel boundaries. Do not use it for polarisation analysis. |
 
-| Value | Branch | Description | Speed |
+`precision` does not affect the pointing, which is always float64.
+It also leaves the bilinear weights, the spin-2 cache, the accumulators and `B_ℓ` at float64.
+With float32, the remaining cost is the beam node vectors, at 3.8e-6 of the TOD rms.
+
+`spin2_skip_tolerance: 0.01` is a reasonable speed setting.
+Leave it `null` for validation runs.
+
+### Half-wave plate
+
+| Key | Type | Default | Description |
 |---|---|---|---|
-| `'nearest'` | `main` | Single nearest-pixel lookup. No blending between pixels. Rotationally unstable — not recommended for polarisation analysis. | Fastest |
-| `'bilinear'` | `main` | 4-pixel bilinear HEALPix interpolation via a fused Numba kernel. Best balance of speed and accuracy. **Recommended default.** | Fast |
-| `'bicubic'` | `bicubic` | Keys/Catmull-Rom kernel via gnomonic projection (~30–50 pixels). ~10× more rotationally stable than bilinear. | Slower |
-| `'gaussian'` | `gaussian` | Isotropic Gaussian kernel over all pixels within `radius_deg`. Avoids grid artefacts; requires `beam_interp_sigma_deg`. | Slow |
+| `hwp_enabled` | `bool` | `false` | Modulate Q/U by an ideal rotating HWP. Requires both Q and U in `map_fields`. |
+| `hwp_rotation_frequency_hz` | `float` | `0.0` | Physical rotation rate `f_HWP` [Hz]. Must be positive when the HWP is enabled. |
+| `hwp_initial_phase_rad` | `float` | `0.0` | HWP angle at the start of day 0 [rad]. |
+
+The HWP angle is `φ(t) = 2π f_HWP t + φ₀`, wrapped to `[0, 2π)`.
+Time `t` runs continuously from the start of day 0.
+The generator rotates the beam-convolved Q/U by `4φ`, so a mapmaker still forms `d = I + Q′ cos 2ψ + U′ sin 2ψ`.
+The HDF5 export stores the same wrapped angle, bit for bit, so furax models exactly the modulation in the signal.
+
+### Output format
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `furax_export` | `bool` | `true` | `true` writes one TOAST HDF5 observation per day. `false` writes the raw `(3, n_samples)` `.npy` instead. |
+| `furax_export_t0` | `str` | `'2030-01-01T00:00:00+00:00'` | ISO-8601 UTC time of sample 0 of day 0. |
+
+See [Outputs](#outputs) for both formats.
 
 ### Beam pixel clustering
 
-Spatial k-means clustering on the unit sphere reduces the number of effective
-beam pixels at runtime. Only the low-power *tail* of the beam is clustered;
-the bright main-lobe pixels are kept pixel-exact. For a typical 30′ Gaussian
-beam with 3 % tail power this gives a 3–5× speed-up in TOD generation.
-
-#### Cluster calibration
-
-The calibration sweeps a `(tail_fraction × n_clusters)` grid and, for each
-pair, clusters the beam pixels and recomputes the beam transfer function B_ℓ
-from the clustered geometry. It selects the pair that maximises the pixel-count
-speedup while keeping the B_ℓ divergence from the reference beam below
-`clustering_error_threshold`. No scan data or TOD generation is required.
-
-**Quickstart:**
-
-1. Set `clustering_calibration_enabled: true` and run the pipeline once. The
-   calibration writes the optimal `(tail_fraction, n_clusters)` pair back to
-   the config and resets the flag automatically.
-2. On all subsequent runs the saved values are used directly.
-
-**Manual override:** set `clustering_calibration_enabled: false` and fill in
-`n_beam_clusters` and `beam_cluster_tail_fraction` by hand.
-
-**Disable entirely:** set `n_beam_clusters: null`.
+Spherical k-means merges the low-power *tail* of the beam into centroids.
+The bright main lobe stays pixel-exact.
+This is what makes a 100%-power beam affordable: on the 30′ reference beam it reduces 40,401 grid nodes to 6,397 (6.3×).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `n_beam_clusters` | `int \| null` | `null` | Maximum clusters for the tail. `null` disables clustering entirely. Written automatically by calibration. |
-| `beam_cluster_tail_fraction` | `float \| null` | `null` | Fraction of total beam power treated as the "tail" to be clustered. The remaining `(1 − fraction)` of power pixels are kept pixel-exact. Written automatically by calibration. |
-| `clustering_calibration_enabled` | `bool` | `false` | Run the clustering calibration sweep on this invocation. Automatically reset to `false` after completion. |
-| `clustering_error_threshold` | `float` | `1.0e-5` | Maximum tolerated B_ℓ divergence (see below). The calibration selects the fastest pair that stays within this bound. |
+| `n_beam_clusters` | `int \| null` | `null` | Number of tail clusters. `null` disables clustering. Written by the clustering calibration. |
+| `beam_cluster_tail_fraction` | `float \| null` | `null` | Fraction of integrated beam power treated as the tail. Written by the clustering calibration. |
+| `beam_cluster_whiten` | `bool` | `true` | Assign pixels to clusters in the frame where the beam's second moment is isotropic. Whether this helps depends on the beam. Written by the clustering calibration. |
+| `beam_symmetric` | `bool` | `false` | Cluster one quadrant and copy the partition onto the other three by 90° rotation. Cancels the clustering's manufactured `m = ±2` exactly. Only for a beam that is genuinely round. Overrides `beam_cluster_whiten`. |
+| `clustering_calibration_enabled` | `bool` | `false` | Run the clustering calibration on this invocation. Reset to `false` once it finishes. |
+| `clustering_error_threshold` | `float` | `1.0e-3` | **`m = 0` bound.** Maximum relative RMS divergence of `B_ℓ`, which bounds the beam *width*. The template sets `1.0e-5`. |
+| `clustering_ellipticity_tolerance` | `float \| null` | `1.0` | **`m = ±2` bound.** Maximum error in the beam's own `b_{ℓ,2}` multipoles, as a factor over the least the sweep achieves for this beam. Bounds the beam *shape*. Must be `≥ 1.0`. `null` reports without gating. |
 
-#### Clustering error metric: B_ℓ divergence
+The two bounds constrain different harmonics, and neither implies the other.
+`B_ℓ` depends on each node only through its distance from the beam centre, so it cannot see the ellipticity that clustering adds.
+That added ellipticity is the term that sources T→P leakage.
 
-The quality of a given `(tail_fraction, n_clusters)` pair is measured by the
-**relative RMS divergence in the beam transfer function B_ℓ**:
+**Calibration.**
+Set `clustering_calibration_enabled: true` and run once.
+The calibrator sweeps a `(tail_fraction × n_clusters × whiten)` grid using beam geometry alone, with no scan data.
+It picks the fastest point inside both bounds and breaks speed ties on the least added ellipticity.
+It writes `n_beam_clusters`, `beam_cluster_tail_fraction` and `beam_cluster_whiten` back to the config.
+If no point meets both bounds, it falls back to the point with the least added ellipticity.
+The `n_clusters` grid spans 0.1 to 4 times each tail fraction's crossover cluster count `K_×`, which the table prints as `K/K_x`.
 
-```
-ε = RMS( B_ℓ^{clustered} − B_ℓ^{ref} ) / RMS( B_ℓ^{ref} )
-```
+**Manual setting.**
+Keep `clustering_calibration_enabled: false` and set `n_beam_clusters`, `beam_cluster_tail_fraction` and `beam_cluster_whiten` by hand.
 
-where B_ℓ^{ref} is computed from the full unclustered beam pixel set
-(power_cut = 1.0) and B_ℓ^{clustered} is computed from the centroid pixels
-produced by that pair. Both curves are evaluated at multipoles up to
-`bell_lmax` (default: `2 × nside` of the sky map).
+**`beam_symmetric`.**
+The beam's measured 90° asymmetry is printed when it loads.
+The value is reported, not enforced.
+The flag needs an odd-sized beam grid with equal RA and Dec spacing, centred on the beam-centre pixel.
 
-Using B_ℓ divergence as the threshold metric has two advantages over TOD-based
-error measurement:
+The [clustering documentation](https://tod-generation-mapbased-beam.readthedocs.io/en/latest/beam_cluster_calibration.html) defines both metrics and gives guidance on choosing the bounds.
 
-- **No scan data needed.** The metric is computed purely from beam geometry,
-  so the calibration sweep is fast.
-- **Direct beam fidelity.** A clustering that reproduces B_ℓ faithfully will
-  also reproduce the TOD accurately, because B_ℓ controls how the beam couples
-  to each angular scale of the sky.
+### Partial-Stokes maps
 
-> **Note:** Clustering is applied only to the TOD-generation path. B_ℓ
-> computation itself must always use the full unclustered beam pixel set, since
-> the Legendre polynomial oscillations that define B_ℓ are destroyed by pixel
-> merging.
+`map_fields` selects which components are loaded.
+Inactive components are never allocated, and their beam files are never opened.
+The spin-2 transport runs only when both Q and U are active.
+The output keeps all three I/Q/U rows, and inactive rows are zero.
 
-### Example `config.yaml`
+`tod_config.py` raises a `ValueError` at import that lists any missing `beam_file_*` or `power_fraction_threshold_*` entry for an active component.
+
+### Example `config_local.yaml`
 
 ```yaml
 ---
   FOLDER_SCAN:       "/data/scan/"
   FOLDER_TOD_OUTPUT: "/data/tod/"
   path_to_map:       "/data/maps/cmb_IQU.fits"
+  map_fields: [0, 1, 2]
 
   FOLDER_BEAM:  "/data/beams/"
   beam_file_I:  "beam_I.fits"
   beam_file_Q:  "beam_Q.fits"
   beam_file_U:  "beam_U.fits"
-  power_fraction_threshold_I: 0.99
-  power_fraction_threshold_Q: 0.99
-  power_fraction_threshold_U: 0.99
+  power_fraction_threshold_I: 1.00
+  power_fraction_threshold_Q: 1.00
+  power_fraction_threshold_U: 1.00
+  beam_center_x: null
+  beam_center_y: null
 
   start_day: 0
   end_day: 366
 
   n_processes: 8
-  max_memory_per_process: 2.0   # GB
-
+  mp_start_method: 'spawn'
   calibration_enabled: true
   calibration_n_processes: null
+  calibration_numba_threads: null
   calibration_batch_size: null
 
-  beam_interp_method: 'bilinear'   # or 'nearest'; use 'bicubic'/'gaussian' on those branches
+  beam_interp_method: 'bilinear'
+  precision: 'float32'
+  spin2_skip_tolerance: null
 
   n_beam_clusters: null
   beam_cluster_tail_fraction: null
-  clustering_calibration_enabled: false
+  beam_cluster_whiten: true
+  beam_symmetric: false
+  clustering_calibration_enabled: true
   clustering_error_threshold: 1.0e-5
+  clustering_ellipticity_tolerance: 1.0
+
+  hwp_enabled: false
+  hwp_rotation_frequency_hz: 0.0
+  hwp_initial_phase_rad: 0.0
+
+  furax_export: true
+  furax_export_t0: '2030-01-01T00:00:00+00:00'
 ```
 
 ---
@@ -224,86 +259,86 @@ error measurement:
 
 #### Sky map (`path_to_map`)
 
-A FITS file readable by `healpy.read_map`. Must contain three fields:
+A HEALPix FITS file in RING ordering, readable by `healpy.read_map`.
+Fields 0, 1 and 2 hold Stokes I, Q and U.
+Only the fields in `map_fields` are read, and they must share one `nside`.
+The maps are cast to `precision` when loaded.
 
-- Field 0: Stokes I (intensity)
-- Field 1: Stokes Q (linear polarisation)
-- Field 2: Stokes U (linear polarisation)
+Q and U must follow the HEALPix/COSMO polarisation convention, as healpy and PySM write them.
+An IAU-convention map has the opposite sign of U, and the spin-2 transport would then rotate it the wrong way without any error.
 
-All three fields must share the same HEALPix `nside`. Values are loaded as
-`float32`.
+#### Beam files (`FOLDER_BEAM` / `beam_file_{I,Q,U}`)
 
-#### Beam files (`FOLDER_BEAM / beam_file_{I,Q,U}`)
+A [pixell / enmap](https://pixell.readthedocs.io/en/latest/usage.html#usagepage) FITS map on a CAR grid.
+Only the first map component is read, so each Stokes beam that differs needs its own file.
+RA and Dec come from the WCS header and are expressed as offsets from the beam-centre pixel.
+That pixel is `(H // 2, W // 2)` for a map of shape `(H, W)`, unless `beam_center_x` / `beam_center_y` say otherwise.
+Values are linear beam amplitude, not dB.
 
-[pixell / enmap](https://pixell.readthedocs.io/en/latest/usage.html#usagepage) FITS format (2D map). The map must be centred on the beam axis;
-for a map of shape `(H, W)` the pixel at index `(H // 2, W // 2)` is taken as
-the beam centre. RA and Dec coordinates are read from the map's WCS header and
-converted to offsets relative to that centre pixel. Values represent beam
-amplitude (linear, not dB).
+Use an odd-sized grid, such as 201 × 201, so the centre pixel is unambiguous.
+`beam_symmetric: true` requires it.
 
-Normalisation of the beam file is **not required**. The pipeline selects pixels
-that together carry a fraction `power_fraction_threshold` of the total beam
-power and re-normalises those weights to sum to one, so the absolute scale of
-the beam file does not affect the signal amplitude in the output TOD.
+The beam does not need to be normalised.
+The pipeline multiplies each pixel by `cos(dec)`, keeps the requested power fraction, and normalises the weights to sum to one.
+Zero-weight pixels are dropped.
 
-See the [beam creation example](https://tod-generation-mapbased-beam.readthedocs.io/en/latest/beam_creation.html)
-in the documentation for a step-by-step guide to generating a synthetic beam
-file with pixell.
+The [beam creation example](https://tod-generation-mapbased-beam.readthedocs.io/en/latest/beam_creation.html) generates a synthetic beam file with pixell.
 
 #### Scan files (`FOLDER_SCAN`)
 
-One triplet of `.npy` files per processing batch (referred to as a *day* in
-the filenames, but this can represent any convenient grouping — an observation
-session, a CES, an hour of data, etc.):
+One triplet of `.npy` files per day:
 
-```
-theta_{day_index}.npy   # boresight colatitude  [rad], float32 or float64
-phi_{day_index}.npy     # boresight longitude   [rad], float32 or float64
-psi_{day_index}.npy     # polarisation roll     [rad], float32 or float64
+```text
+theta_{day_index}.npy   # boresight colatitude  [rad]
+phi_{day_index}.npy     # boresight longitude   [rad]
+psi_{day_index}.npy     # polarisation angle    [rad]
 ```
 
-Each file is a 1-D array with one element per detector sample. The files are
-opened as memory-maps, so only the batch currently being processed is resident
-in RAM.
-
-The total number of batches is inferred from the highest-indexed `psi_*.npy`
-file in the scan folder. The sample rate is estimated as
-`len(psi_0.npy) / 86400` (samples per second).
+Each file is a 1-D array with one element per sample, in float32 or float64.
+The files are memory-mapped, and the pointing is converted to float64 batch by batch.
+The number of days is inferred from the highest-indexed `psi_*.npy`.
+The sample rate is `len(psi_0.npy) / 86400` Hz.
 
 ### Outputs
 
-#### TOD files (`FOLDER_TOD_OUTPUT`)
-
-The format is set by `furax_export`.
-
-With `furax_export: true` (the default), each day is one TOAST HDF5 observation for furax:
+#### `furax_export: true` (default)
 
 ```text
-obs_day_{day_index}.h5    # one boresight detector, signal (1, n_samples)
-index.sqlite              # SaveHDF5's observation index
+obs_day_{day_index}.h5    # one TOAST observation, signal shape (1, n_samples)
+index.sqlite              # observation index written by TOAST's SaveHDF5
 ```
 
-The stored signal is `I + Q cos 2ψ + U sin 2ψ`, at the pipeline `precision`.
+The stored detector signal is `d = I + Q cos 2ψ + U sin 2ψ`, after any HWP modulation, at the pipeline `precision`.
 That dtype must match furax's `double_precision`.
-`furax_export_t0` sets the UTC time of sample 0 of day 0.
+No `.npy` file is written.
+The export needs `toast`, which is imported at start-up so a missing install fails before any generation.
 
-With `furax_export: false`, each day is the raw TOD:
+#### `furax_export: false`
 
 ```text
 tod_day_{day_index}.npy   # shape (3, n_samples), dtype = precision
 ```
 
-Axis 0 indexes the Stokes component: `[I, Q, U]`.
-Axis 1 indexes the detector sample.
+Axis 0 indexes the Stokes component `[I, Q, U]`.
+Axis 1 indexes the sample.
+
 `python tod_to_furax.py` re-exports these files to HDF5 afterwards.
-It takes `--output`, `--start-day`, `--end-day`, `--t0`, `--split-per-day` and `--precision`.
+It writes to `<FOLDER_TOD_OUTPUT>/furax_h5/` unless `--output` is given.
+It also takes `--start-day`, `--end-day`, `--t0`, `--split-per-day` and `--precision`.
+`--precision` defaults to `float64`, unlike the integrated export.
+
+#### Mapmaking
+
+`furax_mapmaker/run_furax_mapmaker.py` runs furax's `MultiObservationMapMaker` over the exported observations and writes IQU maps.
+`furax_mapmaker/submit_furax_mapmaker.sh` is the Slurm script for the NERSC Perlmutter GPU partition.
 
 ---
 
 ## Running on HPC / SLURM
 
-The pipeline is SLURM-aware. When `SLURM_CPUS_PER_TASK` is set the calibration
-uses the full node memory and all allocated CPUs. No special flags are needed:
+The pipeline detects SLURM, PBS, LSF and SGE allocations.
+On a cluster it uses all allocated CPUs, capped by `n_processes`, and the full node memory.
+No extra flags are needed:
 
 ```bash
 #!/bin/bash
@@ -314,62 +349,8 @@ uses the full node memory and all allocated CPUs. No special flags are needed:
 python sample_based_tod_generation_gridint.py
 ```
 
-The calibration step will find the process count that maximises
-`throughput_per_process × n_processes` given the available memory, which on
-memory-constrained nodes is often fewer than the total allocated CPUs.
-
----
-
-## Branch Structure
-
-Experimental interpolation methods live on dedicated branches to keep `main`
-clean. Switch branches to enable a different interpolation kernel:
-
-| Branch | Extra module | Adds |
-|--------|-------------|------|
-| `main` | — | `nearest` + `bilinear` (production) |
-| `gaussian` | `tod_gaussian.py` | `gaussian` kernel |
-| `bicubic` | `tod_bicubic.py` | `bicubic` kernel |
-
-```bash
-git checkout gaussian   # enables beam_interp_method: gaussian
-git checkout bicubic    # enables beam_interp_method: bicubic
-git checkout main       # production default
-```
-
-Passing an unsupported `beam_interp_method` on any branch raises a `ValueError`
-pointing to the correct branch.
-
-## Repository Structure
-
-```
-.
-├── sample_based_tod_generation_gridint.py  # Main entry point
-├── tod_core.py                             # Core Numba JIT kernels + interpolation dispatch
-├── tod_rotations.py                        # Rodrigues rotations kernels
-├── tod_gaussian.py                         # [gaussian branch] Gaussian kernel
-├── tod_bicubic.py                          # [bicubic branch]  Keys/Catmull-Rom kernel
-├── tod_bilinear.py                         # Bilinear interpolation
-├── tod_nearest.py                          # Nearest pixel interpolation
-├── tod_io.py                               # File I/O (beam, scan, output)
-├── tod_config.py                           # Config loader
-├── tod_calibrate.py                        # Batch-size / process-count / clustering calibration
-├── tod_utils.py                            # CPU/memory detection and utilities
-├── numba_healpy.py                         # Numba re-implementation of HEALPix helpers
-├── beam_cluster.py                         # Spherical k-means beam-pixel clustering
-├── config.yaml                             # Default configuration template
-└── tests/                                  # pytest test suite
-    ├── test_tod_core.py
-    ├── test_numba_healpy.py
-    ├── test_tod_rotations.py
-    ├── test_gaussian_interp.py             # [gaussian branch only]
-    ├── test_bicubic_interp.py              # [bicubic branch only]
-    ├── test_tod_bilinear.py
-    ├── test_tod_calibrate.py
-    ├── test_beam_cluster.py
-    ├── test_tod_utils.py
-    └── run_all_tests.py
-```
+The runtime calibration searches process count, Numba threads per worker and batch size together, within the memory budget.
+On memory-limited nodes it often picks fewer processes than allocated CPUs.
 
 ---
 
@@ -379,25 +360,22 @@ pointing to the correct branch.
 |---|---|
 | `numpy` | Array operations |
 | `healpy` | HEALPix map I/O and pixel utilities |
-| `numba` | JIT compilation of rotation and interpolation kernels |
+| `numba` | JIT compilation of the rotation and interpolation kernels |
 | `pixell` | enmap beam file loading |
 | `pyyaml` | Config file parsing |
-| `psutil` | CPU/memory auto-detection (optional but recommended) |
+| `psutil` | CPU and memory detection (required) |
 | `toast`, `astropy`, `h5py` | TOAST HDF5 export for furax (`furax_export: true`, the default) |
 
-Install with:
-
 ```bash
-pip install numpy healpy pixell numba pyyaml psutil toast astropy h5py
+pip install -r requirements.txt
 ```
+
+The furax GPU mapmaker in `furax_mapmaker/` has its own JAX/furax stack, which is not listed here.
 
 ---
 
 ## Tests
 
 ```bash
-cd tests
-python run_all_tests.py
-# or
 pytest tests/
 ```

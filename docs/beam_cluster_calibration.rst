@@ -14,8 +14,10 @@ clustered (controlled by ``beam_cluster_tail_fraction``); the bright main-lobe
 pixels are kept pixel-exact.  The gain is a proportional speed-up in the
 innermost Numba gather loops with a small, controllable accuracy loss.
 
-Pixels are grouped in the frame where the beam's own second moment is
-isotropic, so that the clustering narrows the beam without reshaping it.  See
+By default (``beam_cluster_whiten: true``) pixels are grouped in the frame
+where the beam's own second moment is isotropic, so that the clustering
+narrows the beam without reshaping it.  Whether that helps depends on the
+beam, so the calibration measures it.  See
 :ref:`clustering_error_structure` for why that matters and
 :ref:`whitened_assignment` for what it does.
 
@@ -61,7 +63,7 @@ How the Calibration Works
 --------------------------
 
 When ``clustering_calibration_enabled: true`` is set, the pipeline sweeps a
-``(tail_fraction × n_clusters)`` grid.  For each candidate pair it:
+``(tail_fraction × n_clusters × whiten)`` grid.  For each candidate point it:
 
 1. Clusters a copy of the beam pixels using the candidate parameters.
 2. Computes the beam transfer function B_ℓ from the clustered centroids
@@ -73,10 +75,36 @@ When ``clustering_calibration_enabled: true`` is set, the pipeline sweeps a
    :math:`m = \pm 2` bound.
 6. Records the pixel-count speedup as ``S / K_out``.
 
-The pair that achieves the highest speedup while staying inside **both** bounds
-is written to the config.  If no pair qualifies, the pair with the **least
-added ellipticity** is used with a warning — an :math:`m = \pm 2` error
-reshapes the beam, where the :math:`m = 0` term only rescales its width.
+The point that achieves the highest speedup while staying inside **both**
+bounds is written to the config as ``beam_cluster_tail_fraction``,
+``n_beam_clusters`` and ``beam_cluster_whiten``.  Speed ties are broken on the
+least added ellipticity.  The tie-break matters: a whitened point and its
+plain twin cluster the same tail to the same count, so their speedups are
+identical.  If no point qualifies, the point with the **least added
+ellipticity** is used with a warning — an :math:`m = \pm 2` error reshapes the
+beam, where the :math:`m = 0` term only rescales its width.
+
+**The cluster-count grid.**  For each tail fraction the ``n_clusters`` grid
+spans 0.1 to 4 times that tail's crossover cluster count
+
+.. math::
+
+   K_\times \,=\, \frac{\sum_{s\in\rm tail} \sqrt{w_s}}
+                        {\sqrt{\max_{s\in\rm tail} w_s}} \,,
+
+computed from the node weights alone.  Above :math:`K_\times` the optimal
+cell has shrunk to a single grid node.  Sampling both sides matters: a tight
+width budget often needs a cluster count above :math:`K_\times`.
+
+**The whiten axis** is collapsed to one leg when it cannot change the result:
+when ``beam_symmetric: true`` (the quadrant path ignores whitening), or when
+the beam is round to within the whitening guard (both legs give the same
+partition).  Within a tail fraction the whitened leg is also dropped once it
+has lost at some :math:`K > K_\times`.
+
+Points with ``K`` at or above the tail's node count cluster nothing.  They
+print as ``— no reduction`` and are excluded from both bounds and from the
+fallback.
 
 No scan data or TOD generation is performed during calibration — both metrics
 depend only on beam geometry, making the sweep fast.
@@ -84,7 +112,7 @@ depend only on beam geometry, making the sweep fast.
 B_ℓ Divergence Metric
 -----------------------
 
-The quality of a ``(tail_fraction, n_clusters)`` pair is quantified by:
+The width error of a candidate point is quantified by:
 
 .. math::
 
@@ -98,7 +126,7 @@ where:
 * :math:`B_\ell^{\mathrm{ref}}` is the beam transfer function computed from
   the full unclustered pixel set with ``power_cut = 1.0``.
 * :math:`B_\ell^{\mathrm{clust}}` is the beam transfer function computed from
-  the centroid pixels produced by the candidate pair.
+  the centroid pixels produced by the candidate point.
 * The RMS is taken over multipoles :math:`\ell = 0 \ldots \ell_{\max}`, where
   :math:`\ell_{\max}` defaults to ``2 × nside`` of the sky map (or 500 if no
   map is available).
@@ -115,9 +143,8 @@ where:
 
    B_ℓ is the :math:`m = 0` harmonic and bounds the beam *width* only.  It
    cannot bound the ellipticity clustering adds, because no rearrangement of
-   nodes at fixed radius changes it.  Measured on the SAT 90 GHz beam, a
-   shape-preserving clustering scores 10 % *worse* on B_ℓ divergence than one
-   that reshapes the beam, while committing 10× less added ellipticity.  The
+   nodes at fixed radius changes it.  A shape-preserving clustering can
+   score *worse* on B_ℓ divergence than one that reshapes the beam.  The
    second metric below exists for exactly that reason.
 
 Added-Ellipticity Metric
@@ -171,43 +198,39 @@ The table also reports the error as a fraction of the beam's *own*
 Calibration Output Table
 -------------------------
 
-When the calibration runs it prints an ASCII table of the form::
+When the calibration runs it prints a header with both bounds, then one row
+per ``(tail_fraction, n_clusters, whiten)`` point, grouped by tail fraction::
 
    [clust_calib] B_ell (m=0) <= 1.0e-05
-   [clust_calib] added ellipticity q2(l=2048) <= 1 x 3.37e-04 = 3.37e-04
-                 (beam's own quadrupole q2_beam = 2.22e+00)
-    tail%      K   K_out   speedup   B_ell div    q2 added   /q2_beam  status
-   --------------------------------------------------------------------------
-    15.0%    500    2421     14.42    1.97e-04    2.87e-03   1.29e-03  ✗ m=±2
-    15.0%   1000    2921     11.95    2.06e-04    9.54e-04   4.31e-04  ✗ m=±2
-    15.0%   2000    3921      8.91    2.41e-04    3.37e-04   1.52e-04  ✓
-    15.0%   4000    5921      5.90    2.55e-04    8.87e-04   4.00e-04  ✗ m=±2
-   --------------------------------------------------------------------------
+   [clust_calib] added ellipticity q2(l=2048) <= 1 x <floor> = <cap>   (beam's own quadrupole q2_beam = <q2_beam>)
+    tail%       K   K/K_x  whiten   K_out   speedup   B_ell div    q2 added   /q2_beam  status
+   ----------------------------------------------------------------------------------------------------
+    15.0%     ...     ...     ...     ...       ...         ...         ...        ...  ✓ | ✗ m=0 | ✗ m=±2 | — no reduction
+   ----------------------------------------------------------------------------------------------------
 
-   [clust_calib] Recommendation: tail_fraction=0.15, n_clusters=2000
-     (speedup=8.91x, B_ell div=2.41e-04, q2 added=3.37e-04)
+   [clust_calib] Recommendation: tail_fraction=0.15, n_clusters=..., whiten=...  (speedup=..., B_ell div=..., q2 added=..., K/K_x=...)
 
 Columns:
 
-* **tail%** — fraction of total beam power in the clustered tail.
+* **tail%** — fraction of integrated beam power in the clustered tail.
 * **K** — requested number of tail clusters.
+* **K/K_x** — ``K`` over that tail's crossover count :math:`K_\times`.
+* **whiten** — whether whitened assignment was used.
 * **K_out** — actual number of output pixels (``n_main + K_tail``).
 * **speedup** — ratio ``S / K_out`` where ``S`` is the original pixel count.
 * **B_ell div** — :math:`\varepsilon_{B_\ell}`, the :math:`m = 0` bound.
-* **q2 added** — the ellipticity this pair adds to the beam.
+* **q2 added** — the ellipticity this point adds to the beam.
 * **/q2_beam** — that ellipticity as a fraction of the beam's own quadrupole.
 * **status** — ✓ if both bounds hold; ``✗ m=0`` or ``✗ m=±2`` names which one
-  failed.
+  failed; ``— no reduction`` marks a point that clustered nothing.
 
 .. note::
 
-   Added ellipticity is **not** monotone in ``n_clusters``.  In the table above
-   it bottoms at K = 2000 and rises again by 2.6× at K = 4000, because a large
-   cluster budget forces near-degenerate cells: a cell holding two grid nodes
-   has a rank-1 covariance locked to a grid direction, and such cells carry
-   87 % of the manufactured quadrupole at K = 4000 while holding only 36 % of
-   the width error.  More clusters buys width accuracy and can cost shape
-   accuracy.
+   Added ellipticity is **not** monotone in ``n_clusters``.  A large cluster
+   budget forces near-degenerate cells: a cell holding two grid nodes has a
+   rank-1 covariance locked to a grid direction, so such cells carry a
+   disproportionate share of the manufactured quadrupole.  More clusters buys
+   width accuracy and can cost shape accuracy.
 
 .. _clustering_error_threshold_guidance:
 
@@ -307,10 +330,16 @@ Only the assignment is whitened.  Centroids remain the weighted mean of the
 original vectors, so dipole preservation and the exact
 :math:`\Delta M = -\bar\Sigma` identity are untouched.
 
-Measured on the SAT 90 GHz beam at ``n_clusters=2000``, ``tail_fraction=0.15``:
-added ellipticity falls from 3.8e-02 to 3.8e-03 — a factor of 10 — for +0.02 %
-on the width term, with the deficit axis moving from −4.4° (the beam-grid axis)
-to +65.5°, against the beam's own axis of +71.8°.
+.. warning::
+
+   Whitening is built to make :math:`\bar\Sigma \propto M`, so it optimises
+   the second-moment deficit — the retired shape measure — close to by
+   definition.  Under the exact :math:`b_{\ell,2}` metric the verdict is
+   beam-dependent.  On the synthetic 30′ × 15′ reference beam at
+   :math:`K/K_\times = 0.20`, whitened/plain is 0.05–0.13 under
+   :math:`\bar\Sigma` but 0.88–2.34 under :math:`b_{\ell,2}` across tail
+   fractions 0.5–30 %.  Let the calibration sweep the axis rather than
+   setting ``beam_cluster_whiten`` from any single number.
 
 .. note::
 
@@ -340,7 +369,7 @@ effective beam comes out slightly elliptical even when the real one is round.
 That manufactured :math:`m = \pm2` sources T→P leakage and, unlike the
 interpolation kernel, is **not** in the mapmaker's forward model, so it
 survives into the maps rather than being deconvolved.  On a symmetric beam it
-*dominates* the beam's own :math:`m = \pm2` — measured at 3.5–181× of it.
+can *dominate* the beam's own :math:`m = \pm2`.
 
 With ``beam_symmetric: true`` the clustering groups **one quadrant** of the
 beam and copies the partition onto the other three by 90° rotation (the group
@@ -371,9 +400,6 @@ instead.
    * - beam
      - plain k-means
      - ``beam_symmetric: true``
-   * - SAT 90 GHz symmetric (real, noisy)
-     - 3.5–181× the beam's own
-     - **0.004–0.71×**
    * - analytic round Gaussian (:math:`\varepsilon_{\rm eff}`)
      - 1.67e-04
      - **1.04e-07** (1610×)
@@ -382,21 +408,20 @@ instead.
 
    Only set this for a beam that really is symmetric.  The cancellation needs
    the beam's own weights to be 90°-invariant; on a genuinely asymmetric beam
-   the construction both fails to help (0.1–10×, no consistent gain) and costs
-   node reduction (5.0× instead of 8×).  The measured C4 asymmetry is printed
-   when the beam loads — roughly 1e-4 for a symmetric beam and 1e-2 for an
-   asymmetric one — but it is reported, not enforced.
+   the construction gives no consistent gain and costs node reduction.  The
+   measured C4 asymmetry is printed when the beam loads, so the choice can be
+   checked, but it is reported, not enforced.
 
-   Asymmetric beams need no fix: their clustering :math:`m = \pm2` is
-   1.6e-04 of the beam's own, four orders below the signal.
+   Asymmetric beams need no fix: their clustering :math:`m = \pm2` is small
+   against the beam's own.
 
 Two implementation details are load-bearing.  The rotation centre is the
 beam-centre **pixel** (``beam_center_x`` / ``beam_center_y``, default
 ``H//2, W//2``), never the peak pixel — detector noise puts the peak a pixel
-off, which inflates the measured asymmetry sixfold and destroys the gain.  And
-beam maps must be **odd-sized** and centred on that pixel, or orbits do not
-close: a 200×200 map loses its edge pixels to singletons and 8 % of the
-reduction, where 201×201 closes every orbit.
+off, which inflates the measured asymmetry and destroys the gain.  And beam
+maps must be **odd-sized** and centred on that pixel, or orbits do not close:
+on an even-sized grid the edge pixels have no 90° partners and are kept as
+singletons, costing node reduction.
 
 Symmetrising the beam map itself is deliberately *not* offered here.  It
 changes the beam values, which is a claim about the instrument rather than a

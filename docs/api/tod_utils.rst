@@ -1,10 +1,10 @@
 tod\_utils
 ==========
 
-CPU / memory detection and miscellaneous utilities. All functions in this
+CPU / memory detection and progress / timing helpers. All functions in this
 module are internal helpers (prefixed with ``_``) and are not part of the
-public API. They are used internally by the pipeline to auto-detect available
-CPUs, estimate per-process memory budgets, and compute beam power thresholds.
+public API. The pipeline uses them to detect the available CPUs, budget
+per-process memory, and format progress output.
 
 .. automodule:: tod_utils
    :undoc-members: False
