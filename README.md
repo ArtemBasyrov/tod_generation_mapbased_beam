@@ -327,11 +327,6 @@ It writes to `<FOLDER_TOD_OUTPUT>/furax_h5/` unless `--output` is given.
 It also takes `--start-day`, `--end-day`, `--t0`, `--split-per-day` and `--precision`.
 `--precision` defaults to `float64`, unlike the integrated export.
 
-#### Mapmaking
-
-`furax_mapmaker/run_furax_mapmaker.py` runs furax's `MultiObservationMapMaker` over the exported observations and writes IQU maps.
-`furax_mapmaker/submit_furax_mapmaker.sh` is the Slurm script for the NERSC Perlmutter GPU partition.
-
 ---
 
 ## Running on HPC / SLURM
@@ -369,8 +364,6 @@ On memory-limited nodes it often picks fewer processes than allocated CPUs.
 ```bash
 pip install -r requirements.txt
 ```
-
-The furax GPU mapmaker in `furax_mapmaker/` has its own JAX/furax stack, which is not listed here.
 
 ---
 
